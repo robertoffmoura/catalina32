@@ -1886,6 +1886,17 @@ func (c *CPU) execStringOp(op uint8, opSize16 bool, repF3 bool, repF2 bool) {
 
 func (c *CPU) RunUntil(stopEIP uint32) error {
 	for !c.Halted && c.EIP != stopEIP {
+		if limit := c.nextEventStep(); c.Steps < limit {
+			// No step limit, preemption or profiler sample is due before limit, so the checks below
+			// would all be false: run decoded instructions directly, then (if the run stopped at an
+			// uncached instruction) one full Step.
+			c.runCached(stopEIP, limit)
+			if c.Halted || c.EIP == stopEIP || c.Steps >= limit {
+				continue
+			}
+			c.Step()
+			continue
+		}
 		if c.MaxSteps > 0 && c.Steps >= c.MaxSteps {
 			c.Halted = true
 			c.HaltReason = fmt.Sprintf("reached MaxSteps (%d) at EIP=0x%08x", c.MaxSteps, c.EIP)
@@ -1907,6 +1918,46 @@ func (c *CPU) RunUntil(stopEIP uint32) error {
 		return fmt.Errorf("%s", c.HaltReason)
 	}
 	return nil
+}
+
+// nextEventStep returns the first step count at which RunUntil must check MaxSteps, preemption or
+// the profiler. It only depends on state that changes inside full Steps (thunks), never inside
+// decoded instructions.
+func (c *CPU) nextEventStep() uint64 {
+	limit := ^uint64(0)
+	if c.MaxSteps > 0 {
+		limit = c.MaxSteps
+	}
+	if c.Preempt != nil && c.NestDepth == 0 && c.nextPreempt < limit {
+		limit = c.nextPreempt
+	}
+	if c.ProfEvery > 0 {
+		s := max(c.Steps, c.ProfFrom)
+		s = (s + c.ProfEvery - 1) / c.ProfEvery * c.ProfEvery
+		limit = min(limit, s)
+	}
+	return limit
+}
+
+// runCached executes decoded instructions until limit steps, stopEIP, a halt, or an instruction
+// that needs the full decoder (intercepts, uncached forms, code outside [CodeLo, CodeHi)).
+func (c *CPU) runCached(stopEIP uint32, limit uint64) {
+	span := c.CodeHi - c.CodeLo
+	for c.Steps < limit {
+		eip := c.EIP
+		if eip == stopEIP || c.Halted || eip-c.CodeLo >= span || c.icept[eip>>6]&(1<<(eip&63)) != 0 {
+			return
+		}
+		d := &c.dcache[eip&dcacheMask]
+		if d.tag != eip {
+			c.decodeCached(d, eip)
+		}
+		if d.kind == dSlow {
+			return
+		}
+		c.Steps++
+		c.execCached(d)
+	}
 }
 
 func (c *CPU) CallGuest(fnAddr uint32, args ...uint32) (uint32, error) {
