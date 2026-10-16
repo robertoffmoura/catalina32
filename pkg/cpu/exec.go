@@ -516,10 +516,12 @@ func (c *CPU) Step() {
 	}
 
 	// Check if current EIP is intercepted by a host thunk or lifted function
-	if thunk, ok := c.Intercepts[c.EIP]; ok {
-		c.Steps++
-		thunk(c)
-		return
+	if c.EIP >= ArenaSize || c.icept[c.EIP>>6]&(1<<(c.EIP&63)) != 0 {
+		if thunk, ok := c.Intercepts[c.EIP]; ok {
+			c.Steps++
+			thunk(c)
+			return
+		}
 	}
 
 	startEIP := c.EIP

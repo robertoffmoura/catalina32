@@ -25,6 +25,7 @@ type BufferDesc struct {
 }
 
 type Subsystem struct {
+	rendering bool // true while the frame being drawn will be rasterized/exported
 	nextVTableAddr uint32
 	nextTrampAddr  uint32
 
@@ -484,7 +485,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 17: // Present
 		s.FrameCount++
-		s.exportFramePNG()
+		if s.rendering {
+			s.exportFramePNG()
+		}
+		s.rendering = s.wantRender(s.FrameCount + 1)
 		if s.TraceLog && (s.FrameCount <= 10 || s.FrameCount%30 == 0) {
 			fmt.Printf("[D3D9] Present() Frame #%d completed (DrawCalls=%d, Triangles=%d, Clears=%d, LastClearColor=0x%08x)\n",
 				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.LastClearColor)
@@ -604,10 +608,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		flags := c.Arg(3)
 		col := c.Arg(4)
 		s.LastClearColor = col
-		if (flags&1) != 0 && s.FrameDrawCalls == 0 {
+		if s.rendering && (flags&1) != 0 && s.FrameDrawCalls == 0 {
 			s.clearFramebuffer(col)
 		}
-		if (flags & 2) != 0 {
+		if s.rendering && (flags&2) != 0 {
 			s.clearZBuffer(1.0)
 		}
 		c.Regs[cpu.RegEAX] = 0

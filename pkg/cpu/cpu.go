@@ -77,6 +77,7 @@ type CPU struct {
 
 	// Intercept table (stubs, MacDoze, IndirectX, COM vtables, Lifted functions)
 	Intercepts   map[uint32]ThunkFunc
+	icept        []uint64 // bitmap over guest addresses: fast pre-check before the Intercepts map lookup
 	InterceptTag map[uint32]string
 
 	// Execution telemetry & debugging
@@ -114,6 +115,7 @@ func NewCPU() *CPU {
 		InterceptTag:  make(map[uint32]string),
 		UnmappedCalls: make(map[uint32]uint64),
 		VisitedFuncs:  make(map[uint32]uint64),
+		icept:         make([]uint64, ArenaSize/64),
 		FSBase:        0x03004000,
 		GSBase:        0x03008000,
 	}
@@ -124,6 +126,12 @@ func NewCPU() *CPU {
 
 func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 	c.Intercepts[addr] = fn
+	if c.icept == nil {
+		c.icept = make([]uint64, ArenaSize/64)
+	}
+	if addr < ArenaSize {
+		c.icept[addr>>6] |= 1 << (addr & 63)
+	}
 	c.InterceptTag[addr] = name
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"lsw64/pkg/cpu"
 )
@@ -28,7 +29,21 @@ type screenVertex struct {
 	valid      bool
 }
 
+// renderEvery: only every Nth presented frame is rasterized/exported (rendering is pure overhead for guest execution).
+// Override with LSW_RENDER_EVERY (1 = every frame, e.g. for a live display).
+var renderEvery = func() int {
+	if v, err := strconv.Atoi(os.Getenv("LSW_RENDER_EVERY")); err == nil && v > 0 {
+		return v
+	}
+	return 30
+}()
+
+func (s *Subsystem) wantRender(frame uint64) bool {
+	return frame <= 2 || frame%uint64(renderEvery) == 0
+}
+
 func (s *Subsystem) initRasterizer(framesDir string) {
+	s.rendering = true
 	s.Framebuffer = image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
 	s.ZBuffer = make([]float32, ScreenWidth*ScreenHeight)
 	s.FramesDir = framesDir
@@ -561,6 +576,9 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int32, startIdx uint32, primCount uint32, pVerts uint32, stride uint32, pIdx uint32, idxLen uint32, is32BitIdx bool, isUP bool) {
 	if pVerts == 0 || pIdx == 0 || stride < 12 || primCount == 0 {
 		return
+	}
+	if !s.rendering {
+		return // frame will not be exported: skip software rasterization entirely
 	}
 	if primCount > 4096 {
 		primCount = 4096

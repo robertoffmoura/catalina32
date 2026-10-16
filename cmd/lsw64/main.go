@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 
@@ -80,6 +81,12 @@ func main() {
 	// 2. Call WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1) at 0x00209d10
 	fmt.Printf("[lsw64] Launching WinMain(0x00001000, 0, 0x%08x, 1) @ 0x00209d10...\n", w32.CmdLineAddr)
 	vm.MaxSteps = 1_100_000_000
+	if pf := os.Getenv("LSW_CPUPROF"); pf != "" {
+		if f, err := os.Create(pf); err == nil {
+			_ = pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
+	}
 	if v := os.Getenv("LSW_MAX_STEPS"); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 			vm.MaxSteps = n
@@ -98,6 +105,7 @@ func main() {
 	}
 	vm.NestDepth = -1 // WinMain is the top-level thread; keep depth 0 inside it so the scheduler may preempt
 	ret, err := vm.CallGuest(0x00209d10, 0x00001000, 0, w32.CmdLineAddr, 1)
+	pprof.StopCPUProfile()
 	if err != nil {
 		fmt.Printf("[lsw64] WinMain stopped: %v\n  State: %s\n", err, vm.DumpState())
 		fmt.Printf("  CallStack depth=%d:\n", len(vm.CallStack))
