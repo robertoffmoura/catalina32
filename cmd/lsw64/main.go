@@ -54,6 +54,11 @@ func main() {
 	}
 
 	prof.Attach(img, vm.Mem)
+	for _, sec := range img.Sections {
+		if sec.SegName == "__TEXT" && sec.SectName == "__text" && os.Getenv("LSW_NO_DCACHE") == "" {
+			vm.SetCodeRange(sec.Addr, sec.Addr+sec.Size-16) // leave room so decoding never runs off the end
+		}
+	}
 	entry, ok := prof.Addr(prof.EntryPoint)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "profile %q does not locate entry point %q\n", prof.Name, prof.EntryPoint)

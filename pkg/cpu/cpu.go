@@ -93,6 +93,13 @@ type CPU struct {
 	UnmappedCalls map[uint32]uint64
 	VisitedFuncs  map[uint32]uint64
 
+	// Decoded-instruction cache (dcache.go); active once SetCodeRange is called.
+	dcache           []dInst
+	CodeLo, CodeHi   uint32
+	CodeCacheFlushes uint64
+	// Stores with addr-CodeHi <= writeSpan are in bounds and above guest code (the inlined fast path).
+	writeSpan uint32
+
 	// Guest sampling profiler (enabled when ProfEvery > 0; needs TraceCalls for function attribution).
 	// Every ProfEvery steps past ProfFrom, the innermost call frame is charged in ProfSelf and every
 	// distinct frame on the call stack in ProfIncl.
@@ -133,6 +140,7 @@ func NewCPU() *CPU {
 		UnmappedCalls: make(map[uint32]uint64),
 		VisitedFuncs:  make(map[uint32]uint64),
 		icept:         make([]uint64, ArenaSize/64),
+		writeSpan:     ArenaSize - 8,
 		FSBase:        0x03004000,
 		GSBase:        0x03008000,
 	}
@@ -237,7 +245,7 @@ func (c *CPU) ReadF64(addr uint32) float64 {
 }
 
 func (c *CPU) Write8(addr uint32, val uint8) {
-	if addr < ArenaSize && c.WatchFn == nil {
+	if addr-c.CodeHi <= c.writeSpan && c.WatchFn == nil {
 		c.Mem[addr] = val
 		return
 	}
@@ -248,6 +256,7 @@ func (c *CPU) write8Slow(addr uint32, val uint8) {
 	if !c.checkAddr(addr, 1) {
 		return
 	}
+	c.noteCodeWrite(addr, 1)
 	if c.WatchFn != nil && addr >= c.WatchLo && addr < c.WatchHi {
 		c.WatchFn(c, addr, 1, true)
 	}
@@ -255,27 +264,58 @@ func (c *CPU) write8Slow(addr uint32, val uint8) {
 }
 
 func (c *CPU) Write16(addr uint32, val uint16) {
-	if addr <= ArenaSize-2 {
+	if addr-c.CodeHi <= c.writeSpan {
 		binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
 		return
 	}
-	c.checkAddr(addr, 2)
+	c.write16Slow(addr, val)
+}
+
+func (c *CPU) write16Slow(addr uint32, val uint16) {
+	if !c.checkAddr(addr, 2) {
+		return
+	}
+	c.noteCodeWrite(addr, 2)
+	binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
 }
 
 func (c *CPU) Write32(addr uint32, val uint32) {
-	if addr <= ArenaSize-4 {
+	if addr-c.CodeHi <= c.writeSpan {
 		binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
 		return
 	}
-	c.checkAddr(addr, 4)
+	c.write32Slow(addr, val)
+}
+
+func (c *CPU) write32Slow(addr uint32, val uint32) {
+	if !c.checkAddr(addr, 4) {
+		return
+	}
+	c.noteCodeWrite(addr, 4)
+	binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
 }
 
 func (c *CPU) Write64(addr uint32, val uint64) {
-	if addr <= ArenaSize-8 {
+	if addr-c.CodeHi <= c.writeSpan {
 		binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
 		return
 	}
-	c.checkAddr(addr, 8)
+	c.write64Slow(addr, val)
+}
+
+func (c *CPU) write64Slow(addr uint32, val uint64) {
+	if !c.checkAddr(addr, 8) {
+		return
+	}
+	c.noteCodeWrite(addr, 8)
+	binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
+}
+
+// noteCodeWrite flushes the decoded-instruction cache when a guest store touches cached code.
+func (c *CPU) noteCodeWrite(addr, size uint32) {
+	if addr < c.CodeHi && addr+size > c.CodeLo && c.dcache != nil {
+		c.FlushCodeCache()
+	}
 }
 
 func (c *CPU) WriteF32(addr uint32, val float32) {

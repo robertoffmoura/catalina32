@@ -525,6 +525,18 @@ func (c *CPU) Step() {
 		}
 	}
 
+	if c.EIP >= c.CodeLo && c.EIP < c.CodeHi {
+		d := &c.dcache[c.EIP&dcacheMask]
+		if d.tag != c.EIP {
+			c.decodeCached(d, c.EIP)
+		}
+		if d.kind != dSlow {
+			c.Steps++
+			c.execCached(d)
+			return
+		}
+	}
+
 	startEIP := c.EIP
 	c.Steps++
 
