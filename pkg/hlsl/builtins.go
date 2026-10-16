@@ -403,6 +403,15 @@ func (c *compiler) intrinsic(e *CallExpr) *cval {
 		if smp.t.Base != BSampler {
 			failf(e.Line, "%s: first argument must be a sampler", e.Name)
 		}
+		if k := smp.konst; k != nil {
+			seen := false
+			for _, x := range c.prog.TexSamplers {
+				seen = seen || x == k
+			}
+			if !seen {
+				c.prog.TexSamplers = append(c.prog.TexSamplers, k)
+			}
+		}
 		t := vectorType(BFloat, 4)
 		tmp := c.temp(t)
 		se, ce, so, co, cn := smp.eval, coord.eval, smp.off, coord.off, coord.t.Size()

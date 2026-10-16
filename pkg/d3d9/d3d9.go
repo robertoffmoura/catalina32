@@ -39,6 +39,7 @@ type BufferDesc struct {
 }
 
 type VertexDecl struct {
+	Elements        []VertexElement
 	Summary         string
 	HasPos          bool
 	PosOffset       uint16
@@ -87,6 +88,7 @@ type Subsystem struct {
 	vtQuery9     uint32
 	vtSwapChain9 uint32
 	vtD3DXBuffer uint32
+	vtConstTable uint32
 	vtDInput8    uint32
 	vtDIDevice8  uint32
 	vtDSound8    uint32
@@ -137,7 +139,18 @@ type Subsystem struct {
 	fpsTime           time.Time // live-mode FPS report window start
 	fpsFrame, fpsStep uint64
 	renderWait        time.Duration
-	shaderDumps       int // emulator time blocked on the previous frame's drawing
+	shaderDumps       int
+
+	// Real shader pipeline (shaders.go)
+	RealShaders         bool
+	shaderCache         map[string]*compiledShader
+	shaderBlobs         map[uint32]*compiledShader // ID3DXBuffer data -> shader
+	shaderObjs          map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
+	constTables         map[uint32]*compiledShader
+	curVS, curPS        *compiledShader
+	shaderConstsDirty   bool
+	shaderErrors        int
+	loggedConstTableSet bool // emulator time blocked on the previous frame's drawing
 
 	KeyMu        sync.Mutex
 	KeyHoldUntil [256]uint64
@@ -192,6 +205,12 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 	s.vtQuery9 = s.buildVTable(c, "IDirect3DQuery9", 16, s.handleIDirect3DQuery9)
 	s.vtSwapChain9 = s.buildVTable(c, "IDirect3DSwapChain9", 24, s.handleIDirect3DSwapChain9)
 	s.vtD3DXBuffer = s.buildVTable(c, "ID3DXBuffer", 16, s.handleID3DXBuffer)
+	s.vtConstTable = s.buildVTable(c, "ID3DXConstantTable", 40, s.handleID3DXConstantTable)
+	s.RealShaders = RealShadersEnabled()
+	s.shaderCache = map[string]*compiledShader{}
+	s.shaderBlobs = map[uint32]*compiledShader{}
+	s.shaderObjs = map[uint32]*compiledShader{}
+	s.constTables = map[uint32]*compiledShader{}
 	s.vtDInput8 = s.buildVTable(c, "IDirectInput8A", 20, s.handleIDirectInput8)
 	s.vtDIDevice8 = s.buildVTable(c, "IDirectInputDevice8A", 40, s.handleIDirectInputDevice8)
 	s.vtDSound8 = s.buildVTable(c, "IDirectSound8", 24, s.handleIDirectSound8)
@@ -841,6 +860,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 				elType := c.Mem[pElem+i*8+4]
 				usage := c.Mem[pElem+i*8+6]
 				usageIdx := c.Mem[pElem+i*8+7]
+				vd.Elements = append(vd.Elements, VertexElement{Stream: stream, Offset: off, Type: elType, Usage: usage, UIdx: usageIdx})
 				switch usage {
 				case 0: // D3DDECLUSAGE_POSITION
 					if usageIdx == 0 {
@@ -885,8 +905,16 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 	case 91: // CreateVertexShader(this, pFunction, ppShader)
 		pp := c.Arg(2)
 		if pp != 0 {
-			c.Write32(pp, s.allocCOMObject(c, s.vtVertexShdr, 16))
+			obj := s.allocCOMObject(c, s.vtVertexShdr, 16)
+			if cs := s.shaderBlobs[c.Arg(1)]; cs != nil {
+				s.shaderObjs[obj] = cs
+			}
+			c.Write32(pp, obj)
 		}
+		c.Regs[cpu.RegEAX] = 0
+	case 92: // SetVertexShader(this, pShader)
+		s.curVS = s.shaderObjs[c.Arg(1)]
+		s.shaderConstsDirty = true
 		c.Regs[cpu.RegEAX] = 0
 	case 94: // SetVertexShaderConstantF(this, StartRegister, pConstantData, Vector4fCount)
 		startReg := int(c.Arg(1))
@@ -895,6 +923,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if startReg == 16 {
 			s.NumSkinMatrices = 0
 		}
+		s.shaderConstsDirty = true
 		if pData != 0 {
 			for i := 0; i < vecCount && startReg+i < 256; i++ {
 				for j := 0; j < 4; j++ {
@@ -917,10 +946,19 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 	case 106: // CreatePixelShader(this, pFunction, ppShader)
 		pp := c.Arg(2)
 		if pp != 0 {
-			c.Write32(pp, s.allocCOMObject(c, s.vtPixelShdr, 16))
+			obj := s.allocCOMObject(c, s.vtPixelShdr, 16)
+			if cs := s.shaderBlobs[c.Arg(1)]; cs != nil {
+				s.shaderObjs[obj] = cs
+			}
+			c.Write32(pp, obj)
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 107: // SetPixelShader(this, pShader)
+		s.curPS = s.shaderObjs[c.Arg(1)]
+		s.shaderConstsDirty = true
+		c.Regs[cpu.RegEAX] = 0
 	case 109: // SetPixelShaderConstantF
+		s.shaderConstsDirty = true
 		startReg := int(c.Arg(1))
 		pData := c.Arg(2)
 		vecCount := int(c.Arg(3))
@@ -1243,6 +1281,9 @@ func (s *Subsystem) thunkD3DXCompileShader(c *cpu.CPU) {
 		name := fmt.Sprintf("%04d_%s_%s.hlsl", s.shaderDumps, profile, entry)
 		_ = os.MkdirAll(dir, 0755)
 		_ = os.WriteFile(filepath.Join(dir, name), src, 0644)
+	}
+	if s.RealShaders && s.compileShaderReal(c) {
+		return
 	}
 	if ppShader != 0 {
 		c.Write32(ppShader, s.allocD3DXBuffer(c, 64))

@@ -19,8 +19,17 @@ func Install(c *cpu.CPU, d3d *d3d9.Subsystem, prof *profile.Profile) {
 	// Unidentified MacDoze helper whose result the engine ignores.
 	c.RegisterIntercept(0x00620da0, "MacDoze::Unknown_620da0", returnZero)
 
+	d3d.InputScript = inputScript
+
 	// Skip the fullscreen bloom/blur post-processing pass over the software framebuffer.
 	c.RegisterIntercept(0x0001d900, "NuPostProcessRender", returnZero)
+	if d3d.RealShaders {
+		// The engine discovers registers through the real ID3DXConstantTable and uploads its own
+		// constants, textures and skin matrices: none of the material/constant hooks below apply.
+		patchNuTexRead(c)
+		registerLifted(c)
+		return
+	}
 	// Prevent directional lightmap binding from overwriting the stage 0 diffuse texture (layer0_sampler).
 	c.RegisterIntercept(0x0006f840, "NuBindLightmaps", returnZero)
 	c.RegisterIntercept(0x00070730, "NuBindLightmapsA", returnZero)
@@ -30,15 +39,17 @@ func Install(c *cpu.CPU, d3d *d3d9.Subsystem, prof *profile.Profile) {
 	// Populate NuShader constant & sampler descriptors so NuShaderBindMaterial binds textures & material colors.
 	c.RegisterIntercept(0x001535c0, "NuShaderParseConstantTable", nuShaderParseConstantTable)
 	c.RegisterIntercept(0x001538f0, "NuShaderBindMaterial", func(c *cpu.CPU) { nuShaderBindMaterial(d3d, c) })
-	// Patch NuTexRead (0x00078df0) at 0x00079088 (jne 0x000791d0 -> 6x NOP) so .GSC textures with
-	// flags & 0x3c0c are never skipped.
+	patchNuTexRead(c)
+
+	registerLifted(c)
+}
+
+// patchNuTexRead patches NuTexRead (0x00078df0) at 0x00079088 (jne 0x000791d0 -> 6x NOP) so .GSC
+// textures with flags & 0x3c0c are never skipped.
+func patchNuTexRead(c *cpu.CPU) {
 	for i := uint32(0); i < 6; i++ {
 		c.Mem[0x00079088+i] = 0x90
 	}
-
-	d3d.InputScript = inputScript
-
-	registerLifted(c)
 }
 
 func returnZero(c *cpu.CPU) {

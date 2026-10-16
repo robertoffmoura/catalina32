@@ -405,6 +405,9 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	if vp+12 > uint32(len(c.Mem)) {
 		return screenVertex{}
 	}
+	if s.realShading() {
+		return s.shadeVertex(c, vp, stride, isUP)
+	}
 	x := c.ReadF32(vp + 0)
 	y := c.ReadF32(vp + 4)
 	z := c.ReadF32(vp + 8)
@@ -1124,6 +1127,9 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 	if s.BoundTextures[1] != 0 {
 		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
 	}
+	if s.realShading() {
+		texRes, texRes1 = s.realTexture(c), nil
+	}
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
 		for i := uint32(0); i < primCount; i++ {
@@ -1172,6 +1178,9 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	}
 	if s.BoundTextures[1] != 0 {
 		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
+	}
+	if s.realShading() {
+		texRes, texRes1 = s.realTexture(c), nil
 	}
 	readIdx := func(n uint32) uint32 {
 		pos := startIdx + n

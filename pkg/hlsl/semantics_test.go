@@ -93,9 +93,9 @@ func TestSemantics(t *testing.T) {
 		return s.M[vy.Offset : vy.Offset+vy.Components]
 	}
 	want := map[string][]float32{
-		"POSITION": {2 + 10, 4 + 20, 6 + 30, 1},     // scaled by bone 1, then translated
+		"POSITION": {2 + 10, 4 + 20, 6 + 30, 1},           // scaled by bone 1, then translated
 		"COLOR":    {0.3 * 1, 0.2 * 0.5, 0.1 * 0.25, 0.5}, // .bgra * tint, a = k
-		"TEXCOORD": {3*2 + 1 - 1, 4 * 2, -1},        // twice(float3(3,4,1)) ; x += M[0][0]-1 ; z = -1
+		"TEXCOORD": {3*2 + 1 - 1, 4 * 2, -1},              // twice(float3(3,4,1)) ; x += M[0][0]-1 ; z = -1
 	}
 	for sem, w := range want {
 		idx := 0

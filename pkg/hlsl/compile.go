@@ -15,12 +15,14 @@ type Program struct {
 	Outputs   []*Varying  // return value (flattened struct fields) by semantic
 	MemSize   int         // float slots per invocation (see NewState)
 
-	run      func(m []float32)
-	retOff   int
-	inits    []func(m []float32) // static/global initialisers, run once per State
-	consts   []*Constant
-	Sampler  func(unit int, coord []float32, cube bool) [4]float32 // texture lookups (optional)
-	uniformT []func(m []float32)                                   // per-batch: copy registers into uniform slots (set by Load*)
+	run     func(m []float32)
+	retOff  int
+	inits   []func(m []float32) // static/global initialisers, run once per State
+	consts  []*Constant
+	Sampler func(unit int, coord []float32, cube bool) [4]float32 // texture lookups (optional)
+	// TexSamplers lists the sampler uniforms passed to texture lookups, in code order.
+	TexSamplers []*Constant
+	uniformT    []func(m []float32) // per-batch: copy registers into uniform slots (set by Load*)
 }
 
 // Register sets, as in D3DXREGISTER_SET.
@@ -429,10 +431,11 @@ func (c *compiler) stmt(s Stmt) stmtFn {
 // cval is a compiled expression: after eval(m), its value is in m[off : off+t.Size()]
 // (contiguous). Lvalues additionally carry store information.
 type cval struct {
-	t    *Type
-	eval func(m []float32) // never nil; no-op for values already in storage
-	off  int
-	lv   *lvalue
+	t     *Type
+	eval  func(m []float32) // never nil; no-op for values already in storage
+	off   int
+	lv    *lvalue
+	konst *Constant // set when the value is a uniform read directly
 }
 
 // lvalue describes an assignable location: base slot (static or dynamic) plus an optional
@@ -454,7 +457,7 @@ func (c *compiler) lookup(name string, line int) *cval {
 		}
 	}
 	if g := c.global(name, line); g != nil {
-		v := &cval{t: g.decl.Type, eval: noop, off: g.off}
+		v := &cval{t: g.decl.Type, eval: noop, off: g.off, konst: g.constant}
 		if g.constant == nil {
 			v.lv = &lvalue{base: g.off}
 		}
