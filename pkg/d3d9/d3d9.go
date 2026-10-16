@@ -186,41 +186,20 @@ func (s *Subsystem) allocSurface(c *cpu.CPU, width, height, format uint32) uint3
 	if bufSize > 4*1024*1024 {
 		bufSize = 4 * 1024 * 1024
 	}
-	dataPtr := c.Malloc(bufSize)
+	// Guest backing store is allocated lazily (guestBuf on LockRect): GetSurfaceLevel is called every frame and
+	// eagerly reserving a 3.6MB buffer each time exhausted the guest heap after ~2800 frames.
 	s.Resources[obj] = &BufferDesc{
-		DataPtr: dataPtr,
-		Length:  bufSize,
-		Format:  format,
-		Width:   width,
-		Height:  height,
-		Pitch:   pitch,
+		Length: bufSize,
+		Format: format,
+		Width:  width,
+		Height: height,
+		Pitch:  pitch,
 	}
 	return obj
 }
 
 func (s *Subsystem) allocTexture(c *cpu.CPU, width, height, format uint32) uint32 {
-	if width == 0 {
-		width = 64
-	}
-	if height == 0 {
-		height = 64
-	}
-	obj := s.allocCOMObject(c, s.vtTexture9, 32)
-	pitch := width * 4
-	bufSize := pitch * height
-	if bufSize > 4*1024*1024 {
-		bufSize = 4 * 1024 * 1024
-	}
-	dataPtr := c.Malloc(bufSize)
-	s.Resources[obj] = &BufferDesc{
-		DataPtr: dataPtr,
-		Length:  bufSize,
-		Format:  format,
-		Width:   width,
-		Height:  height,
-		Pitch:   pitch,
-	}
-	return obj
+	return s.allocTextureLazy(c, width, height, format)
 }
 
 // allocTextureLazy creates a texture object whose pixels live host-side; no guest memory is reserved until

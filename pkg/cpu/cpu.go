@@ -7,9 +7,12 @@ import (
 )
 
 const (
-	ArenaSize         = 0x20000000 // 512 MB 32-bit guest address space
-	HeapStartAddr     = 0x04000000
-	HeapEndAddr       = 0x1e000000
+	ArenaSize     = 0x20000000 // 512 MB 32-bit guest address space
+	HeapStartAddr = 0x04000000
+	HeapEndAddr   = 0x1e000000
+	// Host-reserved guest region (D3D vtable + trampoline arenas live here); the heap must never allocate inside it.
+	ReservedLo        = 0x0f000000
+	ReservedHi        = 0x0f400000
 	StackTopAddr      = 0x1fef0000
 	SentinelReturnEIP = 0x0ffffff0
 	ExitReturnEIP     = 0x0ffffff4
@@ -71,8 +74,8 @@ type CPU struct {
 	MXCSR uint32
 
 	// Heap allocator state
-	HeapPtr   uint32
-	AllocSize map[uint32]uint32
+	HeapPtr    uint32
+	AllocSize  map[uint32]uint32
 	FreeBlocks map[uint32][]uint32 // size class -> free list
 
 	// Intercept table (stubs, MacDoze, IndirectX, COM vtables, Lifted functions)
@@ -325,6 +328,9 @@ func (c *CPU) Malloc(size uint32) uint32 {
 		c.AllocSize[ptr] = aligned
 		return ptr
 	}
+	if c.HeapPtr < ReservedHi && c.HeapPtr+aligned > ReservedLo {
+		c.HeapPtr = ReservedHi // skip the host-reserved region
+	}
 	if c.HeapPtr+aligned > HeapEndAddr {
 		panic(fmt.Sprintf("guest heap exhausted (HeapPtr=0x%08x, req=%d)", c.HeapPtr, aligned))
 	}
@@ -440,7 +446,7 @@ func (c *CPU) UpdateFlagsAdd32(a, b, res uint32) {
 	c.SetFlag(FlagSF, (res&0x80000000) != 0)
 	c.SetFlag(FlagPF, parity8(uint8(res)))
 	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, ((^(a ^ b) & (a ^ res)) & 0x80000000) != 0)
+	c.SetFlag(FlagOF, ((^(a^b)&(a^res))&0x80000000) != 0)
 }
 
 func (c *CPU) UpdateFlagsSub32(a, b, res uint32) {
@@ -449,7 +455,7 @@ func (c *CPU) UpdateFlagsSub32(a, b, res uint32) {
 	c.SetFlag(FlagSF, (res&0x80000000) != 0)
 	c.SetFlag(FlagPF, parity8(uint8(res)))
 	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, (((a ^ b) & (a ^ res)) & 0x80000000) != 0)
+	c.SetFlag(FlagOF, (((a^b)&(a^res))&0x80000000) != 0)
 }
 
 func (c *CPU) UpdateFlagsAdd16(a, b, res uint16) {
@@ -458,7 +464,7 @@ func (c *CPU) UpdateFlagsAdd16(a, b, res uint16) {
 	c.SetFlag(FlagSF, (res&0x8000) != 0)
 	c.SetFlag(FlagPF, parity8(uint8(res)))
 	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, ((^(a ^ b) & (a ^ res)) & 0x8000) != 0)
+	c.SetFlag(FlagOF, ((^(a^b)&(a^res))&0x8000) != 0)
 }
 
 func (c *CPU) UpdateFlagsSub16(a, b, res uint16) {
@@ -467,7 +473,7 @@ func (c *CPU) UpdateFlagsSub16(a, b, res uint16) {
 	c.SetFlag(FlagSF, (res&0x8000) != 0)
 	c.SetFlag(FlagPF, parity8(uint8(res)))
 	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, (((a ^ b) & (a ^ res)) & 0x8000) != 0)
+	c.SetFlag(FlagOF, (((a^b)&(a^res))&0x8000) != 0)
 }
 
 func (c *CPU) UpdateFlagsAdd8(a, b, res uint8) {
@@ -476,7 +482,7 @@ func (c *CPU) UpdateFlagsAdd8(a, b, res uint8) {
 	c.SetFlag(FlagSF, (res&0x80) != 0)
 	c.SetFlag(FlagPF, parity8(res))
 	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, ((^(a ^ b) & (a ^ res)) & 0x80) != 0)
+	c.SetFlag(FlagOF, ((^(a^b)&(a^res))&0x80) != 0)
 }
 
 func (c *CPU) UpdateFlagsSub8(a, b, res uint8) {
@@ -485,7 +491,7 @@ func (c *CPU) UpdateFlagsSub8(a, b, res uint8) {
 	c.SetFlag(FlagSF, (res&0x80) != 0)
 	c.SetFlag(FlagPF, parity8(res))
 	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, (((a ^ b) & (a ^ res)) & 0x80) != 0)
+	c.SetFlag(FlagOF, (((a^b)&(a^res))&0x80) != 0)
 }
 
 func (c *CPU) EvalCond(cc uint8) bool {
