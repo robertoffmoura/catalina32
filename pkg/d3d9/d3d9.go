@@ -5,6 +5,7 @@ import (
 	"image"
 	"math"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -135,14 +136,15 @@ type Subsystem struct {
 	LastPresentTime   time.Time
 	fpsTime           time.Time // live-mode FPS report window start
 	fpsFrame, fpsStep uint64
-	renderWait        time.Duration // emulator time blocked on the previous frame's drawing
+	renderWait        time.Duration
+	shaderDumps       int // emulator time blocked on the previous frame's drawing
 
-	KeyMu             sync.Mutex
-	KeyHoldUntil      [256]uint64
-	AutoKeysMode      string
+	KeyMu        sync.Mutex
+	KeyHoldUntil [256]uint64
+	AutoKeysMode string
 	// InputScript, when set by the game profile, presses scripted keys (DIK-indexed, 0x80 = down)
 	// for the C32_AUTO_KEYS mode in effect; used for unattended test runs.
-	InputScript func(s *Subsystem, mode string, keys []byte)
+	InputScript       func(s *Subsystem, mode string, keys []byte)
 	CubeTexCount      uint64
 	TitleFirstFrame   uint64
 	CantinaFirstFrame uint64
@@ -952,8 +954,8 @@ func (s *Subsystem) fillSurfaceDesc(c *cpu.CPU, obj uint32, pDesc uint32) {
 		w, h, fmtCode = res.Width, res.Height, res.Format
 	}
 	c.Write32(pDesc+0, fmtCode)
-	c.Write32(pDesc+4, 1) // Type = D3DRTYPE_SURFACE
-	c.Write32(pDesc+8, 0) // Usage
+	c.Write32(pDesc+4, 1)  // Type = D3DRTYPE_SURFACE
+	c.Write32(pDesc+8, 0)  // Usage
 	c.Write32(pDesc+12, 1) // Pool = D3DPOOL_MANAGED
 	c.Write32(pDesc+16, 0) // MultiSampleType
 	c.Write32(pDesc+20, 0) // MultiSampleQuality
@@ -1234,6 +1236,14 @@ func (s *Subsystem) thunkD3DXCompileShader(c *cpu.CPU) {
 	ppShader := c.Arg(7)
 	ppErr := c.Arg(8)
 	ppConst := c.Arg(9)
+	if dir := os.Getenv("C32_DUMP_SHADERS"); dir != "" {
+		src := c.Mem[c.Arg(0) : c.Arg(0)+c.Arg(1)]
+		entry, profile := c.ReadCString(c.Arg(4)), c.ReadCString(c.Arg(5))
+		s.shaderDumps++
+		name := fmt.Sprintf("%04d_%s_%s.hlsl", s.shaderDumps, profile, entry)
+		_ = os.MkdirAll(dir, 0755)
+		_ = os.WriteFile(filepath.Join(dir, name), src, 0644)
+	}
 	if ppShader != 0 {
 		c.Write32(ppShader, s.allocD3DXBuffer(c, 64))
 	}
@@ -1281,8 +1291,8 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 			clear(c.Mem[inst : inst+580])
 			c.Write32(inst+0, 580)
 			kb := []byte{0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}
-			copy(c.Mem[inst+4:], kb)  // guidInstance
-			copy(c.Mem[inst+20:], kb) // guidProduct
+			copy(c.Mem[inst+4:], kb)       // guidInstance
+			copy(c.Mem[inst+20:], kb)      // guidProduct
 			c.Write32(inst+36, 0x00000413) // DI8DEVTYPE_KEYBOARD | (DI8DEVTYPEKEYBOARD_PCENH << 8)
 			c.WriteCString(inst+40, "Keyboard")
 			c.WriteCString(inst+300, "Keyboard")

@@ -3,6 +3,7 @@ package lswsaga
 import (
 	"encoding/binary"
 	"math"
+	"os"
 
 	"catalina32/pkg/cpu"
 )
@@ -18,7 +19,9 @@ func registerLifted(c *cpu.CPU) {
 	c.RegisterIntercept(0x0026ee60, "lifted::NuStrNICmp_0026ee60", liftedNuStrNICmp)
 	c.RegisterIntercept(0x00275250, "lifted::NuFile_ReadU16_00275250", liftedNuFileReadU16)
 	c.RegisterIntercept(0x0020f130, "lifted::NuStrSliceEq_0020f130", liftedNuStrSliceEq)
-	c.RegisterIntercept(0x002aee50, "lifted::NuShaderGenerateHLSL_002aee50", liftedNuShaderGenerateHLSL)
+	if os.Getenv("C32_REAL_HLSL") != "1" { // C32_REAL_HLSL=1 runs the engine's own HLSL generator
+		c.RegisterIntercept(0x002aee50, "lifted::NuShaderGenerateHLSL_002aee50", liftedNuShaderGenerateHLSL)
+	}
 	c.RegisterIntercept(0x002767c6, "lifted::NuTxtDispatchLoop_002767c6", liftedNuTxtDispatchLoop)
 	c.RegisterIntercept(0x00275c10, "lifted::NuTxtReadToken_00275c10", liftedNuTxtReadToken)
 	c.RegisterIntercept(0x00275510, "lifted::NuTxtReadLine_00275510", liftedNuTxtReadLine)
@@ -997,4 +1000,3 @@ func liftedNuSqrt(c *cpu.CPU) {
 	}
 	c.Ret()
 }
-
