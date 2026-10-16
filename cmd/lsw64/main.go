@@ -89,6 +89,13 @@ func main() {
 	// 2. Call WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1) at 0x00209d10
 	fmt.Printf("[lsw64] Launching WinMain(0x00001000, 0, 0x%08x, 1) @ 0x00209d10...\n", w32.CmdLineAddr)
 	vm.MaxSteps = 1_100_000_000
+	vm.TraceCalls = os.Getenv("LSW_TRACE_CALLS") == "1"
+	if v := os.Getenv("LSW_GUEST_PROF"); v != "" { // value = first step to sample from
+		from, _ := strconv.ParseUint(v, 10, 64)
+		vm.TraceCalls = true
+		vm.ProfEvery, vm.ProfFrom = 997, from
+		vm.ProfSelf, vm.ProfIncl = map[uint32]uint64{}, map[uint32]uint64{}
+	}
 	if pf := os.Getenv("LSW_CPUPROF"); pf != "" {
 		if f, err := os.Create(pf); err == nil {
 			_ = pprof.StartCPUProfile(f)
@@ -114,6 +121,7 @@ func main() {
 	vm.NestDepth = -1 // WinMain is the top-level thread; keep depth 0 inside it so the scheduler may preempt
 	ret, err := vm.CallGuest(0x00209d10, 0x00001000, 0, w32.CmdLineAddr, 1)
 	pprof.StopCPUProfile()
+	dumpGuestProfile(vm)
 	if err != nil {
 		fmt.Printf("[lsw64] WinMain stopped: %v\n  State: %s\n", err, vm.DumpState())
 		fmt.Printf("  CallStack depth=%d:\n", len(vm.CallStack))
@@ -141,4 +149,28 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("[lsw64] WinMain returned EAX=0x%08x after %d instructions!\n", ret, vm.Steps)
+}
+
+// dumpGuestProfile prints the guest functions that consumed the most sampled x86 steps.
+func dumpGuestProfile(vm *cpu.CPU) {
+	if vm.ProfSamples == 0 {
+		return
+	}
+	type kv struct {
+		addr  uint32
+		count uint64
+	}
+	report := func(title string, m map[uint32]uint64) {
+		var top []kv
+		for k, v := range m {
+			top = append(top, kv{k, v})
+		}
+		sort.Slice(top, func(i, j int) bool { return top[i].count > top[j].count })
+		fmt.Printf("[PROF] %s (%d samples, 1 per %d steps):\n", title, vm.ProfSamples, vm.ProfEvery)
+		for i := 0; i < len(top) && i < 40; i++ {
+			fmt.Printf("[PROF]   0x%08x %6.2f%%  %s\n", top[i].addr, 100*float64(top[i].count)/float64(vm.ProfSamples), vm.InterceptTag[top[i].addr])
+		}
+	}
+	report("self", vm.ProfSelf)
+	report("inclusive", vm.ProfIncl)
 }

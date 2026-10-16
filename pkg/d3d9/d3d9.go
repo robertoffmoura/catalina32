@@ -148,6 +148,7 @@ type Subsystem struct {
 	LastClearColor uint32
 	fbDirty        bool
 	TraceLog       bool
+	frameTris      []queuedTri
 }
 
 func NewSubsystem(c *cpu.CPU) *Subsystem {
@@ -728,7 +729,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			fmt.Printf("[D3D9] Title screen detected at Frame #%d (CubeTexCount=%d, FrameDrawCalls=%d)\n", s.FrameCount, s.CubeTexCount, s.FrameDrawCalls)
 		}
 		if s.rendering && (s.FrameDrawCalls > 0 || s.FrameCount == 1) {
+			s.flushFrameTriangles()
 			s.exportFramePNG()
+		} else {
+			s.frameTris = s.frameTris[:0]
 		}
 		if s.ShmFile != nil && s.AutoKeysMode == "off" {
 			if !s.LastPresentTime.IsZero() {
@@ -868,6 +872,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		col := c.Arg(4)
 		s.LastClearColor = col
 		if s.rendering && s.fbDirty && s.FrameDrawCalls == 0 {
+			s.frameTris = s.frameTris[:0]
 			if (flags & 1) != 0 {
 				s.clearFramebuffer(col)
 			}
@@ -961,6 +966,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 					s.CantinaDIPLogged = 1
 					s.CantinaFirstFrame = s.FrameCount
 					s.rendering = true
+					s.frameTris = s.frameTris[:0]
 					s.clearFramebuffer(0xFF000000)
 					s.clearZBuffer(1.0)
 				}

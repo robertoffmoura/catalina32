@@ -103,6 +103,13 @@ To ensure this runtime can be open-sourced on GitHub as a general runner for 32-
    - Parallelize scanline band rasterization across host CPU cores (and/or offload triangles to Metal/OpenGL in `LSWWindow`) and support general `D3DXCompileShader` constant tables (`ID3DXConstantTable`).
 
 ## Session log (latest first)
+- **Parallel band rasterizer, vertex cache, guest profiler**:
+  - `rasterizeScreenTriangle` now queues `queuedTri`s into `s.frameTris`; `Present()` calls `flushFrameTriangles()`, which rasterizes 8 horizontal 90px bands on parallel goroutines (bands own disjoint framebuffer/Z rows, so no locks). Safe because `Clear` only acts when `FrameDrawCalls == 0` (no mid-frame clears); the queue is reset on clears and on the first-Cantina-DIP clear.
+  - Additive blending (`ALPHABLENDENABLE` + `DESTBLEND == D3DBLEND_ONE`) no longer writes Z; Cantina band stage lights now glow instead of drawing black quads.
+  - `rasterizeIndexedBatch` uses a 256-entry post-transform vertex cache. Live mode renders every frame (was every 2nd).
+  - `CallStack`/`VisitedFuncs` bookkeeping only when `LSW_TRACE_CALLS=1`; `CallGuestNested` stop address uses `NestDepth`.
+  - Benchmark (`LSW_AUTO_KEYS=outside`, headless renders every 5th frame): Cantina frames 540→600 take 5.07s vs 6.16s before (−18%); frames bit-identical except the additive lights.
+  - New `LSW_GUEST_PROF=<fromStep>`: samples the guest call stack every 997 steps and prints top self/inclusive guest functions at exit (`[PROF]` lines) — use it to pick functions to lift.
 - **Ogg Vorbis Music Streaming, 3D DirectSound Separation, 60 FPS Menu Clock, Indoor/Outdoor Multi-Layer Textures & Vorbis/3D Fast-Paths**:
   - **Ogg Vorbis Music Streaming (`titles.ogg`, `qui_moscant1.ogg`, `qui_mos_a.ogg`)**: Fixed `0x0060b8a0` (`GetFileSize`, previously mis-registered as `FlushFileBuffers` returning `1` byte), implemented `timeSetEvent` (`0x00624310`) and `timeKillEvent` (`0x006245f0`, previously mis-registered as `CreateThread`), added missing `libm` functions (`_rintf`, `_rint`, `_atan`, `_log`, `_exp`, `_frexp`, `_ldexp`) in `pkg/crt/crt.go`, and fixed `IDirectSoundBuffer8::Lock` (`dwBytes == 0` guard) so background Ogg Vorbis tracks decode and stream cleanly into the circular `IDirectSoundBuffer8`.
   - **3D Sound Effects & Duplicate Voice Cleanup (`IDirectSoundBuffer8::QueryInterface`)**: Separated `IID_IDirectSound3DBuffer8` (`0x279afa86`) onto its own COM object (`s.dummy3DObj`, `s.vtDS3DBuffer`) so `IDirectSound3DBuffer8::SetMode` (slot 18) no longer collides with `IDirectSoundBuffer8::Stop` (slot 18) every frame, and added `RefCount`/`IsDuplicate` cleanup on `Release` so one-shot SFX buffers (like death/fall screams) are removed once released.

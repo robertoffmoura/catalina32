@@ -1,6 +1,7 @@
 package cpu
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/bits"
 )
@@ -12,13 +13,13 @@ func (c *CPU) Fetch8() uint8 {
 }
 
 func (c *CPU) Fetch16() uint16 {
-	v := c.Read16(c.EIP)
+	v := binary.LittleEndian.Uint16(c.Mem[c.EIP : c.EIP+2])
 	c.EIP += 2
 	return v
 }
 
 func (c *CPU) Fetch32() uint32 {
-	v := c.Read32(c.EIP)
+	v := binary.LittleEndian.Uint32(c.Mem[c.EIP : c.EIP+4])
 	c.EIP += 4
 	return v
 }
@@ -1515,7 +1516,7 @@ func (c *CPU) Step() {
 		rel := int32(c.Fetch32())
 		target := uint32(int32(c.EIP) + rel)
 		c.Push32(c.EIP)
-		if rel != 0 { // Skip recording PIC call $+5
+		if c.TraceCalls && rel != 0 { // Skip recording PIC call $+5
 			c.CallStack = append(c.CallStack, CallFrame{
 				CallerEIP: startEIP,
 				TargetEIP: target,
@@ -1739,12 +1740,14 @@ func (c *CPU) Step() {
 		case 2: // CALL r/m32
 			target := c.readRM32(modrm, segOverride, hasSeg)
 			c.Push32(c.EIP)
-			c.CallStack = append(c.CallStack, CallFrame{
-				CallerEIP: startEIP,
-				TargetEIP: target,
-				ESP:       c.Regs[RegESP],
-			})
-			c.VisitedFuncs[target]++
+			if c.TraceCalls {
+				c.CallStack = append(c.CallStack, CallFrame{
+					CallerEIP: startEIP,
+					TargetEIP: target,
+					ESP:       c.Regs[RegESP],
+				})
+				c.VisitedFuncs[target]++
+			}
 			c.EIP = target
 		case 4: // JMP r/m32
 			target := c.readRM32(modrm, segOverride, hasSeg)
@@ -1883,6 +1886,9 @@ func (c *CPU) RunUntil(stopEIP uint32) error {
 				break
 			}
 		}
+		if c.ProfEvery > 0 && c.Steps%c.ProfEvery == 0 && c.Steps >= c.ProfFrom {
+			c.sampleProfile()
+		}
 		c.Step()
 	}
 	if c.Halted {
@@ -1917,7 +1923,7 @@ func (c *CPU) CallGuestNested(fnAddr uint32, args ...uint32) (uint32, error) {
 	savedFlags := c.Flags
 	savedXMM := c.XMM
 	savedEIP := c.EIP
-	stopEIP := uint32(0x1FFFF000 - len(c.CallStack)*4)
+	stopEIP := uint32(0x1FFFF000 - (c.NestDepth+2)*4)
 
 	argBytes := uint32(len(args) * 4)
 	c.Regs[RegESP] = (c.Regs[RegESP] - 64 - argBytes) & ^uint32(15)

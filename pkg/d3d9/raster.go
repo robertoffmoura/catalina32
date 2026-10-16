@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"lsw64/pkg/cpu"
@@ -40,6 +41,17 @@ type screenVertex struct {
 	invW           float32 // 1/w for perspective-correct texturing (1 for pre-transformed / 2D vertices)
 }
 
+type queuedTri struct {
+	v0, v1, v2   screenVertex
+	texRes       *BufferDesc
+	texRes1      *BufferDesc
+	minX, maxX   int
+	minY, maxY   int
+	invArea      float32
+	alphaEnabled bool
+	additive     bool
+}
+
 // nearW is the minimum clip-space w accepted before perspective divide. Triangles crossing it are clipped.
 const nearW = 0.05
 
@@ -61,7 +73,7 @@ func (s *Subsystem) wantRender(frame uint64) bool {
 	}
 	if s.CantinaDIPLogged > 0 || (liveMode && s.TitleFirstFrame > 0) {
 		if liveMode {
-			return frame%2 == 0 || frame%uint64(renderEvery) == 0
+			return true
 		}
 		return frame%5 == 0 || frame%uint64(renderEvery) == 0
 	}
@@ -690,7 +702,6 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 	}
 
 	hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
-	hasTex1 := texRes1 != nil && len(texRes1.Pixels) > 0 && texRes1.Width > 0 && texRes1.Height > 0
 
 	// Skip fullscreen post-process / fade / pillarbox quads so they don't overwrite the software framebuffer
 	if !hasTex && ((maxX-minX) >= 1100 && (maxY-minY) >= 600 || (!is3D && v0.r < 16 && v0.g < 16 && v0.b < 16 && ((maxX-minX) >= 24 || (maxY-minY) >= 24))) {
@@ -701,205 +712,288 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 	if area > -0.001 && area < 0.001 {
 		return
 	}
-	invArea := 1.0 / area
-	dw0dx := (v1.sy - v2.sy) * invArea
-	dw1dx := (v2.sy - v0.sy) * invArea
 
-	isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (maxY-minY) <= 64
-	alphaEnabled := s.RenderStates[27] != 0 || s.RenderStates[15] != 0
-	sampleTex := hasTex && v0.u > -900.0
-	sampleTex1 := hasTex1 && v0.u1 > -900.0 && (v0.blend1 > 0.01 || v1.blend1 > 0.01 || v2.blend1 > 0.01)
+	s.frameTris = append(s.frameTris, queuedTri{
+		v0:           v0,
+		v1:           v1,
+		v2:           v2,
+		texRes:       texRes,
+		texRes1:      texRes1,
+		minX:         minX,
+		maxX:         maxX,
+		minY:         minY,
+		maxY:         maxY,
+		invArea:      1.0 / area,
+		alphaEnabled: s.RenderStates[27] != 0 || s.RenderStates[15] != 0,
+		additive:     s.RenderStates[27] != 0 && s.RenderStates[20] == 2,
+	})
+}
 
-	var texW, texH, wMask, hMask uint32
-	var texWf, texHf float32
-	var isPow2, isDXT1 bool
-	var texPixels []uint32
-	if sampleTex {
-		texW = texRes.Width
-		texH = texRes.Height
-		texWf = float32(texW)
-		texHf = float32(texH)
-		isPow2 = (texW&(texW-1)) == 0 && (texH&(texH-1)) == 0
-		wMask = texW - 1
-		hMask = texH - 1
-		isDXT1 = texRes.Format == 0x31545844
-		texPixels = texRes.Pixels
+func (s *Subsystem) flushFrameTriangles() {
+	if len(s.frameTris) == 0 || s.Framebuffer == nil {
+		s.frameTris = s.frameTris[:0]
+		return
 	}
-
-	var tex1W, tex1H, w1Mask, h1Mask uint32
-	var tex1Wf, tex1Hf float32
-	var isPow2_1 bool
-	var tex1Pixels []uint32
-	if sampleTex1 {
-		tex1W = texRes1.Width
-		tex1H = texRes1.Height
-		tex1Wf = float32(tex1W)
-		tex1Hf = float32(tex1H)
-		isPow2_1 = (tex1W&(tex1W-1)) == 0 && (tex1H&(tex1H-1)) == 0
-		w1Mask = tex1W - 1
-		h1Mask = tex1H - 1
-		tex1Pixels = texRes1.Pixels
+	const numBands = 8
+	const bandH = ScreenHeight / numBands
+	var wg sync.WaitGroup
+	wg.Add(numBands)
+	for b := 0; b < numBands; b++ {
+		bMinY := b * bandH
+		bMaxY := (b+1)*bandH - 1
+		if b == numBands-1 {
+			bMaxY = ScreenHeight - 1
+		}
+		go func(yLo, yHi int) {
+			defer wg.Done()
+			s.rasterizeBand(yLo, yHi)
+		}(bMinY, bMaxY)
 	}
+	wg.Wait()
+	s.frameTris = s.frameTris[:0]
+}
 
-	v0r, v1r, v2r := float32(v0.r), float32(v1.r), float32(v2.r)
-	perspTex := (sampleTex || sampleTex1) && v0.invW > 0 && v1.invW > 0 && v2.invW > 0 &&
-		(v0.invW != v1.invW || v1.invW != v2.invW)
-	u0w, u1w, u2w := v0.u*v0.invW, v1.u*v1.invW, v2.u*v2.invW
-	t0w, t1w, t2w := v0.v*v0.invW, v1.v*v1.invW, v2.v*v2.invW
-	l1u0w, l1u1w, l1u2w := v0.u1*v0.invW, v1.u1*v1.invW, v2.u1*v2.invW
-	l1t0w, l1t1w, l1t2w := v0.v1*v0.invW, v1.v1*v1.invW, v2.v1*v2.invW
-	v0g, v1g, v2g := float32(v0.g), float32(v1.g), float32(v2.g)
-	v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
-	v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
-
+func (s *Subsystem) rasterizeBand(bandMinY, bandMaxY int) {
 	pix := s.Framebuffer.Pix
 	zbuf := s.ZBuffer
-	pxStart := float32(minX) + 0.5
-	for y := minY; y <= maxY; y++ {
-		py := float32(y) + 0.5
-		rowIdx := y * ScreenWidth
-		w0 := ((v1.sx-pxStart)*(v2.sy-py) - (v1.sy-py)*(v2.sx-pxStart)) * invArea
-		w1 := ((v2.sx-pxStart)*(v0.sy-py) - (v2.sy-py)*(v0.sx-pxStart)) * invArea
-		for x := minX; x <= maxX; x++ {
-			w2 := 1.0 - w0 - w1
-			if w0 >= 0 && w1 >= 0 && w2 >= 0 {
-				z := w0*v0.sz + w1*v1.sz + w2*v2.sz
-				zIdx := rowIdx + x
-				if !is3D || z <= zbuf[zIdx] {
-					r := uint8(w0*v0r + w1*v1r + w2*v2r)
-					g := uint8(w0*v0g + w1*v1g + w2*v2g)
-					b := uint8(w0*v0b + w1*v1b + w2*v2b)
-					a := uint8(w0*v0a + w1*v1a + w2*v2a)
-					skip := false
+	for i := range s.frameTris {
+		qt := &s.frameTris[i]
+		if qt.maxY < bandMinY || qt.minY > bandMaxY {
+			continue
+		}
+		yStart := qt.minY
+		if yStart < bandMinY {
+			yStart = bandMinY
+		}
+		yEnd := qt.maxY
+		if yEnd > bandMaxY {
+			yEnd = bandMaxY
+		}
 
-					if sampleTex {
-						var tu, tv, iw float32
-						if perspTex {
-							iw = w0*v0.invW + w1*v1.invW + w2*v2.invW
-							tu = (w0*u0w + w1*u1w + w2*u2w) / iw
-							tv = (w0*t0w + w1*t1w + w2*t2w) / iw
-						} else {
-							tu = w0*v0.u + w1*v1.u + w2*v2.u
-							tv = w0*v0.v + w1*v1.v + w2*v2.v
-						}
-						var tx, ty uint32
-						if isPow2 {
-							ui := int32(tu * texWf)
-							if tu < 0 {
-								ui--
+		v0, v1, v2 := qt.v0, qt.v1, qt.v2
+		minX, maxX := qt.minX, qt.maxX
+		invArea := qt.invArea
+		texRes, texRes1 := qt.texRes, qt.texRes1
+
+		is3D := v0.sz > 0.001 || v1.sz > 0.001 || v2.sz > 0.001
+		hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
+		hasTex1 := texRes1 != nil && len(texRes1.Pixels) > 0 && texRes1.Width > 0 && texRes1.Height > 0
+
+		dw0dx := (v1.sy - v2.sy) * invArea
+		dw1dx := (v2.sy - v0.sy) * invArea
+
+		isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (qt.maxY-qt.minY) <= 64
+		alphaEnabled := qt.alphaEnabled
+		sampleTex := hasTex && v0.u > -900.0
+		sampleTex1 := hasTex1 && v0.u1 > -900.0 && (v0.blend1 > 0.01 || v1.blend1 > 0.01 || v2.blend1 > 0.01)
+
+		var texW, texH, wMask, hMask uint32
+		var texWf, texHf float32
+		var isPow2, isDXT1 bool
+		var texPixels []uint32
+		if sampleTex {
+			texW = texRes.Width
+			texH = texRes.Height
+			texWf = float32(texW)
+			texHf = float32(texH)
+			isPow2 = (texW&(texW-1)) == 0 && (texH&(texH-1)) == 0
+			wMask = texW - 1
+			hMask = texH - 1
+			isDXT1 = texRes.Format == 0x31545844
+			texPixels = texRes.Pixels
+		}
+
+		var tex1W, tex1H, w1Mask, h1Mask uint32
+		var tex1Wf, tex1Hf float32
+		var isPow2_1 bool
+		var tex1Pixels []uint32
+		if sampleTex1 {
+			tex1W = texRes1.Width
+			tex1H = texRes1.Height
+			tex1Wf = float32(tex1W)
+			tex1Hf = float32(tex1H)
+			isPow2_1 = (tex1W&(tex1W-1)) == 0 && (tex1H&(tex1H-1)) == 0
+			w1Mask = tex1W - 1
+			h1Mask = tex1H - 1
+			tex1Pixels = texRes1.Pixels
+		}
+
+		v0r, v1r, v2r := float32(v0.r), float32(v1.r), float32(v2.r)
+		perspTex := (sampleTex || sampleTex1) && v0.invW > 0 && v1.invW > 0 && v2.invW > 0 &&
+			(v0.invW != v1.invW || v1.invW != v2.invW)
+		u0w, u1w, u2w := v0.u*v0.invW, v1.u*v1.invW, v2.u*v2.invW
+		t0w, t1w, t2w := v0.v*v0.invW, v1.v*v1.invW, v2.v*v2.invW
+		l1u0w, l1u1w, l1u2w := v0.u1*v0.invW, v1.u1*v1.invW, v2.u1*v2.invW
+		l1t0w, l1t1w, l1t2w := v0.v1*v0.invW, v1.v1*v1.invW, v2.v1*v2.invW
+		v0g, v1g, v2g := float32(v0.g), float32(v1.g), float32(v2.g)
+		v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
+		v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
+
+		pxStart := float32(minX) + 0.5
+		for y := yStart; y <= yEnd; y++ {
+			py := float32(y) + 0.5
+			rowIdx := y * ScreenWidth
+			w0 := ((v1.sx-pxStart)*(v2.sy-py) - (v1.sy-py)*(v2.sx-pxStart)) * invArea
+			w1 := ((v2.sx-pxStart)*(v0.sy-py) - (v2.sy-py)*(v0.sx-pxStart)) * invArea
+			for x := minX; x <= maxX; x++ {
+				w2 := 1.0 - w0 - w1
+				if w0 >= 0 && w1 >= 0 && w2 >= 0 {
+					z := w0*v0.sz + w1*v1.sz + w2*v2.sz
+					zIdx := rowIdx + x
+					if !is3D || z <= zbuf[zIdx] {
+						r := uint8(w0*v0r + w1*v1r + w2*v2r)
+						g := uint8(w0*v0g + w1*v1g + w2*v2g)
+						b := uint8(w0*v0b + w1*v1b + w2*v2b)
+						a := uint8(w0*v0a + w1*v1a + w2*v2a)
+						skip := false
+
+						if sampleTex {
+							var tu, tv, iw float32
+							if perspTex {
+								iw = w0*v0.invW + w1*v1.invW + w2*v2.invW
+								tu = (w0*u0w + w1*u1w + w2*u2w) / iw
+								tv = (w0*t0w + w1*t1w + w2*t2w) / iw
+							} else {
+								tu = w0*v0.u + w1*v1.u + w2*v2.u
+								tv = w0*v0.v + w1*v1.v + w2*v2.v
 							}
-							vi := int32(tv * texHf)
-							if tv < 0 {
-								vi--
+							var tx, ty uint32
+							if isPow2 {
+								ui := int32(tu * texWf)
+								if tu < 0 {
+									ui--
+								}
+								vi := int32(tv * texHf)
+								if tv < 0 {
+									vi--
+								}
+								tx = uint32(ui) & wMask
+								ty = uint32(vi) & hMask
+							} else {
+								tu = tu - float32(math.Floor(float64(tu)))
+								tv = tv - float32(math.Floor(float64(tv)))
+								tx = uint32(tu*texWf) % texW
+								ty = uint32(tv*texHf) % texH
 							}
-							tx = uint32(ui) & wMask
-							ty = uint32(vi) & hMask
-						} else {
-							tu = tu - float32(math.Floor(float64(tu)))
-							tv = tv - float32(math.Floor(float64(tv)))
-							tx = uint32(tu*texWf) % texW
-							ty = uint32(tv*texHf) % texH
-						}
-						tp := texPixels[ty*texW+tx]
-						if tp == 0 && !isDXT1 && !sampleTex1 {
-							skip = true
-						} else {
-							tr := uint8(tp & 0xFF)
-							tg := uint8((tp >> 8) & 0xFF)
-							tb := uint8((tp >> 16) & 0xFF)
-							ta := uint8((tp >> 24) & 0xFF)
-							if sampleTex1 {
-								b1 := w0*v0.blend1 + w1*v1.blend1 + w2*v2.blend1
-								if b1 > 0.01 {
-									var tu1, tv1 float32
-									if perspTex {
-										tu1 = (w0*l1u0w + w1*l1u1w + w2*l1u2w) / iw
-										tv1 = (w0*l1t0w + w1*l1t1w + w2*l1t2w) / iw
-									} else {
-										tu1 = w0*v0.u1 + w1*v1.u1 + w2*v2.u1
-										tv1 = w0*v0.v1 + w1*v1.v1 + w2*v2.v1
-									}
-									var tx1, ty1 uint32
-									if isPow2_1 {
-										ui1 := int32(tu1 * tex1Wf)
-										if tu1 < 0 {
-											ui1--
+							tp := texPixels[ty*texW+tx]
+							if tp == 0 && !isDXT1 && !sampleTex1 {
+								skip = true
+							} else {
+								tr := uint8(tp & 0xFF)
+								tg := uint8((tp >> 8) & 0xFF)
+								tb := uint8((tp >> 16) & 0xFF)
+								ta := uint8((tp >> 24) & 0xFF)
+								if sampleTex1 {
+									b1 := w0*v0.blend1 + w1*v1.blend1 + w2*v2.blend1
+									if b1 > 0.01 {
+										var tu1, tv1 float32
+										if perspTex {
+											tu1 = (w0*l1u0w + w1*l1u1w + w2*l1u2w) / iw
+											tv1 = (w0*l1t0w + w1*l1t1w + w2*l1t2w) / iw
+										} else {
+											tu1 = w0*v0.u1 + w1*v1.u1 + w2*v2.u1
+											tv1 = w0*v0.v1 + w1*v1.v1 + w2*v2.v1
 										}
-										vi1 := int32(tv1 * tex1Hf)
-										if tv1 < 0 {
-											vi1--
+										var tx1, ty1 uint32
+										if isPow2_1 {
+											ui1 := int32(tu1 * tex1Wf)
+											if tu1 < 0 {
+												ui1--
+											}
+											vi1 := int32(tv1 * tex1Hf)
+											if tv1 < 0 {
+												vi1--
+											}
+											tx1 = uint32(ui1) & w1Mask
+											ty1 = uint32(vi1) & h1Mask
+										} else {
+											tu1 = tu1 - float32(math.Floor(float64(tu1)))
+											tv1 = tv1 - float32(math.Floor(float64(tv1)))
+											tx1 = uint32(tu1*tex1Wf) % tex1W
+											ty1 = uint32(tv1*tex1Hf) % tex1H
 										}
-										tx1 = uint32(ui1) & w1Mask
-										ty1 = uint32(vi1) & h1Mask
-									} else {
-										tu1 = tu1 - float32(math.Floor(float64(tu1)))
-										tv1 = tv1 - float32(math.Floor(float64(tv1)))
-										tx1 = uint32(tu1*tex1Wf) % tex1W
-										ty1 = uint32(tv1*tex1Hf) % tex1H
+										tp1 := tex1Pixels[ty1*tex1W+tx1]
+										tr1 := uint8(tp1 & 0xFF)
+										tg1 := uint8((tp1 >> 8) & 0xFF)
+										tb1 := uint8((tp1 >> 16) & 0xFF)
+										ta1 := uint8((tp1 >> 24) & 0xFF)
+										a1 := uint16(b1 * float32(ta1))
+										if a1 > 255 {
+											a1 = 255
+										}
+										ia1 := 255 - a1
+										tr = uint8((uint16(tr)*ia1 + uint16(tr1)*a1) / 255)
+										tg = uint8((uint16(tg)*ia1 + uint16(tg1)*a1) / 255)
+										tb = uint8((uint16(tb)*ia1 + uint16(tb1)*a1) / 255)
+										ta = 255
 									}
-									tp1 := tex1Pixels[ty1*tex1W+tx1]
-									tr1 := uint8(tp1 & 0xFF)
-									tg1 := uint8((tp1 >> 8) & 0xFF)
-									tb1 := uint8((tp1 >> 16) & 0xFF)
-									ta1 := uint8((tp1 >> 24) & 0xFF)
-									a1 := uint16(b1 * float32(ta1))
-									if a1 > 255 {
-										a1 = 255
-									}
-									ia1 := 255 - a1
-									tr = uint8((uint16(tr)*ia1 + uint16(tr1)*a1) / 255)
-									tg = uint8((uint16(tg)*ia1 + uint16(tg1)*a1) / 255)
-									tb = uint8((uint16(tb)*ia1 + uint16(tb1)*a1) / 255)
-									ta = 255
+								}
+								r = uint8((uint16(r) * uint16(tr)) / 255)
+								g = uint8((uint16(g) * uint16(tg)) / 255)
+								b = uint8((uint16(b) * uint16(tb)) / 255)
+								if !is3D || alphaEnabled {
+									a = uint8((uint16(a) * uint16(ta)) / 255)
+								} else {
+									a = 255
 								}
 							}
-							r = uint8((uint16(r) * uint16(tr)) / 255)
-							g = uint8((uint16(g) * uint16(tg)) / 255)
-							b = uint8((uint16(b) * uint16(tb)) / 255)
-							if !is3D || alphaEnabled {
-								a = uint8((uint16(a) * uint16(ta)) / 255)
-							} else {
-								a = 255
-							}
-						}
-					} else if isGlyphQuad {
-						rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
-						ry := float64(y-minY) / math.Max(1.0, float64(maxY-minY))
-						if rx < 0.15 || rx > 0.85 || ry < 0.15 || ry > 0.85 {
-							skip = true
-						} else {
-							uSeed := int(v0.u*256.0) + int(v0.v*512.0)
-							gx := int((rx - 0.15) / 0.70 * 5.0)
-							gy := int((ry - 0.15) / 0.70 * 7.0)
-							bit := ((uSeed*31 + gx*7 + gy*13) ^ (gx * gy)) & 3
-							if bit == 0 && gy != 0 && gy != 3 && gx != 2 {
+						} else if isGlyphQuad {
+							rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
+							ry := float64(y-qt.minY) / math.Max(1.0, float64(qt.maxY-qt.minY))
+							if rx < 0.15 || rx > 0.85 || ry < 0.15 || ry > 0.85 {
 								skip = true
+							} else {
+								uSeed := int(v0.u*256.0) + int(v0.v*512.0)
+								gx := int((rx - 0.15) / 0.70 * 5.0)
+								gy := int((ry - 0.15) / 0.70 * 7.0)
+								bit := ((uSeed*31 + gx*7 + gy*13) ^ (gx * gy)) & 3
+								if bit == 0 && gy != 0 && gy != 3 && gx != 2 {
+									skip = true
+								}
 							}
 						}
-					}
-					if !skip && a >= 8 {
-						if is3D && a >= 240 {
-							zbuf[zIdx] = z
-						}
-						off := zIdx * 4
-						if a == 255 {
-							pix[off+0] = r
-							pix[off+1] = g
-							pix[off+2] = b
-							pix[off+3] = 255
-						} else {
-							af := uint16(a)
-							ia := 255 - af
-							pix[off+0] = uint8((uint16(r)*af + uint16(pix[off+0])*ia) / 255)
-							pix[off+1] = uint8((uint16(g)*af + uint16(pix[off+1])*ia) / 255)
-							pix[off+2] = uint8((uint16(b)*af + uint16(pix[off+2])*ia) / 255)
-							pix[off+3] = 255
+						if !skip && a >= 8 {
+							if is3D && a >= 240 && !qt.additive {
+								zbuf[zIdx] = z
+							}
+							off := zIdx * 4
+							if qt.additive {
+								af := uint16(a)
+								rAdd := uint16(pix[off+0]) + (uint16(r)*af)/255
+								gAdd := uint16(pix[off+1]) + (uint16(g)*af)/255
+								bAdd := uint16(pix[off+2]) + (uint16(b)*af)/255
+								if rAdd > 255 {
+									rAdd = 255
+								}
+								if gAdd > 255 {
+									gAdd = 255
+								}
+								if bAdd > 255 {
+									bAdd = 255
+								}
+								pix[off+0] = uint8(rAdd)
+								pix[off+1] = uint8(gAdd)
+								pix[off+2] = uint8(bAdd)
+								pix[off+3] = 255
+							} else if a == 255 {
+								pix[off+0] = r
+								pix[off+1] = g
+								pix[off+2] = b
+								pix[off+3] = 255
+							} else {
+								af := uint16(a)
+								ia := 255 - af
+								pix[off+0] = uint8((uint16(r)*af + uint16(pix[off+0])*ia) / 255)
+								pix[off+1] = uint8((uint16(g)*af + uint16(pix[off+1])*ia) / 255)
+								pix[off+2] = uint8((uint16(b)*af + uint16(pix[off+2])*ia) / 255)
+								pix[off+3] = 255
+							}
 						}
 					}
 				}
+				w0 += dw0dx
+				w1 += dw1dx
 			}
-			w0 += dw0dx
-			w1 += dw1dx
 		}
 	}
 }
@@ -982,25 +1076,43 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		return uint32(int32(c.Read16(pIdx+pos*2)) + baseV)
 	}
 
+	var vCache [256]struct {
+		idx uint32
+		v   screenVertex
+	}
+	for k := range vCache {
+		vCache[k].idx = 0xFFFFFFFF
+	}
+	getVert := func(idx uint32) screenVertex {
+		slot := &vCache[idx&255]
+		if slot.idx == idx {
+			return slot.v
+		}
+		v := s.transformVertex(c, pVerts+idx*stride, stride, isUP)
+		slot.idx = idx
+		slot.v = v
+		return v
+	}
+
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
 		for i := uint32(0); i < primCount; i++ {
 			i0 := readIdx(i*3 + 0)
 			i1 := readIdx(i*3 + 1)
 			i2 := readIdx(i*3 + 2)
-			v0 := s.transformVertex(c, pVerts+i0*stride, stride, isUP)
-			v1 := s.transformVertex(c, pVerts+i1*stride, stride, isUP)
-			v2 := s.transformVertex(c, pVerts+i2*stride, stride, isUP)
+			v0 := getVert(i0)
+			v1 := getVert(i1)
+			v2 := getVert(i2)
 			s.rasterizeTriangle(c, v0, v1, v2, texRes, texRes1)
 		}
 	case 5: // D3DPT_TRIANGLESTRIP
 		i0 := readIdx(0)
 		i1 := readIdx(1)
-		v0 := s.transformVertex(c, pVerts+i0*stride, stride, isUP)
-		v1 := s.transformVertex(c, pVerts+i1*stride, stride, isUP)
+		v0 := getVert(i0)
+		v1 := getVert(i1)
 		for i := uint32(0); i < primCount; i++ {
 			i2 := readIdx(i + 2)
-			v2 := s.transformVertex(c, pVerts+i2*stride, stride, isUP)
+			v2 := getVert(i2)
 			if i0 != i1 && i1 != i2 && i0 != i2 {
 				if i&1 == 1 {
 					s.rasterizeTriangle(c, v0, v2, v1, texRes, texRes1)

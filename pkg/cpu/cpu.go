@@ -93,6 +93,15 @@ type CPU struct {
 	UnmappedCalls map[uint32]uint64
 	VisitedFuncs  map[uint32]uint64
 
+	// Guest sampling profiler (enabled when ProfEvery > 0; needs TraceCalls for function attribution).
+	// Every ProfEvery steps past ProfFrom, the innermost call frame is charged in ProfSelf and every
+	// distinct frame on the call stack in ProfIncl.
+	ProfEvery   uint64
+	ProfFrom    uint64
+	ProfSamples uint64
+	ProfSelf    map[uint32]uint64
+	ProfIncl    map[uint32]uint64
+
 	// Green-thread scheduling support. NestDepth counts host-initiated nested guest calls
 	// (CallGuest/CallGuestNested); thread switches are only legal at depth 0.
 	NestDepth       int
@@ -145,7 +154,7 @@ func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 
 // Memory accessors
 func (c *CPU) checkAddr(addr uint32, sz uint32) bool {
-	if uint64(addr)+uint64(sz) > uint64(len(c.Mem)) {
+	if uint64(addr)+uint64(sz) > ArenaSize {
 		c.Halted = true
 		c.HaltReason = fmt.Sprintf("OOB memory access addr=0x%08x at EIP=0x%08x", addr, c.EIP)
 		return false
@@ -306,9 +315,30 @@ func (c *CPU) ArgF32(i int) float32 {
 	return math.Float32frombits(c.Arg(i))
 }
 
+func (c *CPU) sampleProfile() {
+	c.ProfSamples++
+	if len(c.CallStack) == 0 {
+		c.ProfSelf[0]++
+		return
+	}
+	c.ProfSelf[c.CallStack[len(c.CallStack)-1].TargetEIP]++
+	for i, f := range c.CallStack {
+		dup := false
+		for _, g := range c.CallStack[i+1:] {
+			if g.TargetEIP == f.TargetEIP {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			c.ProfIncl[f.TargetEIP]++
+		}
+	}
+}
+
 func (c *CPU) Ret() {
 	c.EIP = c.Pop32()
-	if len(c.CallStack) > 0 {
+	if c.TraceCalls && len(c.CallStack) > 0 {
 		c.CallStack = c.CallStack[:len(c.CallStack)-1]
 	}
 }
@@ -316,7 +346,7 @@ func (c *CPU) Ret() {
 func (c *CPU) RetN(popBytes uint32) {
 	c.EIP = c.Pop32()
 	c.Regs[RegESP] += popBytes
-	if len(c.CallStack) > 0 {
+	if c.TraceCalls && len(c.CallStack) > 0 {
 		c.CallStack = c.CallStack[:len(c.CallStack)-1]
 	}
 }
