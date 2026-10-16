@@ -75,6 +75,7 @@ func RegisterCRT(c *CPUWrapper, img *macho32.Image) {
 	c.RegisterIntercept(0x008c17a0, "decode_packed_entry_number", thunkVorbisDecodePackedEntryNumber)
 	c.RegisterIntercept(0x008c1ef0, "vorbis_book_decodev_set", thunkVorbisBookDecodevSet)
 	c.RegisterIntercept(0x008c1fe0, "vorbis_book_decodevv_add", thunkVorbisBookDecodevvAdd)
+	c.RegisterIntercept(mdctBackwardAddr, "mdct_backward", thunkMdctBackward)
 }
 
 type CPUWrapper = cpu.CPU

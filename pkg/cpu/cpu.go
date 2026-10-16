@@ -152,6 +152,19 @@ func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 	c.InterceptTag[addr] = name
 }
 
+// SetInterceptEnabled toggles an already registered intercept, e.g. so a host thunk can run the
+// original guest code it replaces (differential verification).
+func (c *CPU) SetInterceptEnabled(addr uint32, on bool) {
+	if addr >= ArenaSize {
+		return
+	}
+	if on {
+		c.icept[addr>>6] |= 1 << (addr & 63)
+	} else {
+		c.icept[addr>>6] &^= 1 << (addr & 63)
+	}
+}
+
 // Memory accessors
 func (c *CPU) checkAddr(addr uint32, sz uint32) bool {
 	if uint64(addr)+uint64(sz) > ArenaSize {

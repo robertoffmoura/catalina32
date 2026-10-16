@@ -746,8 +746,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		s.mixAudioFrame(c)
 		s.rendering = s.wantRender(s.FrameCount + 1)
 		if s.TraceLog && (s.FrameCount <= 10 || s.FrameCount%30 == 0) {
-			fmt.Printf("[D3D9] Present() Frame #%d completed (DrawCalls=%d, Triangles=%d, Clears=%d, AudioSamples=%d)\n",
-				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.AudioWriteSamples)
+			fmt.Printf("[D3D9] Present() Frame #%d completed (DrawCalls=%d, Triangles=%d, Clears=%d, AudioSamples=%d, Steps=%d)\n",
+				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.AudioWriteSamples, c.Steps)
 		}
 		s.FrameDrawCalls = 0
 		c.Regs[cpu.RegEAX] = 0
