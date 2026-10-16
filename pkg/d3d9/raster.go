@@ -41,10 +41,28 @@ type screenVertex struct {
 	invW           float32 // 1/w for perspective-correct texturing (1 for pre-transformed / 2D vertices)
 }
 
+// texSnap is the texture state a queued triangle samples. Texture updates replace a resource's
+// Pixels slice rather than writing into it, so the snapshot stays valid while the frame is drawn
+// on the render goroutine.
+type texSnap struct {
+	Pixels                []uint32
+	Width, Height, Format uint32
+}
+
+func snapTex(res *BufferDesc) texSnap {
+	if res == nil {
+		return texSnap{}
+	}
+	return texSnap{Pixels: res.Pixels, Width: res.Width, Height: res.Height, Format: res.Format}
+}
+
+// queuedTri is one render operation: a screen-space triangle, or (clearOp) a framebuffer/Z clear.
 type queuedTri struct {
 	v0, v1, v2   screenVertex
-	texRes       *BufferDesc
-	texRes1      *BufferDesc
+	tex0, tex1   texSnap
+	clearOp      bool
+	clearFlags   uint32
+	clearColor   uint32
 	minX, maxX   int
 	minY, maxY   int
 	invArea      float32
@@ -121,6 +139,23 @@ func (s *Subsystem) clearFramebuffer(argb uint32) {
 		pix[i+1] = g
 		pix[i+2] = b
 		pix[i+3] = a
+	}
+}
+
+// clearRows applies a Clear to framebuffer/Z rows y0..y1.
+func (s *Subsystem) clearRows(argb, flags uint32, y0, y1 int) {
+	if flags&1 != 0 {
+		r, g, b := uint8(argb>>16), uint8(argb>>8), uint8(argb)
+		pix := s.Framebuffer.Pix[y0*ScreenWidth*4 : (y1+1)*ScreenWidth*4]
+		for i := 0; i < len(pix); i += 4 {
+			pix[i+0], pix[i+1], pix[i+2], pix[i+3] = r, g, b, 0xFF
+		}
+	}
+	if flags&2 != 0 {
+		z := s.ZBuffer[y0*ScreenWidth : (y1+1)*ScreenWidth]
+		for i := range z {
+			z[i] = 1.0
+		}
 	}
 }
 
@@ -717,8 +752,8 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 		v0:           v0,
 		v1:           v1,
 		v2:           v2,
-		texRes:       texRes,
-		texRes1:      texRes1,
+		tex0:         snapTex(texRes),
+		tex1:         snapTex(texRes1),
 		minX:         minX,
 		maxX:         maxX,
 		minY:         minY,
@@ -729,9 +764,79 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 	})
 }
 
-func (s *Subsystem) flushFrameTriangles() {
-	if len(s.frameTris) == 0 || s.Framebuffer == nil {
-		s.frameTris = s.frameTris[:0]
+// frameInfo holds the counters exportFrame needs, captured when the frame is submitted.
+type frameInfo struct {
+	frame, drawCalls, triangles, steps uint64
+	frameDrawCalls                     uint64
+	cubeTexCount                       uint64
+}
+
+// queueClear records a Clear (D3DCLEAR_TARGET = 1, D3DCLEAR_ZBUFFER = 2) in draw order.
+func (s *Subsystem) queueClear(color, flags uint32) {
+	s.frameTris = append(s.frameTris, queuedTri{clearOp: true, clearFlags: flags, clearColor: color,
+		minY: 0, maxY: ScreenHeight - 1})
+}
+
+// submitFrame hands the frame's queued operations to the render goroutine, which draws and exports
+// them while the emulator runs the next frame. At most one frame is in flight.
+func (s *Subsystem) submitFrame() {
+	s.WaitRender()
+	info := frameInfo{frame: s.FrameCount, drawCalls: s.DrawCallCount, triangles: s.TriangleCount,
+		frameDrawCalls: s.FrameDrawCalls, cubeTexCount: s.CubeTexCount}
+	if s.VM != nil {
+		info.steps = s.VM.Steps
+	}
+	ops := s.frameTris
+	s.frameTris = s.spareTris[:0]
+	s.renderWG.Add(1)
+	go func() {
+		defer s.renderWG.Done()
+		s.drawOps(ops)
+		s.exportFrame(info)
+		s.spareTris = ops
+	}()
+	if syncRender {
+		s.WaitRender()
+	}
+}
+
+// syncRender (C32_SYNC_RENDER=1) draws each frame before the emulator continues, for A/B testing.
+var syncRender = os.Getenv("C32_SYNC_RENDER") == "1"
+
+// dropFrameKeepClears discards a frame that is not drawn, keeping its clears so they still reach the
+// framebuffer (they apply before the next submitted frame's operations).
+func (s *Subsystem) dropFrameKeepClears() {
+	kept := s.frameTris[:0]
+	for _, op := range s.frameTris {
+		if op.clearOp {
+			kept = append(kept, op)
+		}
+	}
+	s.frameTris = kept
+}
+
+// reportFPS prints frames and emulated instructions per second every 2 seconds (live mode only;
+// headless runs use a virtual clock, so wall-clock rates there are meaningless).
+func (s *Subsystem) reportFPS(c *cpu.CPU) {
+	now := time.Now()
+	if s.fpsTime.IsZero() {
+		s.fpsTime, s.fpsFrame, s.fpsStep = now, s.FrameCount, c.Steps
+		return
+	}
+	if dt := now.Sub(s.fpsTime).Seconds(); dt >= 2 {
+		fmt.Printf("[catalina32] %.1f FPS, %.1fM x86 instructions/s (frame %d)\n",
+			float64(s.FrameCount-s.fpsFrame)/dt, float64(c.Steps-s.fpsStep)/dt/1e6, s.FrameCount)
+		s.fpsTime, s.fpsFrame, s.fpsStep = now, s.FrameCount, c.Steps
+	}
+}
+
+// WaitRender blocks until the in-flight frame (if any) has been drawn and exported.
+func (s *Subsystem) WaitRender() {
+	s.renderWG.Wait()
+}
+
+func (s *Subsystem) drawOps(ops []queuedTri) {
+	if len(ops) == 0 || s.Framebuffer == nil {
 		return
 	}
 	const numBands = 8
@@ -746,18 +851,21 @@ func (s *Subsystem) flushFrameTriangles() {
 		}
 		go func(yLo, yHi int) {
 			defer wg.Done()
-			s.rasterizeBand(yLo, yHi)
+			s.rasterizeBand(ops, yLo, yHi)
 		}(bMinY, bMaxY)
 	}
 	wg.Wait()
-	s.frameTris = s.frameTris[:0]
 }
 
-func (s *Subsystem) rasterizeBand(bandMinY, bandMaxY int) {
+func (s *Subsystem) rasterizeBand(ops []queuedTri, bandMinY, bandMaxY int) {
 	pix := s.Framebuffer.Pix
 	zbuf := s.ZBuffer
-	for i := range s.frameTris {
-		qt := &s.frameTris[i]
+	for i := range ops {
+		qt := &ops[i]
+		if qt.clearOp {
+			s.clearRows(qt.clearColor, qt.clearFlags, bandMinY, bandMaxY)
+			continue
+		}
 		if qt.maxY < bandMinY || qt.minY > bandMaxY {
 			continue
 		}
@@ -773,11 +881,11 @@ func (s *Subsystem) rasterizeBand(bandMinY, bandMaxY int) {
 		v0, v1, v2 := qt.v0, qt.v1, qt.v2
 		minX, maxX := qt.minX, qt.maxX
 		invArea := qt.invArea
-		texRes, texRes1 := qt.texRes, qt.texRes1
+		texRes, texRes1 := &qt.tex0, &qt.tex1
 
 		is3D := v0.sz > 0.001 || v1.sz > 0.001 || v2.sz > 0.001
-		hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
-		hasTex1 := texRes1 != nil && len(texRes1.Pixels) > 0 && texRes1.Width > 0 && texRes1.Height > 0
+		hasTex := len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
+		hasTex1 := len(texRes1.Pixels) > 0 && texRes1.Width > 0 && texRes1.Height > 0
 
 		dw0dx := (v1.sy - v2.sy) * invArea
 		dw1dx := (v2.sy - v0.sy) * invArea
@@ -1126,7 +1234,7 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	}
 }
 
-func (s *Subsystem) exportFramePNG() {
+func (s *Subsystem) exportFrame(fi frameInfo) {
 	if s.Framebuffer == nil {
 		return
 	}
@@ -1138,13 +1246,10 @@ func (s *Subsystem) exportFramePNG() {
 
 	if s.ShmFile != nil {
 		var hdr [32]byte
-		steps := uint64(0)
-		if s.VM != nil {
-			steps = s.VM.Steps
-		}
-		binary.LittleEndian.PutUint64(hdr[0:8], s.FrameCount)
-		binary.LittleEndian.PutUint64(hdr[8:16], s.DrawCallCount)
-		binary.LittleEndian.PutUint64(hdr[16:24], s.TriangleCount)
+		steps := fi.steps
+		binary.LittleEndian.PutUint64(hdr[0:8], fi.frame)
+		binary.LittleEndian.PutUint64(hdr[8:16], fi.drawCalls)
+		binary.LittleEndian.PutUint64(hdr[16:24], fi.triangles)
 		binary.LittleEndian.PutUint64(hdr[24:32], steps)
 		_, _ = s.ShmFile.WriteAt(s.Framebuffer.Pix, ShmHeaderSize)
 		_, _ = s.ShmFile.WriteAt(hdr[:], 0)
@@ -1154,7 +1259,7 @@ func (s *Subsystem) exportFramePNG() {
 		if s.ShmFile != nil {
 			return
 		}
-		if s.FramesDir != "" && s.FrameCount%60 == 0 {
+		if s.FramesDir != "" && fi.frame%60 == 0 {
 			var buf bytes.Buffer
 			if err := fastPNG.Encode(&buf, s.Framebuffer); err == nil {
 				latestPath := filepath.Join(s.FramesDir, "latest.png")
@@ -1164,7 +1269,7 @@ func (s *Subsystem) exportFramePNG() {
 		return
 	}
 
-	if s.FramesDir != "" && (s.FrameDrawCalls > 0 || s.FrameCount == 1 || s.FrameCount%30 == 0) {
+	if s.FramesDir != "" && (fi.frameDrawCalls > 0 || fi.frame == 1 || fi.frame%30 == 0) {
 		var buf bytes.Buffer
 		if err := fastPNG.Encode(&buf, s.Framebuffer); err != nil {
 			return
@@ -1176,13 +1281,13 @@ func (s *Subsystem) exportFramePNG() {
 
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
 		_ = os.WriteFile(latestPath, pngBytes, 0644)
-		if s.CubeTexCount >= 8 && s.FrameDrawCalls > 50 {
+		if fi.cubeTexCount >= 8 && fi.frameDrawCalls > 50 {
 			cantinaPath := filepath.Join(s.FramesDir, "cantina_latest.png")
 			_ = os.WriteFile(cantinaPath, pngBytes, 0644)
-			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", s.FrameCount))
+			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))
 			_ = os.WriteFile(framePath, pngBytes, 0644)
-		} else if s.FrameCount == 1 || s.FrameCount == 30 || s.FrameCount == 60 || s.FrameCount == 90 || s.FrameCount == 120 || s.FrameCount%30 == 0 {
-			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", s.FrameCount))
+		} else if fi.frame == 1 || fi.frame == 30 || fi.frame == 60 || fi.frame == 90 || fi.frame == 120 || fi.frame%30 == 0 {
+			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))
 			_ = os.WriteFile(framePath, pngBytes, 0644)
 		}
 	}

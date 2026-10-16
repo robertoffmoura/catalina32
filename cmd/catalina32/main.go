@@ -125,6 +125,7 @@ func main() {
 	vm.NestDepth = -1 // WinMain is the top-level thread; keep depth 0 inside it so the scheduler may preempt
 	ret, err := vm.CallGuest(entry, 0x00001000, 0, w32.CmdLineAddr, 1)
 	pprof.StopCPUProfile()
+	d3d.WaitRender() // let the last submitted frame finish drawing/exporting
 	dumpGuestProfile(vm)
 	if err != nil {
 		fmt.Printf("[catalina32] WinMain stopped: %v\n  State: %s\n", err, vm.DumpState())
