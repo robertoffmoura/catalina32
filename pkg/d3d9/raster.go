@@ -39,6 +39,9 @@ var renderEvery = func() int {
 }()
 
 func (s *Subsystem) wantRender(frame uint64) bool {
+	if s.CantinaDIPLogged > 0 {
+		return frame%5 == 0 || frame%uint64(renderEvery) == 0
+	}
 	return frame <= 2 || frame%uint64(renderEvery) == 0
 }
 
@@ -343,28 +346,37 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		u = c.ReadF32(vp + 16)
 		v = c.ReadF32(vp + 20)
 	} else if stride >= 20 && vp+stride <= uint32(len(c.Mem)) {
-		u = c.ReadF32(vp + stride - 8)
-		v = c.ReadF32(vp + stride - 4)
-		// Derive subtle directional shading from vertex coordinates/normals
-		nx := c.ReadF32(vp + 12)
-		ny := c.ReadF32(vp + 16)
-		shade := float32(0.85)
-		if !math.IsNaN(float64(nx)) && !math.IsNaN(float64(ny)) && math.Abs(float64(nx)) <= 1.5 && math.Abs(float64(ny)) <= 1.5 {
-			shade = float32(0.65) + 0.35*(nx*0.5+ny*0.7)
-			if shade < 0.35 {
-				shade = 0.35
-			} else if shade > 1.0 {
-				shade = 1.0
-			}
+		if stride <= 32 {
+			u = c.ReadF32(vp + stride - 8)
+			v = c.ReadF32(vp + stride - 4)
+		} else if stride == 48 {
+			// Cantina floor (stride 48) binds a multi-UV lightmap atlas on stage 0; shade smoothly with sandstone normal lighting
+			u = -999.0
+			v = -999.0
+		} else {
+			// Sample base material texel (0,0) modulated by UBYTE4N 3D vertex normal lighting (preserves Jedi robe colors & door lights)
+			u = 0.0
+			v = 0.0
 		}
-		mr, mg, mb := float32(235), float32(225), float32(205)
+		// Decode packed UBYTE4N normal at vp+12 for directional 3D lighting
+		nx := float32(int(c.Mem[vp+12])-128) / 127.0
+		ny := float32(int(c.Mem[vp+13])-128) / 127.0
+		nz := float32(int(c.Mem[vp+14])-128) / 127.0
+		dot := nx*0.45 + ny*0.70 - nz*0.45
+		shade := float32(0.60) + 0.40*dot
+		if shade < 0.32 {
+			shade = 0.32
+		} else if shade > 1.0 {
+			shade = 1.0
+		}
+		mr, mg, mb := float32(225), float32(210), float32(185)
 		// If layer0_diffuse (PSConstants[112]) was bound by NuShaderBindMaterial, modulate by material diffuse color
 		mc := s.PSConstants[112]
 		if mc[0] > 0.01 || mc[1] > 0.01 || mc[2] > 0.01 {
 			if mc[0] <= 1.0 && mc[1] <= 1.0 && mc[2] <= 1.0 {
-				mr = float32(math.Min(255.0, float64(0.35+0.65*mc[0])*255.0))
-				mg = float32(math.Min(255.0, float64(0.35+0.65*mc[1])*255.0))
-				mb = float32(math.Min(255.0, float64(0.35+0.65*mc[2])*255.0))
+				mr = float32(math.Min(255.0, float64(0.30+0.70*mc[0])*255.0))
+				mg = float32(math.Min(255.0, float64(0.30+0.70*mc[1])*255.0))
+				mb = float32(math.Min(255.0, float64(0.30+0.70*mc[2])*255.0))
 			}
 		}
 		r = uint8(mr * shade)
@@ -374,45 +386,40 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 
 	// Case 0: Pre-transformed screen-space XYZRHW quad (x in [0..1280], y in [0..720], rhw == 1.0)
 	if stride == 28 && c.Read32(vp+12) == 0x3f800000 && x >= -1.0 && x <= float32(ScreenWidth)+1.0 && y >= -1.0 && y <= float32(ScreenHeight)+1.0 {
-		return screenVertex{sx: x, sy: y, sz: z, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
+		return screenVertex{sx: x, sy: y, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
 	}
 
 	// Case 1: DrawPrimitiveUP 2D UI/splash quads ([-1, 1] x [-1, 1])
 	if isUP {
 		sx := (x + 1.0) * 0.5 * float32(ScreenWidth)
 		sy := (1.0 - y) * 0.5 * float32(ScreenHeight)
-		return screenVertex{sx: sx, sy: sy, sz: z, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
+		return screenVertex{sx: sx, sy: sy, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
 	}
 
-	// Case 2: Transform 3D vertex by NuShaderParam 4x4 matrices at *0x00b2842c
-	// param[20] = worldViewProj, param[17] = world, param[19] = viewProj, param[21] = worldView
-	tableBase := c.Read32(0x00b2842c)
-	if tableBase != 0 && tableBase+92*100 <= uint32(len(c.Mem)) {
-		for _, pid := range []uint32{20, 19, 21, 17, 18} {
-			entry := tableBase + pid*92
-			m := entry + 0x1c
-			m00, m01, m02, m03 := c.ReadF32(m+0), c.ReadF32(m+4), c.ReadF32(m+8), c.ReadF32(m+12)
-			m10, m11, m12, m13 := c.ReadF32(m+16), c.ReadF32(m+20), c.ReadF32(m+24), c.ReadF32(m+28)
-			m20, m21, m22, m23 := c.ReadF32(m+32), c.ReadF32(m+36), c.ReadF32(m+40), c.ReadF32(m+44)
-			m30, m31, m32, m33 := c.ReadF32(m+48), c.ReadF32(m+52), c.ReadF32(m+56), c.ReadF32(m+60)
-			if m00 == 0 && m11 == 0 && m22 == 0 {
-				continue
-			}
-			cx := x*m00 + y*m10 + z*m20 + m30
-			cy := x*m01 + y*m11 + z*m21 + m31
-			cz := x*m02 + y*m12 + z*m22 + m32
-			cw := x*m03 + y*m13 + z*m23 + m33
-			if cw > 0.05 && cw < 1000.0 {
-				ndcX := cx / cw
-				ndcY := cy / cw
-				ndcZ := cz / cw
-				if ndcX >= -2.5 && ndcX <= 2.5 && ndcY >= -2.5 && ndcY <= 2.5 {
-					sx := (ndcX + 1.0) * 0.5 * float32(ScreenWidth)
-					sy := (1.0 - ndcY) * 0.5 * float32(ScreenHeight)
-					return screenVertex{sx: sx, sy: sy, sz: ndcZ, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
-				}
-			}
+	// Case 2: Transform 3D vertex using D3D9 VSConstants (c16..c18 = world, c0..c3 = viewProj, transposed dp4 layout)
+	vp0, vp1, vp2, vp3 := s.VSConstants[0], s.VSConstants[1], s.VSConstants[2], s.VSConstants[3]
+	if vp0[0] != 0 || vp0[2] != 0 || vp1[1] != 0 || vp2[0] != 0 {
+		wx, wy, wz := x, y, z
+		w0, w1, w2 := s.VSConstants[16], s.VSConstants[17], s.VSConstants[18]
+		if w0[0] != 0 || w0[1] != 0 || w0[2] != 0 || w1[0] != 0 || w1[1] != 0 || w1[2] != 0 {
+			wx = w0[0]*x + w0[1]*y + w0[2]*z + w0[3]
+			wy = w1[0]*x + w1[1]*y + w1[2]*z + w1[3]
+			wz = w2[0]*x + w2[1]*y + w2[2]*z + w2[3]
 		}
+		cx := vp0[0]*wx + vp0[1]*wy + vp0[2]*wz + vp0[3]
+		cy := vp1[0]*wx + vp1[1]*wy + vp1[2]*wz + vp1[3]
+		cz := vp2[0]*wx + vp2[1]*wy + vp2[2]*wz + vp2[3]
+		cw := vp3[0]*wx + vp3[1]*wy + vp3[2]*wz + vp3[3]
+		if cw <= 0.08 || cw > 1000.0 {
+			return screenVertex{}
+		}
+		ndcX, ndcY, ndcZ := cx/cw, cy/cw, cz/cw
+		if ndcX < -4.0 || ndcX > 4.0 || ndcY < -4.0 || ndcY > 4.0 {
+			return screenVertex{}
+		}
+		sx := (ndcX + 1.0) * 0.5 * float32(ScreenWidth)
+		sy := (1.0 - ndcY) * 0.5 * float32(ScreenHeight)
+		return screenVertex{sx: sx, sy: sy, sz: ndcZ, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
 	}
 
 	// Fallback perspective/orthographic projection into screen center
@@ -437,6 +444,10 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 	if maxX < 0 || minX >= ScreenWidth || maxY < 0 || minY >= ScreenHeight {
 		return
 	}
+	is3D := v0.sz > 0.001 || v1.sz > 0.001 || v2.sz > 0.001
+	if is3D && (maxY-minY) > 660 && (maxX-minX) > 660 {
+		return
+	}
 	if minX < 0 {
 		minX = 0
 	}
@@ -456,8 +467,8 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 	}
 	hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
 
-	// Skip untextured fullscreen post-process / render-target blit quads so they don't overwrite the software framebuffer
-	if !hasTex && (maxX-minX) >= 1100 && (maxY-minY) >= 600 {
+	// Skip fullscreen post-process / fade / pillarbox quads so they don't overwrite the software framebuffer
+	if !hasTex && ((maxX-minX) >= 1100 && (maxY-minY) >= 600 || (!is3D && v0.r < 16 && v0.g < 16 && v0.b < 16 && ((maxX-minX) >= 24 || (maxY-minY) >= 24))) {
 		return
 	}
 
@@ -469,8 +480,10 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 	isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (maxY-minY) <= 64
 
 	pix := s.Framebuffer.Pix
+	zbuf := s.ZBuffer
 	for y := minY; y <= maxY; y++ {
 		py := float32(y) + 0.5
+		rowIdx := y * ScreenWidth
 		for x := minX; x <= maxX; x++ {
 			px := float32(x) + 0.5
 			w0 := ((v1.sx-px)*(v2.sy-py) - (v1.sy-py)*(v2.sx-px)) * invArea
@@ -480,12 +493,17 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 				if w0 < 0 {
 					w0, w1, w2 = -w0, -w1, -w2
 				}
+				z := w0*v0.sz + w1*v1.sz + w2*v2.sz
+				zIdx := rowIdx + x
+				if is3D && z > zbuf[zIdx] {
+					continue
+				}
 				r := uint8(w0*float32(v0.r) + w1*float32(v1.r) + w2*float32(v2.r))
 				g := uint8(w0*float32(v0.g) + w1*float32(v1.g) + w2*float32(v2.g))
 				b := uint8(w0*float32(v0.b) + w1*float32(v1.b) + w2*float32(v2.b))
 				a := uint8(w0*float32(v0.a) + w1*float32(v1.a) + w2*float32(v2.a))
 
-				if hasTex {
+				if hasTex && v0.u > -900.0 {
 					tu := w0*v0.u + w1*v1.u + w2*v2.u
 					tv := w0*v0.v + w1*v1.v + w2*v2.v
 					tu = tu - float32(math.Floor(float64(tu)))
@@ -497,10 +515,20 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 					tg := uint8((tp >> 8) & 0xFF)
 					tb := uint8((tp >> 16) & 0xFF)
 					ta := uint8((tp >> 24) & 0xFF)
-					r = uint8((uint16(r) * uint16(tr)) / 255)
-					g = uint8((uint16(g) * uint16(tg)) / 255)
-					b = uint8((uint16(b) * uint16(tb)) / 255)
-					a = uint8((uint16(a) * uint16(ta)) / 255)
+					if is3D {
+						// In 3D opaque shaders, texture alpha is specular glossiness, not opacity
+						if tr > 0 || tg > 0 || tb > 0 {
+							r = uint8((uint16(r) * uint16(tr)) / 255)
+							g = uint8((uint16(g) * uint16(tg)) / 255)
+							b = uint8((uint16(b) * uint16(tb)) / 255)
+						}
+						a = 255
+					} else {
+						r = uint8((uint16(r) * uint16(tr)) / 255)
+						g = uint8((uint16(g) * uint16(tg)) / 255)
+						b = uint8((uint16(b) * uint16(tb)) / 255)
+						a = uint8((uint16(a) * uint16(ta)) / 255)
+					}
 				} else if isGlyphQuad {
 					// Procedural glyph stroke pattern derived from font atlas UV coordinates
 					rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
@@ -519,7 +547,10 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 				if a < 8 {
 					continue
 				}
-				off := (y*ScreenWidth + x) * 4
+				if is3D && a >= 240 {
+					zbuf[zIdx] = z
+				}
+				off := zIdx * 4
 				if a == 255 {
 					pix[off+0] = r
 					pix[off+1] = g
@@ -539,7 +570,7 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 }
 
 func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCount uint32, pVerts uint32, stride uint32, isUP bool) {
-	if pVerts == 0 || stride < 12 || primCount == 0 {
+	if pVerts == 0 || stride < 12 || primCount == 0 || !s.rendering {
 		return
 	}
 	if primCount > 4096 {
@@ -644,7 +675,12 @@ func (s *Subsystem) exportFramePNG() {
 	if s.FramesDir != "" && (s.FrameDrawCalls > 0 || s.FrameCount == 1 || s.FrameCount%30 == 0) {
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
 		_ = os.WriteFile(latestPath, pngBytes, 0644)
-		if s.FrameCount == 1 || s.FrameCount == 30 || s.FrameCount == 60 || s.FrameCount == 90 || s.FrameCount == 120 || s.FrameCount%30 == 0 {
+		if s.CubeTexCount >= 8 && s.FrameDrawCalls > 50 {
+			cantinaPath := filepath.Join(s.FramesDir, "cantina_latest.png")
+			_ = os.WriteFile(cantinaPath, pngBytes, 0644)
+			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", s.FrameCount))
+			_ = os.WriteFile(framePath, pngBytes, 0644)
+		} else if s.FrameCount == 1 || s.FrameCount == 30 || s.FrameCount == 60 || s.FrameCount == 90 || s.FrameCount == 120 || s.FrameCount%30 == 0 {
 			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", s.FrameCount))
 			_ = os.WriteFile(framePath, pngBytes, 0644)
 		}

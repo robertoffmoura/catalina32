@@ -78,9 +78,13 @@ type Subsystem struct {
 	FrameMu        sync.Mutex
 	LatestPNG      []byte
 
-	KeyMu        sync.Mutex
-	KeyHoldUntil [256]uint64
-	AutoKeysMode string
+	KeyMu           sync.Mutex
+	KeyHoldUntil    [256]uint64
+	AutoKeysMode    string
+	CubeTexCount      uint64
+	TitleFirstFrame   uint64
+	CantinaFirstFrame uint64
+	CantinaDIPLogged  int
 
 	FrameCount     uint64
 	DrawCallCount  uint64
@@ -482,6 +486,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 17: // Present
 		s.FrameCount++
+		if s.TitleFirstFrame == 0 && s.CubeTexCount >= 5 && s.FrameDrawCalls >= 10 {
+			s.TitleFirstFrame = s.FrameCount
+			fmt.Printf("[D3D9] Title screen detected at Frame #%d (CubeTexCount=%d, FrameDrawCalls=%d)\n", s.FrameCount, s.CubeTexCount, s.FrameDrawCalls)
+		}
 		if s.rendering {
 			s.exportFramePNG()
 		}
@@ -492,6 +500,11 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		s.FrameDrawCalls = 0
 		c.Regs[cpu.RegEAX] = 0
+		c.Ret()
+		if c.Preempt != nil {
+			c.Preempt(c)
+		}
+		return
 	case 18: // GetBackBuffer(this, iSwapChain, iBackBuffer, Type, ppBackBuffer)
 		pp := c.Arg(4)
 		if pp != 0 {
@@ -588,6 +601,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, surf)
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 37: // SetRenderTarget(this, RenderTargetIndex, pRenderTarget)
+		c.Regs[cpu.RegEAX] = 0
 	case 38: // GetRenderTarget(this, RenderTargetIndex, ppRenderTarget)
 		pp := c.Arg(2)
 		if pp != 0 {
@@ -664,7 +679,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if vbRes := s.Resources[s.StreamSources[0]]; vbRes != nil {
 			stride := s.StreamStrides[0]
 			pVerts := vbRes.DataPtr + s.StreamOffsets[0] + c.Arg(2)*stride
-			s.rasterizePrimitiveBatch(c, c.Arg(1), c.Arg(3), pVerts, stride, false)
+			is2D := (stride == 24 || stride == 20)
+			s.rasterizePrimitiveBatch(c, c.Arg(1), c.Arg(3), pVerts, stride, is2D)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 82: // DrawIndexedPrimitive(this, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount)
@@ -682,6 +698,13 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if vbRes != nil && ibRes != nil && !isPostProcessGrid {
 			pVerts := vbRes.DataPtr + s.StreamOffsets[0]
 			is32 := ibRes.Format == 102 // D3DFMT_INDEX32
+			if s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0 {
+				s.CantinaDIPLogged = 1
+				s.CantinaFirstFrame = s.FrameCount
+				s.rendering = true
+				s.clearFramebuffer(0xFF000000)
+				s.clearZBuffer(1.0)
+			}
 			s.rasterizeIndexedBatch(c, c.Arg(1), int32(c.Arg(2)), c.Arg(5), prims, pVerts, stride, ibRes.DataPtr, ibRes.Length, is32, false)
 		}
 		if s.TraceLog && s.DIPCount <= 15 {
@@ -1032,12 +1055,13 @@ func (s *Subsystem) allocD3DXBuffer(c *cpu.CPU, size uint32) uint32 {
 
 func (s *Subsystem) thunkD3DXAssembleShader(c *cpu.CPU) {
 	// 0x00691ef0 is D3DXCreateCubeTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppCubeTexture)
+	s.CubeTexCount++
 	ppCubeTex := c.Arg(3)
 	if ppCubeTex != 0 {
 		c.Write32(ppCubeTex, s.allocCOMObject(c, s.vtCubeTex9, 32))
 	}
 	if s.TraceLog {
-		fmt.Printf("[D3DX9] D3DXCreateCubeTextureFromFileInMemory(size=%d) -> S_OK\n", c.Arg(2))
+		fmt.Printf("[D3DX9] D3DXCreateCubeTextureFromFileInMemory(size=%d, count=%d) -> S_OK\n", c.Arg(2), s.CubeTexCount)
 	}
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
@@ -1138,12 +1162,18 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 				f := s.FrameCount
 				switch mode {
 				case "boot":
-					// Auto-advance past initial device selection & F2 prompt, then stop so we don't spam Pause Menu.
-					switch {
-					case (f >= 200 && f < 208) || (f >= 255 && f < 263) || (f >= 365 && f < 373):
-						c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
-					case f >= 315 && f < 323:
-						c.Mem[lpvData+0x3C] = 0x80 // DIK_F2
+					// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
+					if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
+						df := f - s.TitleFirstFrame
+						if (df >= 20 && df < 26) || (df >= 60 && df < 66) || (df >= 110 && df < 116) {
+							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
+						}
+					}
+					if s.CantinaFirstFrame > 0 && f >= s.CantinaFirstFrame {
+						cf := f - s.CantinaFirstFrame
+						if (cf >= 10 && cf < 16) || (cf >= 40 && cf < 46) {
+							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN (select Save Slot 1 -> start Cantina gameplay)
+						}
 					}
 				case "loop":
 					if f >= 200 {

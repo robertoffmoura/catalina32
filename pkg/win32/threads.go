@@ -95,6 +95,11 @@ func (env *Win32Env) switchTo(c *cpu.CPU, next *guestThread) {
 	c.LoadContext(&next.ctx)
 	s.cur = next
 	env.CurrentThreadId = next.handle
+	if next == s.threads[0] {
+		c.PreemptInterval = preemptIntervalSt
+	} else {
+		c.PreemptInterval = 100000
+	}
 }
 
 // yield gives other runnable threads a chance to run. No-op inside nested host-initiated guest calls.
