@@ -70,10 +70,24 @@ func (s *State) LoadConstants(regs [][4]float32) {
 
 // Run executes the entry point with the inputs currently stored in the input slots.
 func (s *State) Run() {
+	for _, t := range s.P.TexCalls {
+		s.M[t.flagOff] = 0
+	}
 	for _, f := range s.P.inits {
 		f(s.M)
 	}
 	s.P.run(s.M)
+}
+
+// TexCoord returns the coordinates passed to the first texture lookup (in code order) that ran
+// during the last Run on sampler register unit.
+func (s *State) TexCoord(unit int) ([]float32, bool) {
+	for _, t := range s.P.TexCalls {
+		if s.M[t.flagOff] != 0 && int(s.M[t.unitOff]) == unit {
+			return s.M[t.coordOff : t.coordOff+t.coordN], true
+		}
+	}
+	return nil, false
 }
 
 // Input returns the input element with the given semantic and index, or nil.

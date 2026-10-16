@@ -415,12 +415,15 @@ func (c *compiler) intrinsic(e *CallExpr) *cval {
 		t := vectorType(BFloat, 4)
 		tmp := c.temp(t)
 		se, ce, so, co, cn := smp.eval, coord.eval, smp.off, coord.off, coord.t.Size()
+		flag := c.alloc(1)
+		c.prog.TexCalls = append(c.prog.TexCalls, &TexCall{unitOff: so, coordOff: co, coordN: cn, flagOff: flag})
 		cube := e.Name[3] == 'C'
 		proj := e.Name == "tex2Dproj"
 		prog := c.prog
 		return &cval{t: t, off: tmp, eval: func(m []float32) {
 			se(m)
 			ce(m)
+			m[flag] = 1
 			var r [4]float32
 			if prog.Sampler != nil {
 				coords := m[co : co+cn]

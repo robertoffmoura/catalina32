@@ -15,14 +15,17 @@ type Program struct {
 	Outputs   []*Varying  // return value (flattened struct fields) by semantic
 	MemSize   int         // float slots per invocation (see NewState)
 
-	run     func(m []float32)
-	retOff  int
-	inits   []func(m []float32) // static/global initialisers, run once per State
-	consts  []*Constant
-	Sampler func(unit int, coord []float32, cube bool) [4]float32 // texture lookups (optional)
+	run    func(m []float32)
+	retOff int
+	inits  []func(m []float32) // static/global initialisers, run once per State
+	consts []*Constant
+	// Sampler, if set, performs texture lookups (otherwise they return white). It is shared by
+	// all States of the program, so it must not be set while States run concurrently.
+	Sampler func(unit int, coord []float32, cube bool) [4]float32
 	// TexSamplers lists the sampler uniforms passed to texture lookups, in code order.
 	TexSamplers []*Constant
-	uniformT    []func(m []float32) // per-batch: copy registers into uniform slots (set by Load*)
+	// TexCalls lists every texture lookup site in code order (see State.TexCoord).
+	TexCalls []*TexCall
 }
 
 // Register sets, as in D3DXREGISTER_SET.
@@ -42,6 +45,11 @@ type Constant struct {
 	RegisterCount int
 	Explicit      bool // register(...) given in source
 	off           int  // evaluator slot
+}
+
+// TexCall is one texture lookup site: its sampler unit, coordinate and executed-flag slots.
+type TexCall struct {
+	unitOff, coordOff, coordN, flagOff int
 }
 
 // Varying is one input or output element of the entry point.

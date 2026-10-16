@@ -371,14 +371,10 @@ func (s *Subsystem) shadeVertex(c *cpu.CPU, vp, stride uint32, isUP bool) screen
 				copy(pst.M[in.Offset:in.Offset+n], st.M[out.Offset:out.Offset+n])
 			}
 		}
-		gotUV := false
-		ps.prog.Sampler = func(unit int, coord []float32, cube bool) [4]float32 {
-			if unit == ps.texUnit && !gotUV && len(coord) >= 2 {
-				uv[0], uv[1], gotUV = coord[0], coord[1], true
-			}
-			return [4]float32{1, 1, 1, 1}
-		}
 		pst.Run()
+		if tc, ok := pst.TexCoord(ps.texUnit); ok && len(tc) >= 2 {
+			uv[0], uv[1] = tc[0], tc[1]
+		}
 		if out := ps.prog.Output("COLOR", 0); out != nil && out.Components >= 4 {
 			color = pst.M[out.Offset : out.Offset+4]
 		}
