@@ -42,7 +42,7 @@ var liveMode = os.Getenv("LSW_LIVE") == "1"
 var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
 
 func (s *Subsystem) wantRender(frame uint64) bool {
-	if s.CantinaDIPLogged > 0 {
+	if s.CantinaDIPLogged > 0 || (liveMode && s.TitleFirstFrame > 0) {
 		if liveMode {
 			return frame%2 == 0 || frame%uint64(renderEvery) == 0
 		}
