@@ -31,6 +31,13 @@ func RegisterLiftedFunctions(c *cpu.CPU) {
 	c.RegisterIntercept(0x001052a0, "lifted::NuMtxMul_001052a0", liftedNuMtxMul)
 	c.RegisterIntercept(0x002e2dc0, "lifted::NuBufReadF32_002e2dc0", liftedNuBufReadF32)
 	c.RegisterIntercept(0x0068f570, "lifted::D3DXMatrixMultiply_0068f570", liftedD3DXMatrixMultiply)
+	c.RegisterIntercept(0x0006e050, "lifted::NuInitMtlItem_0006e050", liftedNuInitMtlItem)
+	c.RegisterIntercept(0x0006e090, "lifted::NuNoOp_0006e090", liftedNuNoOp)
+	c.RegisterIntercept(0x0006e0a0, "lifted::NuNoOp_0006e0a0", liftedNuNoOp)
+	c.RegisterIntercept(0x0002dd60, "lifted::NuHasRenderData_0002dd60", liftedNuHasRenderData)
+	c.RegisterIntercept(0x00102c40, "lifted::NuVecMtxTransform_00102c40", liftedNuVecMtxTransform)
+	c.RegisterIntercept(0x00102dd0, "lifted::NuVecMtxRotate_00102dd0", liftedNuVecMtxRotate)
+	c.RegisterIntercept(0x0016ff70, "lifted::NuSqrt_0016ff70", liftedNuSqrt)
 }
 
 func liftedNuMtxMul(c *cpu.CPU) {
@@ -952,3 +959,68 @@ func liftedD3DXMatrixMultiply(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = pOut
 	c.Ret()
 }
+
+func liftedNuInitMtlItem(c *cpu.CPU) {
+	p := c.Arg(0)
+	c.Write32(p+0x8, 0)
+	c.Write32(p+0x14, 0xffffffff)
+	c.Write32(p+0x20, 0xffffffff)
+	c.Write16(p+0x24, 0xffff)
+	c.Write16(p+0x2c, 0xffff)
+	c.Write16(p+0x2e, 0xffff)
+	c.Write16(p+0x1e, 0xffff)
+	c.Ret()
+}
+
+func liftedNuNoOp(c *cpu.CPU) {
+	c.Ret()
+}
+
+func liftedNuHasRenderData(c *cpu.CPU) {
+	p := c.Arg(0)
+	if p != 0 && (c.Read32(p+4) != 0 || c.Read32(p+8) != 0) {
+		c.Regs[cpu.RegEAX] = 1
+	} else {
+		c.Regs[cpu.RegEAX] = 0
+	}
+	c.Ret()
+}
+
+func liftedNuVecMtxTransform(c *cpu.CPU) {
+	out := c.Arg(0)
+	in := c.Arg(1)
+	mtx := c.Arg(2)
+	ix, iy, iz := c.ReadF32(in), c.ReadF32(in+4), c.ReadF32(in+8)
+	ox := ix*c.ReadF32(mtx+0x00) + iy*c.ReadF32(mtx+0x10) + iz*c.ReadF32(mtx+0x20) + c.ReadF32(mtx+0x30)
+	oy := ix*c.ReadF32(mtx+0x04) + iy*c.ReadF32(mtx+0x14) + iz*c.ReadF32(mtx+0x24) + c.ReadF32(mtx+0x34)
+	oz := ix*c.ReadF32(mtx+0x08) + iy*c.ReadF32(mtx+0x18) + iz*c.ReadF32(mtx+0x28) + c.ReadF32(mtx+0x38)
+	c.WriteF32(out, ox)
+	c.WriteF32(out+4, oy)
+	c.WriteF32(out+8, oz)
+	c.Ret()
+}
+
+func liftedNuVecMtxRotate(c *cpu.CPU) {
+	out := c.Arg(0)
+	in := c.Arg(1)
+	mtx := c.Arg(2)
+	ix, iy, iz := c.ReadF32(in), c.ReadF32(in+4), c.ReadF32(in+8)
+	ox := ix*c.ReadF32(mtx+0x00) + iy*c.ReadF32(mtx+0x10) + iz*c.ReadF32(mtx+0x20)
+	oy := ix*c.ReadF32(mtx+0x04) + iy*c.ReadF32(mtx+0x14) + iz*c.ReadF32(mtx+0x24)
+	oz := ix*c.ReadF32(mtx+0x08) + iy*c.ReadF32(mtx+0x18) + iz*c.ReadF32(mtx+0x28)
+	c.WriteF32(out, ox)
+	c.WriteF32(out+4, oy)
+	c.WriteF32(out+8, oz)
+	c.Ret()
+}
+
+func liftedNuSqrt(c *cpu.CPU) {
+	x := c.ReadF32(c.Regs[cpu.RegESP] + 4)
+	if x <= 0 {
+		c.FPUPush(0)
+	} else {
+		c.FPUPush(math.Sqrt(float64(x)))
+	}
+	c.Ret()
+}
+

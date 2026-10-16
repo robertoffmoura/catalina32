@@ -36,6 +36,7 @@ type Win32Env struct {
 	CurrentThreadId uint32
 	PerfCounter     uint64
 	TraceLog        bool
+	LiveClock       bool
 	sched           *scheduler
 	WndProc         uint32
 	peekCount       uint64
@@ -47,6 +48,8 @@ func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
 	_ = os.MkdirAll(saveRoot, 0755)
 	cmdAddr := c.Malloc(256)
 	c.WriteCString(cmdAddr, "")
+	ak := os.Getenv("LSW_AUTO_KEYS")
+	liveClock := (os.Getenv("LSW_SHM_FILE") != "" || os.Getenv("LSW_LIVE") == "1") && (ak == "" || ak == "off")
 	return &Win32Env{
 		DataRoot:        dataRoot,
 		SaveRoot:        saveRoot,
@@ -58,7 +61,8 @@ func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
 		ModulePath:      "C:\\LEGOStarWarsSaga\\LEGOStarWarsSaga.exe",
 		CurrentThreadId: 1,
 		PerfCounter:     1000000,
-		TraceLog:        true,
+		TraceLog:        os.Getenv("LSW_LIVE") != "1",
+		LiveClock:       liveClock,
 	}
 }
 
@@ -157,7 +161,6 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, boundaryAddrs []uint32) 
 	c.RegisterIntercept(0x00623b90, "WaitForSingleObject", env.thunkWaitForSingleObject)
 	c.RegisterIntercept(0x00623c30, "ResetEvent", env.thunkResetEvent)
 	c.RegisterIntercept(0x00620660, "CloseHandle", env.thunkCloseHandle)
-	c.RegisterIntercept(0x006245f0, "CreateThread", env.thunkCreateThread)
 	c.RegisterIntercept(0x00623ac0, "CreateThread_2", env.thunkCreateThread)
 	c.RegisterIntercept(0x00623b70, "ResumeThread_2", env.thunkResumeThread)
 	c.RegisterIntercept(0x00623c60, "Sleep", env.thunkSleep)
@@ -180,18 +183,20 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, boundaryAddrs []uint32) 
 	c.RegisterIntercept(0x00620da0, "NoOp_620da0", env.thunkReturnZero)
 	c.RegisterIntercept(0x00620810, "IsDebuggerPresent_OrOne", env.thunkReturnOne)
 
-	// High-Resolution Timers
+	// High-Resolution & Multimedia Timers
 	c.RegisterIntercept(0x00624700, "QueryPerformanceFrequency", env.thunkQueryPerformanceFrequency)
 	c.RegisterIntercept(0x00624720, "QueryPerformanceCounter", env.thunkQueryPerformanceCounter)
 	c.RegisterIntercept(0x006242d0, "timeGetTime_OrDouble", env.thunkTimeGetTime)
 	c.RegisterIntercept(0x00624290, "GetTickCount", env.thunkTimeGetTime)
+	c.RegisterIntercept(0x00624310, "timeSetEvent", env.thunkTimeSetEvent)
+	c.RegisterIntercept(0x006245f0, "timeKillEvent", env.thunkTimeKillEvent)
 
-	// Win32 File I/O (CreateFileA, ReadFile, WriteFile, SetFilePointerEx, etc.)
+	// Win32 File I/O (CreateFileA, ReadFile, WriteFile, SetFilePointerEx, GetFileSize, etc.)
 	c.RegisterIntercept(0x0060a600, "CreateFileA", env.thunkCreateFileA)
 	c.RegisterIntercept(0x0060ae10, "ReadFile", env.thunkReadFile)
 	c.RegisterIntercept(0x0060b2d0, "WriteFile", env.thunkWriteFile)
 	c.RegisterIntercept(0x0060b8e0, "SetFilePointerEx", env.thunkSetFilePointerEx)
-	c.RegisterIntercept(0x0060b8a0, "FlushFileBuffers", env.thunkReturnOne)
+	c.RegisterIntercept(0x0060b8a0, "GetFileSize", env.thunkGetFileSize)
 	c.RegisterIntercept(0x0060b790, "CreateDirectoryA", env.thunkCreateDirectoryA)
 	c.RegisterIntercept(0x0060bb30, "GetFileAttributesA", env.thunkGetFileAttributesA)
 	c.RegisterIntercept(0x0060bd50, "GetDiskFreeSpaceExA", env.thunkGetDiskFreeSpaceExA)
@@ -347,11 +352,23 @@ func (env *Win32Env) thunkGetLastError(c *cpu.CPU) {
 	c.Ret()
 }
 
+func (env *Win32Env) currentMs(c *cpu.CPU) uint32 {
+	if env.LiveClock {
+		return uint32(time.Since(env.StartTime).Milliseconds())
+	}
+	return uint32(c.Steps / 50000)
+}
+
 func (env *Win32Env) thunkQueryPerformanceCounter(c *cpu.CPU) {
 	ptr := c.Arg(0)
-	// Increment deterministically so game frame delta is smooth (~50-60 FPS)
-	env.PerfCounter += 20000000
-	ticks := env.PerfCounter + c.Steps*20
+	var ticks uint64
+	if env.LiveClock {
+		ticks = uint64(time.Since(env.StartTime).Nanoseconds())
+	} else {
+		// Increment deterministically so game frame delta is smooth (~50-60 FPS) in headless runs
+		env.PerfCounter += 20000000
+		ticks = env.PerfCounter + c.Steps*20
+	}
 	if ptr != 0 {
 		c.Write64(ptr, ticks)
 	}
@@ -369,8 +386,7 @@ func (env *Win32Env) thunkQueryPerformanceFrequency(c *cpu.CPU) {
 }
 
 func (env *Win32Env) thunkTimeGetTime(c *cpu.CPU) {
-	ms := uint32(c.Steps / 50000)
-	c.Regs[cpu.RegEAX] = ms
+	c.Regs[cpu.RegEAX] = env.currentMs(c)
 	c.Ret()
 }
 
@@ -511,6 +527,22 @@ func (env *Win32Env) thunkSetFilePointerEx(c *cpu.CPU) {
 		c.Write64(newPosPtr, uint64(pos))
 	}
 	c.Regs[cpu.RegEAX] = 1
+	c.Ret()
+}
+
+func (env *Win32Env) thunkGetFileSize(c *cpu.CPU) {
+	h := c.Arg(0)
+	highPtr := c.Arg(1)
+	of, ok := env.Handles[h]
+	if !ok {
+		c.Regs[cpu.RegEAX] = InvalidHandleValue
+		c.Ret()
+		return
+	}
+	if highPtr != 0 {
+		c.Write32(highPtr, uint32(uint64(of.Size)>>32))
+	}
+	c.Regs[cpu.RegEAX] = uint32(of.Size)
 	c.Ret()
 }
 
@@ -760,4 +792,5 @@ func (env *Win32Env) thunkPeekMessageA(c *cpu.CPU) {
 	}
 	c.Regs[cpu.RegEAX] = 0 // no message left in the queue
 	c.Ret()
+	env.fireTimers(c)
 }

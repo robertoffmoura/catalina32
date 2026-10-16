@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,6 +67,14 @@ func RegisterCRT(c *CPUWrapper, img *macho32.Image) {
 			})
 		}
 	}
+
+	// Native fast-paths for hot statically linked libogg / libvorbis bitstream & Huffman functions
+	c.RegisterIntercept(0x008be6c0, "oggpack_look", thunkOggpackLook)
+	c.RegisterIntercept(0x008be770, "oggpack_adv", thunkOggpackAdv)
+	c.RegisterIntercept(0x008be7a0, "oggpack_read", thunkOggpackRead)
+	c.RegisterIntercept(0x008c17a0, "decode_packed_entry_number", thunkVorbisDecodePackedEntryNumber)
+	c.RegisterIntercept(0x008c1ef0, "vorbis_book_decodev_set", thunkVorbisBookDecodevSet)
+	c.RegisterIntercept(0x008c1fe0, "vorbis_book_decodevv_add", thunkVorbisBookDecodevvAdd)
 }
 
 type CPUWrapper = cpu.CPU
@@ -166,6 +175,14 @@ func lookupCRTThunk(sym string) cpu.ThunkFunc {
 		return thunkUnaryMathF32(math.Log10)
 	case "_expf":
 		return thunkUnaryMathF32(math.Exp)
+	case "_rintf", "_nearbyintf":
+		return thunkUnaryMathF32(math.RoundToEven)
+	case "_roundf":
+		return thunkUnaryMathF32(math.Round)
+	case "_truncf":
+		return thunkUnaryMathF32(math.Trunc)
+	case "_fabsf":
+		return thunkUnaryMathF32(math.Abs)
 	case "_atan2f":
 		return thunkBinaryMathF32(math.Atan2)
 	case "_powf":
@@ -174,16 +191,50 @@ func lookupCRTThunk(sym string) cpu.ThunkFunc {
 		return thunkBinaryMathF32(math.Mod)
 	case "_pow":
 		return thunkPowF64
+	case "_atan2":
+		return thunkBinaryMathF64(math.Atan2)
+	case "_fmod":
+		return thunkBinaryMathF64(math.Mod)
 	case "_sin":
 		return thunkUnaryMathF64(math.Sin)
 	case "_cos":
 		return thunkUnaryMathF64(math.Cos)
+	case "_tan":
+		return thunkUnaryMathF64(math.Tan)
+	case "_asin":
+		return thunkUnaryMathF64(math.Asin)
+	case "_acos":
+		return thunkUnaryMathF64(math.Acos)
+	case "_atan":
+		return thunkUnaryMathF64(math.Atan)
 	case "_sqrt":
 		return thunkUnaryMathF64(math.Sqrt)
 	case "_floor":
 		return thunkUnaryMathF64(math.Floor)
 	case "_ceil":
 		return thunkUnaryMathF64(math.Ceil)
+	case "_rint", "_nearbyint":
+		return thunkUnaryMathF64(math.RoundToEven)
+	case "_round":
+		return thunkUnaryMathF64(math.Round)
+	case "_trunc":
+		return thunkUnaryMathF64(math.Trunc)
+	case "_fabs":
+		return thunkUnaryMathF64(math.Abs)
+	case "_log":
+		return thunkUnaryMathF64(math.Log)
+	case "_log10":
+		return thunkUnaryMathF64(math.Log10)
+	case "_exp":
+		return thunkUnaryMathF64(math.Exp)
+	case "_frexp":
+		return thunkFrexpF64
+	case "_frexpf":
+		return thunkFrexpF32
+	case "_ldexp":
+		return thunkLdexpF64
+	case "_ldexpf":
+		return thunkLdexpF32
 	case "___isfinited":
 		return thunkIsFiniteD
 	case "___isnand":
@@ -828,6 +879,51 @@ func thunkPowF64(c *cpu.CPU) {
 	c.Ret()
 }
 
+func thunkBinaryMathF64(fn func(float64, float64) float64) cpu.ThunkFunc {
+	return func(c *cpu.CPU) {
+		x := c.ReadF64(c.Regs[cpu.RegESP] + 4)
+		y := c.ReadF64(c.Regs[cpu.RegESP] + 12)
+		c.FPUPush(fn(x, y))
+		c.Ret()
+	}
+}
+
+func thunkFrexpF64(c *cpu.CPU) {
+	x := c.ReadF64(c.Regs[cpu.RegESP] + 4)
+	expPtr := c.Read32(c.Regs[cpu.RegESP] + 12)
+	frac, exp := math.Frexp(x)
+	if expPtr != 0 {
+		c.Write32(expPtr, uint32(int32(exp)))
+	}
+	c.FPUPush(frac)
+	c.Ret()
+}
+
+func thunkFrexpF32(c *cpu.CPU) {
+	x := float64(c.ArgF32(0))
+	expPtr := c.Arg(1)
+	frac, exp := math.Frexp(x)
+	if expPtr != 0 {
+		c.Write32(expPtr, uint32(int32(exp)))
+	}
+	c.FPUPush(frac)
+	c.Ret()
+}
+
+func thunkLdexpF64(c *cpu.CPU) {
+	x := c.ReadF64(c.Regs[cpu.RegESP] + 4)
+	exp := int(int32(c.Read32(c.Regs[cpu.RegESP] + 12)))
+	c.FPUPush(math.Ldexp(x, exp))
+	c.Ret()
+}
+
+func thunkLdexpF32(c *cpu.CPU) {
+	x := float64(c.ArgF32(0))
+	exp := int(int32(c.Arg(1)))
+	c.FPUPush(math.Ldexp(x, exp))
+	c.Ret()
+}
+
 func thunkIsFiniteD(c *cpu.CPU) {
 	x := c.ReadF64(c.Regs[cpu.RegESP] + 4)
 	if !math.IsNaN(x) && !math.IsInf(x, 0) {
@@ -982,3 +1078,180 @@ func thunkBasicStringDtor(c *cpu.CPU) {
 	}
 	c.Ret()
 }
+
+func oggpackLook(c *cpu.CPU, b uint32, nbits int32) int32 {
+	if nbits < 0 || nbits > 32 {
+		return -1
+	}
+	endbyte := int32(c.Read32(b))
+	endbit := int32(c.Read32(b + 4))
+	storage := int32(c.Read32(b + 16))
+	if endbyte+4 >= storage {
+		if endbyte*8+endbit+nbits > storage*8 {
+			return -1
+		}
+	}
+	ptr := c.Read32(b + 12)
+	if ptr+8 <= uint32(len(c.Mem)) {
+		w := binary.LittleEndian.Uint64(c.Mem[ptr : ptr+8])
+		mask := (uint64(1) << uint(nbits)) - 1
+		return int32((w >> uint(endbit)) & mask)
+	}
+	return -1
+}
+
+func oggpackAdv(c *cpu.CPU, b uint32, nbits int32) {
+	total := int32(c.Read32(b+4)) + nbits
+	bytes := total / 8
+	c.Write32(b+12, c.Read32(b+12)+uint32(bytes))
+	c.Write32(b, c.Read32(b)+uint32(bytes))
+	c.Write32(b+4, uint32(total&7))
+}
+
+func thunkOggpackLook(c *cpu.CPU) {
+	c.Regs[cpu.RegEAX] = uint32(oggpackLook(c, c.Arg(0), int32(c.Arg(1))))
+	c.Ret()
+}
+
+func thunkOggpackAdv(c *cpu.CPU) {
+	oggpackAdv(c, c.Arg(0), int32(c.Arg(1)))
+	c.Ret()
+}
+
+func thunkOggpackRead(c *cpu.CPU) {
+	b := c.Arg(0)
+	nbits := int32(c.Arg(1))
+	ret := oggpackLook(c, b, nbits)
+	oggpackAdv(c, b, nbits)
+	c.Regs[cpu.RegEAX] = uint32(ret)
+	c.Ret()
+}
+
+func vorbisDecodePackedEntryNumber(c *cpu.CPU, book uint32, b uint32) int32 {
+	firstTabN := int32(c.Read32(book + 0x24))
+	maxLen := int32(c.Read32(book + 0x28))
+	lok := oggpackLook(c, b, firstTabN)
+	var lo, hi int32
+	if lok >= 0 {
+		firstTable := c.Read32(book + 0x20)
+		entry := int32(c.Read32(firstTable + uint32(lok)*4))
+		if entry >= 0 {
+			codelengths := c.Read32(book + 0x1c)
+			l := int32(int8(c.Mem[codelengths+uint32(entry)-1]))
+			oggpackAdv(c, b, l)
+			return entry - 1
+		}
+		u := uint32(entry)
+		lo = int32((u >> 15) & 0x7fff)
+		hi = int32(c.Read32(book+0x8)) - int32(u&0x7fff)
+	} else {
+		lo = 0
+		hi = int32(c.Read32(book + 0x8))
+	}
+	read := maxLen
+	lok = oggpackLook(c, b, read)
+	for lok < 0 && read > 1 {
+		read--
+		lok = oggpackLook(c, b, read)
+	}
+	if lok < 0 {
+		return -1
+	}
+	rev := bits.Reverse32(uint32(lok))
+	codelist := c.Read32(book + 0x14)
+	for hi-lo > 1 {
+		p := (hi - lo) >> 1
+		if c.Read32(codelist+uint32(lo+p)*4) <= rev {
+			lo += p
+		} else {
+			hi -= p
+		}
+	}
+	codelengths := c.Read32(book + 0x1c)
+	l := int32(int8(c.Mem[codelengths+uint32(lo)]))
+	if l <= read {
+		oggpackAdv(c, b, l)
+		return lo
+	}
+	oggpackAdv(c, b, read)
+	return -1
+}
+
+// 0x008c17a0: decode_packed_entry_number (fastcall: ECX = book, EDX = b)
+func thunkVorbisDecodePackedEntryNumber(c *cpu.CPU) {
+	c.Regs[cpu.RegEAX] = uint32(vorbisDecodePackedEntryNumber(c, c.Regs[cpu.RegECX], c.Regs[cpu.RegEDX]))
+	c.Ret()
+}
+
+// 0x008c1ef0: vorbis_book_decodev_set(codebook *book, float *a, oggpack_buffer *b, int n)
+func thunkVorbisBookDecodevSet(c *cpu.CPU) {
+	book := c.Arg(0)
+	a := c.Arg(1)
+	b := c.Arg(2)
+	n := int32(c.Arg(3))
+	dim := int32(c.Read32(book))
+	valuelist := c.Read32(book + 0x10)
+	for i := int32(0); i < n; {
+		entry := vorbisDecodePackedEntryNumber(c, book, b)
+		if entry == -1 {
+			c.Regs[cpu.RegEAX] = 0xffffffff
+			c.Ret()
+			return
+		}
+		if dim > 0 {
+			t := valuelist + uint32(entry*dim)*4
+			for j := int32(0); j < dim; j++ {
+				c.Write32(a+uint32(i)*4, c.Read32(t+uint32(j)*4))
+				i++
+			}
+		} else {
+			i++
+		}
+	}
+	c.Regs[cpu.RegEAX] = 0
+	c.Ret()
+}
+
+// 0x008c1fe0: vorbis_book_decodevv_add(codebook *book, float **a, long offset, int ch, oggpack_buffer *b, int n)
+func thunkVorbisBookDecodevvAdd(c *cpu.CPU) {
+	book := c.Arg(0)
+	a := c.Arg(1)
+	offset := int32(c.Arg(2))
+	ch := int32(c.Arg(3))
+	b := c.Arg(4)
+	n := int32(c.Arg(5))
+	if ch <= 0 {
+		c.Regs[cpu.RegEAX] = 0
+		c.Ret()
+		return
+	}
+	i := offset / ch
+	end := (offset + n) / ch
+	dim := int32(c.Read32(book))
+	valuelist := c.Read32(book + 0x10)
+	chptr := int32(0)
+	for i < end {
+		entry := vorbisDecodePackedEntryNumber(c, book, b)
+		if entry == -1 {
+			c.Regs[cpu.RegEAX] = 0xffffffff
+			c.Ret()
+			return
+		}
+		if dim > 0 {
+			t := valuelist + uint32(entry*dim)*4
+			for j := int32(0); j < dim; j++ {
+				chBuf := c.Read32(a + uint32(chptr)*4)
+				addr := chBuf + uint32(i)*4
+				c.WriteF32(addr, c.ReadF32(addr)+c.ReadF32(t+uint32(j)*4))
+				chptr++
+				if chptr == ch {
+					chptr = 0
+					i++
+				}
+			}
+		}
+	}
+	c.Regs[cpu.RegEAX] = 0
+	c.Ret()
+}
+

@@ -1645,16 +1645,28 @@ func (c *CPU) Step() {
 				c.Regs[RegEDX] = uint32(uint64(prod) >> 32)
 				c.SetFlag(FlagCF|FlagOF, prod != int64(int32(prod)))
 			case 6: // DIV r/m32
-				q, r := bits.Div32(c.Regs[RegEDX], c.Regs[RegEAX], val)
-				c.Regs[RegEAX] = q
-				c.Regs[RegEDX] = r
+				if val == 0 {
+					fmt.Printf("[CPU-WARN] DIV32 by zero at EIP=0x%08x\n", c.EIP)
+					c.Regs[RegEAX] = 0
+					c.Regs[RegEDX] = 0
+				} else {
+					q, r := bits.Div32(c.Regs[RegEDX], c.Regs[RegEAX], val)
+					c.Regs[RegEAX] = q
+					c.Regs[RegEDX] = r
+				}
 			case 7: // IDIV r/m32
-				num := int64((uint64(c.Regs[RegEDX]) << 32) | uint64(c.Regs[RegEAX]))
 				d := int64(int32(val))
-				q := num / d
-				r := num % d
-				c.Regs[RegEAX] = uint32(int32(q))
-				c.Regs[RegEDX] = uint32(int32(r))
+				if d == 0 {
+					fmt.Printf("[CPU-WARN] IDIV32 by zero at EIP=0x%08x\n", c.EIP)
+					c.Regs[RegEAX] = 0
+					c.Regs[RegEDX] = 0
+				} else {
+					num := int64((uint64(c.Regs[RegEDX]) << 32) | uint64(c.Regs[RegEAX]))
+					q := num / d
+					r := num % d
+					c.Regs[RegEAX] = uint32(int32(q))
+					c.Regs[RegEDX] = uint32(int32(r))
+				}
 			}
 		}
 		return

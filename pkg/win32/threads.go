@@ -35,11 +35,21 @@ type guestEvent struct {
 	signaled bool
 }
 
+type guestTimer struct {
+	id         uint32
+	delayMs    uint32
+	proc       uint32
+	user       uint32
+	periodic   bool
+	lastFireMs uint32
+}
+
 type scheduler struct {
 	threads  []*guestThread // threads[0] is the main thread
 	cur      *guestThread
 	byHandle map[uint32]*guestThread
 	events   map[uint32]*guestEvent
+	timers   map[uint32]*guestTimer
 }
 
 func (env *Win32Env) initScheduler(c *cpu.CPU) {
@@ -49,6 +59,7 @@ func (env *Win32Env) initScheduler(c *cpu.CPU) {
 		cur:      main,
 		byHandle: map[uint32]*guestThread{main.handle: main},
 		events:   make(map[uint32]*guestEvent),
+		timers:   make(map[uint32]*guestTimer),
 	}
 	c.RegisterIntercept(threadExitEIP, "ThreadExit", env.thunkThreadExit)
 	c.Preempt = func(vm *cpu.CPU) { env.yield(vm) }
@@ -296,3 +307,58 @@ func (env *Win32Env) thunkResetEvent(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = 1
 	c.Ret()
 }
+
+// thunkTimeSetEvent: 0x00624310 timeSetEvent(uDelay, uResolution, lpTimeProc, dwUser, fuEvent)
+func (env *Win32Env) thunkTimeSetEvent(c *cpu.CPU) {
+	delay := c.Arg(0)
+	if delay < 450 {
+		delay = 450
+	}
+	proc := c.Arg(2)
+	user := c.Arg(3)
+	fuEvent := c.Arg(4)
+	id := env.NextHandle
+	env.NextHandle++
+	env.sched.timers[id] = &guestTimer{
+		id:         id,
+		delayMs:    delay,
+		proc:       proc,
+		user:       user,
+		periodic:   (fuEvent & 1) != 0,
+		lastFireMs: env.currentMs(c),
+	}
+	c.Regs[cpu.RegEAX] = id
+	c.Ret()
+}
+
+// thunkTimeKillEvent: 0x006245f0 timeKillEvent(uTimerID)
+func (env *Win32Env) thunkTimeKillEvent(c *cpu.CPU) {
+	delete(env.sched.timers, c.Arg(0))
+	c.Regs[cpu.RegEAX] = 0 // TIMERR_NOERROR
+	c.Ret()
+}
+
+// fireTimers invokes any elapsed multimedia timers on the main thread when at NestDepth 0.
+func (env *Win32Env) fireTimers(c *cpu.CPU) {
+	if env.sched == nil || c.NestDepth != 0 || len(env.sched.timers) == 0 {
+		return
+	}
+	now := env.currentMs(c)
+	fired := false
+	for id, t := range env.sched.timers {
+		if now-t.lastFireMs >= t.delayMs {
+			t.lastFireMs = now
+			if !t.periodic {
+				delete(env.sched.timers, id)
+			}
+			if t.proc != 0 {
+				_, _ = c.CallGuestNested(t.proc, t.id, 0, t.user, 0, 0)
+				fired = true
+			}
+		}
+	}
+	if fired {
+		env.yield(c)
+	}
+}
+

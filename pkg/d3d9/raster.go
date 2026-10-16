@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"lsw64/pkg/cpu"
 )
@@ -27,10 +28,11 @@ const (
 )
 
 type screenVertex struct {
-	sx, sy, sz float32
-	r, g, b, a uint8
-	u, v       float32
-	valid      bool
+	sx, sy, sz     float32
+	r, g, b, a     uint8
+	u, v           float32
+	u1, v1, blend1 float32
+	valid          bool
 	// Clip-space position (only meaningful when clip == true, i.e. a vertex transformed by the
 	// world/viewProj constants). Used to clip triangles against the near plane before projection.
 	cx, cy, cz, cw float32
@@ -54,9 +56,12 @@ var liveMode = os.Getenv("LSW_LIVE") == "1"
 var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
 
 func (s *Subsystem) wantRender(frame uint64) bool {
+	if s.ShmFile != nil && s.FrameDrawCalls > 0 && s.FrameDrawCalls < 80 {
+		return true
+	}
 	if s.CantinaDIPLogged > 0 || (liveMode && s.TitleFirstFrame > 0) {
 		if liveMode {
-			return frame%3 == 0 || frame%uint64(renderEvery) == 0
+			return frame%2 == 0 || frame%uint64(renderEvery) == 0
 		}
 		return frame%5 == 0 || frame%uint64(renderEvery) == 0
 	}
@@ -361,7 +366,7 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	}
 
 	r, g, b, a := uint8(220), uint8(220), uint8(230), uint8(255)
-	var u, v float32
+	var u, v, u1, v1, blend1 float32
 
 	if stride == 24 {
 		col := c.Read32(vp + 12)
@@ -382,19 +387,10 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		v = c.ReadF32(vp + 20)
 	} else if stride >= 20 && vp+stride <= uint32(len(c.Mem)) {
 		vd := s.CurrentVD
-		if vd != nil && !isUP && vd.HasTex0 {
-			if vd.Tex0Type == 3 && uint32(vd.Tex0Offset)+16 <= stride {
-				// D3DDECLTYPE_FLOAT4: .xy is normal/surface UV, .zw is layer0 diffuse/atlas UV
-				u = c.ReadF32(vp + uint32(vd.Tex0Offset) + 8)
-				v = c.ReadF32(vp + uint32(vd.Tex0Offset) + 12)
-				if math.Abs(float64(u)) < 0.001 && math.Abs(float64(v+1.0)) < 0.001 {
-					u = -1000.0
-					v = -1000.0
-				}
-			} else if uint32(vd.Tex0Offset)+8 <= stride {
-				u = c.ReadF32(vp + uint32(vd.Tex0Offset))
-				v = c.ReadF32(vp + uint32(vd.Tex0Offset) + 4)
-			}
+		if vd != nil && !isUP && vd.HasTex0 && uint32(vd.Tex0Offset)+8 <= stride {
+			// For both FLOAT2 and FLOAT4 (where .xy is primary tiled diffuse UV and .zw is lightmap or layer 1 UV), read .xy
+			u = c.ReadF32(vp + uint32(vd.Tex0Offset))
+			v = c.ReadF32(vp + uint32(vd.Tex0Offset) + 4)
 		} else {
 			switch stride {
 			case 32, 40, 48:
@@ -409,6 +405,34 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 			default:
 				u = c.ReadF32(vp + stride - 8)
 				v = c.ReadF32(vp + stride - 4)
+			}
+		}
+		// Multi-layer blending (layer1_sampler at s.BoundTextures[1]):
+		// When vd.HasTex1 is true and TEXCOORD0 is FLOAT4 (uvSet01), LAYER1_UVSET is uvSet1 = TEXCOORD0.zw; otherwise uvSet0 = TEXCOORD0.xy.
+		if s.BoundTextures[1] != 0 {
+			if vd != nil && !isUP && vd.HasTex1 && vd.Tex0Type == 3 && uint32(vd.Tex0Offset)+16 <= stride {
+				u1 = c.ReadF32(vp + uint32(vd.Tex0Offset) + 8)
+				v1 = c.ReadF32(vp + uint32(vd.Tex0Offset) + 12)
+			} else {
+				u1, v1 = u, v
+			}
+			opac1 := float32(1.0)
+			if a1 := s.PSConstants[115][3]; a1 > 0.001 && a1 <= 1.0 {
+				opac1 *= a1
+			}
+			if kg := s.PSConstants[116][1]; kg > 0.001 && kg <= 1.0 {
+				opac1 *= kg
+			}
+			if vd != nil && !isUP && vd.HasColor1 && uint32(vd.Color1Offset)+4 <= stride {
+				col1 := c.Read32(vp + uint32(vd.Color1Offset))
+				// LAYER1_COLORSET.r: check both D3DCOLOR (.r at bits 16..23) and RGBA (.r at bits 0..7)
+				rByte := (col1 >> 16) & 0xFF
+				if b0 := col1 & 0xFF; b0 > rByte {
+					rByte = b0
+				}
+				blend1 = (float32(rByte) / 255.0) * opac1
+			} else {
+				blend1 = opac1
 			}
 		}
 		// Decode packed UBYTE4N normal at vp+12 for directional 3D lighting
@@ -467,7 +491,8 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		if mc[0] > 0.01 || mc[1] > 0.01 || mc[2] > 0.01 {
 			if mc[0] <= 1.0 && mc[1] <= 1.0 && mc[2] <= 1.0 {
 				// If c112 is pure white (1,1,1) on an untextured FLOAT4 surface mesh, keep warm Cantina sandstone tint
-				if !(u < -900.0 && mc[0] > 0.98 && mc[1] > 0.98 && mc[2] > 0.98) {
+				untexturedFloat4 := s.BoundTextures[0] == 0 && vd != nil && vd.Tex0Type == 3
+				if !(untexturedFloat4 && mc[0] > 0.98 && mc[1] > 0.98 && mc[2] > 0.98) {
 					mr = float32(math.Min(255.0, float64(0.20+0.80*mc[0])*255.0))
 					mg = float32(math.Min(255.0, float64(0.20+0.80*mc[1])*255.0))
 					mb = float32(math.Min(255.0, float64(0.20+0.80*mc[2])*255.0))
@@ -501,7 +526,7 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 
 	// Case 0: Pre-transformed screen-space XYZRHW quad (x in [0..1280], y in [0..720], rhw == 1.0)
 	if stride == 28 && c.Read32(vp+12) == 0x3f800000 && x >= -1.0 && x <= float32(ScreenWidth)+1.0 && y >= -1.0 && y <= float32(ScreenHeight)+1.0 {
-		return screenVertex{sx: x, sy: y, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
+		return screenVertex{sx: x, sy: y, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true}
 	}
 
 	// Case 1: DrawPrimitiveUP 2D UI/splash quads ([-1, 1] x [-1, 1]), excluding 3D in-world DrawPrimitiveUP (shadows & 3D Cantina text)
@@ -510,7 +535,7 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	if isUP && !is3DUP {
 		sx := (x + 1.0) * 0.5 * float32(ScreenWidth)
 		sy := (1.0 - y) * 0.5 * float32(ScreenHeight)
-		return screenVertex{sx: sx, sy: sy, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
+		return screenVertex{sx: sx, sy: sy, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true}
 	}
 
 	// Case 2: Transform 3D vertex using D3D9 VSConstants (c16..c18 = world, c0..c3 = viewProj, transposed dp4 layout)
@@ -530,7 +555,7 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		if cw != cw || cx != cx || cy != cy || cz != cz { // NaN
 			return screenVertex{}
 		}
-		sv := screenVertex{r: r, g: g, b: b, a: a, u: u, v: v, valid: true, cx: cx, cy: cy, cz: cz, cw: cw, clip: true}
+		sv := screenVertex{r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true, cx: cx, cy: cy, cz: cz, cw: cw, clip: true}
 		if cw > nearW {
 			projectClip(&sv)
 		}
@@ -544,7 +569,7 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	}
 	sx := float32(ScreenWidth)*0.5 + x*scale
 	sy := float32(ScreenHeight)*0.5 - y*scale
-	return screenVertex{sx: sx, sy: sy, sz: 0.5, r: r, g: g, b: b, a: a, u: u, v: v, valid: true, invW: 1}
+	return screenVertex{sx: sx, sy: sy, sz: 0.5, r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true, invW: 1}
 }
 
 // projectClip performs the perspective divide + viewport transform for a clip-space vertex with w > nearW.
@@ -566,13 +591,14 @@ func lerpClip(a, b *screenVertex, t float32) screenVertex {
 		cx: a.cx + (b.cx-a.cx)*t, cy: a.cy + (b.cy-a.cy)*t, cz: a.cz + (b.cz-a.cz)*t, cw: a.cw + (b.cw-a.cw)*t,
 		r: lerpU8(a.r, b.r, t), g: lerpU8(a.g, b.g, t), b: lerpU8(a.b, b.b, t), a: lerpU8(a.a, b.a, t),
 		u: a.u + (b.u-a.u)*t, v: a.v + (b.v-a.v)*t,
+		u1: a.u1 + (b.u1-a.u1)*t, v1: a.v1 + (b.v1-a.v1)*t, blend1: a.blend1 + (b.blend1-a.blend1)*t,
 		valid: true, clip: true,
 	}
 }
 
 // rasterizeTriangle clips 3D triangles against the w = nearW plane (Sutherland–Hodgman, one plane) and
 // rasterizes the resulting polygon as a fan. Triangles fully in front of the plane go straight through.
-func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes *BufferDesc) {
+func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes, texRes1 *BufferDesc) {
 	if !v0.valid || !v1.valid || !v2.valid {
 		return
 	}
@@ -586,7 +612,7 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 		if !v2.clip && v2.invW == 0 {
 			v2.invW = 1
 		}
-		s.rasterizeScreenTriangle(c, v0, v1, v2, texRes)
+		s.rasterizeScreenTriangle(c, v0, v1, v2, texRes, texRes1)
 		return
 	}
 	if v0.cw <= nearW && v1.cw <= nearW && v2.cw <= nearW {
@@ -614,11 +640,11 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 		projectClip(&out[i])
 	}
 	for i := 1; i+1 < n; i++ {
-		s.rasterizeScreenTriangle(c, out[0], out[i], out[i+1], texRes)
+		s.rasterizeScreenTriangle(c, out[0], out[i], out[i+1], texRes, texRes1)
 	}
 }
 
-func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes *BufferDesc) {
+func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes, texRes1 *BufferDesc) {
 	minXf, maxXf := v0.sx, v0.sx
 	if v1.sx < minXf {
 		minXf = v1.sx
@@ -664,6 +690,7 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 	}
 
 	hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
+	hasTex1 := texRes1 != nil && len(texRes1.Pixels) > 0 && texRes1.Width > 0 && texRes1.Height > 0
 
 	// Skip fullscreen post-process / fade / pillarbox quads so they don't overwrite the software framebuffer
 	if !hasTex && ((maxX-minX) >= 1100 && (maxY-minY) >= 600 || (!is3D && v0.r < 16 && v0.g < 16 && v0.b < 16 && ((maxX-minX) >= 24 || (maxY-minY) >= 24))) {
@@ -681,6 +708,7 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 	isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (maxY-minY) <= 64
 	alphaEnabled := s.RenderStates[27] != 0 || s.RenderStates[15] != 0
 	sampleTex := hasTex && v0.u > -900.0
+	sampleTex1 := hasTex1 && v0.u1 > -900.0 && (v0.blend1 > 0.01 || v1.blend1 > 0.01 || v2.blend1 > 0.01)
 
 	var texW, texH, wMask, hMask uint32
 	var texWf, texHf float32
@@ -698,11 +726,28 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 		texPixels = texRes.Pixels
 	}
 
+	var tex1W, tex1H, w1Mask, h1Mask uint32
+	var tex1Wf, tex1Hf float32
+	var isPow2_1 bool
+	var tex1Pixels []uint32
+	if sampleTex1 {
+		tex1W = texRes1.Width
+		tex1H = texRes1.Height
+		tex1Wf = float32(tex1W)
+		tex1Hf = float32(tex1H)
+		isPow2_1 = (tex1W&(tex1W-1)) == 0 && (tex1H&(tex1H-1)) == 0
+		w1Mask = tex1W - 1
+		h1Mask = tex1H - 1
+		tex1Pixels = texRes1.Pixels
+	}
+
 	v0r, v1r, v2r := float32(v0.r), float32(v1.r), float32(v2.r)
-	perspTex := sampleTex && v0.invW > 0 && v1.invW > 0 && v2.invW > 0 &&
+	perspTex := (sampleTex || sampleTex1) && v0.invW > 0 && v1.invW > 0 && v2.invW > 0 &&
 		(v0.invW != v1.invW || v1.invW != v2.invW)
 	u0w, u1w, u2w := v0.u*v0.invW, v1.u*v1.invW, v2.u*v2.invW
 	t0w, t1w, t2w := v0.v*v0.invW, v1.v*v1.invW, v2.v*v2.invW
+	l1u0w, l1u1w, l1u2w := v0.u1*v0.invW, v1.u1*v1.invW, v2.u1*v2.invW
+	l1t0w, l1t1w, l1t2w := v0.v1*v0.invW, v1.v1*v1.invW, v2.v1*v2.invW
 	v0g, v1g, v2g := float32(v0.g), float32(v1.g), float32(v2.g)
 	v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
 	v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
@@ -728,9 +773,9 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 					skip := false
 
 					if sampleTex {
-						var tu, tv float32
+						var tu, tv, iw float32
 						if perspTex {
-							iw := w0*v0.invW + w1*v1.invW + w2*v2.invW
+							iw = w0*v0.invW + w1*v1.invW + w2*v2.invW
 							tu = (w0*u0w + w1*u1w + w2*u2w) / iw
 							tv = (w0*t0w + w1*t1w + w2*t2w) / iw
 						} else {
@@ -756,13 +801,58 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 							ty = uint32(tv*texHf) % texH
 						}
 						tp := texPixels[ty*texW+tx]
-						if tp == 0 && !isDXT1 {
+						if tp == 0 && !isDXT1 && !sampleTex1 {
 							skip = true
 						} else {
 							tr := uint8(tp & 0xFF)
 							tg := uint8((tp >> 8) & 0xFF)
 							tb := uint8((tp >> 16) & 0xFF)
 							ta := uint8((tp >> 24) & 0xFF)
+							if sampleTex1 {
+								b1 := w0*v0.blend1 + w1*v1.blend1 + w2*v2.blend1
+								if b1 > 0.01 {
+									var tu1, tv1 float32
+									if perspTex {
+										tu1 = (w0*l1u0w + w1*l1u1w + w2*l1u2w) / iw
+										tv1 = (w0*l1t0w + w1*l1t1w + w2*l1t2w) / iw
+									} else {
+										tu1 = w0*v0.u1 + w1*v1.u1 + w2*v2.u1
+										tv1 = w0*v0.v1 + w1*v1.v1 + w2*v2.v1
+									}
+									var tx1, ty1 uint32
+									if isPow2_1 {
+										ui1 := int32(tu1 * tex1Wf)
+										if tu1 < 0 {
+											ui1--
+										}
+										vi1 := int32(tv1 * tex1Hf)
+										if tv1 < 0 {
+											vi1--
+										}
+										tx1 = uint32(ui1) & w1Mask
+										ty1 = uint32(vi1) & h1Mask
+									} else {
+										tu1 = tu1 - float32(math.Floor(float64(tu1)))
+										tv1 = tv1 - float32(math.Floor(float64(tv1)))
+										tx1 = uint32(tu1*tex1Wf) % tex1W
+										ty1 = uint32(tv1*tex1Hf) % tex1H
+									}
+									tp1 := tex1Pixels[ty1*tex1W+tx1]
+									tr1 := uint8(tp1 & 0xFF)
+									tg1 := uint8((tp1 >> 8) & 0xFF)
+									tb1 := uint8((tp1 >> 16) & 0xFF)
+									ta1 := uint8((tp1 >> 24) & 0xFF)
+									a1 := uint16(b1 * float32(ta1))
+									if a1 > 255 {
+										a1 = 255
+									}
+									ia1 := 255 - a1
+									tr = uint8((uint16(tr)*ia1 + uint16(tr1)*a1) / 255)
+									tg = uint8((uint16(tg)*ia1 + uint16(tg1)*a1) / 255)
+									tb = uint8((uint16(tb)*ia1 + uint16(tb1)*a1) / 255)
+									ta = 255
+								}
+							}
 							r = uint8((uint16(r) * uint16(tr)) / 255)
 							g = uint8((uint16(g) * uint16(tg)) / 255)
 							b = uint8((uint16(b) * uint16(tb)) / 255)
@@ -819,12 +909,15 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		return
 	}
 	s.fbDirty = true
-	if primCount > 4096 {
-		primCount = 4096
+	if primCount > 32768 {
+		primCount = 32768
 	}
-	var texRes *BufferDesc
+	var texRes, texRes1 *BufferDesc
 	if s.BoundTextures[0] != 0 {
 		texRes = s.ensureTextureDecoded(c, s.BoundTextures[0])
+	}
+	if s.BoundTextures[1] != 0 {
+		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
 	}
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
@@ -832,7 +925,7 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 			v0 := s.transformVertex(c, pVerts+(i*3+0)*stride, stride, isUP)
 			v1 := s.transformVertex(c, pVerts+(i*3+1)*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+(i*3+2)*stride, stride, isUP)
-			s.rasterizeTriangle(c, v0, v1, v2, texRes)
+			s.rasterizeTriangle(c, v0, v1, v2, texRes, texRes1)
 		}
 	case 5: // D3DPT_TRIANGLESTRIP
 		v0 := s.transformVertex(c, pVerts, stride, isUP)
@@ -840,9 +933,9 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		for i := uint32(0); i < primCount; i++ {
 			v2 := s.transformVertex(c, pVerts+(i+2)*stride, stride, isUP)
 			if i&1 == 1 {
-				s.rasterizeTriangle(c, v0, v2, v1, texRes)
+				s.rasterizeTriangle(c, v0, v2, v1, texRes, texRes1)
 			} else {
-				s.rasterizeTriangle(c, v0, v1, v2, texRes)
+				s.rasterizeTriangle(c, v0, v1, v2, texRes, texRes1)
 			}
 			v0, v1 = v1, v2
 		}
@@ -851,7 +944,7 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		v1 := s.transformVertex(c, pVerts+stride, stride, isUP)
 		for i := uint32(0); i < primCount; i++ {
 			v2 := s.transformVertex(c, pVerts+(i+2)*stride, stride, isUP)
-			s.rasterizeTriangle(c, v0, v1, v2, texRes)
+			s.rasterizeTriangle(c, v0, v1, v2, texRes, texRes1)
 			v1 = v2
 		}
 	}
@@ -865,12 +958,15 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		return // frame will not be exported: skip software rasterization entirely
 	}
 	s.fbDirty = true
-	if primCount > 4096 {
-		primCount = 4096
+	if primCount > 32768 {
+		primCount = 32768
 	}
-	var texRes *BufferDesc
+	var texRes, texRes1 *BufferDesc
 	if s.BoundTextures[0] != 0 {
 		texRes = s.ensureTextureDecoded(c, s.BoundTextures[0])
+	}
+	if s.BoundTextures[1] != 0 {
+		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
 	}
 	readIdx := func(n uint32) uint32 {
 		pos := startIdx + n
@@ -895,7 +991,7 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 			v0 := s.transformVertex(c, pVerts+i0*stride, stride, isUP)
 			v1 := s.transformVertex(c, pVerts+i1*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+i2*stride, stride, isUP)
-			s.rasterizeTriangle(c, v0, v1, v2, texRes)
+			s.rasterizeTriangle(c, v0, v1, v2, texRes, texRes1)
 		}
 	case 5: // D3DPT_TRIANGLESTRIP
 		i0 := readIdx(0)
@@ -907,9 +1003,9 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 			v2 := s.transformVertex(c, pVerts+i2*stride, stride, isUP)
 			if i0 != i1 && i1 != i2 && i0 != i2 {
 				if i&1 == 1 {
-					s.rasterizeTriangle(c, v0, v2, v1, texRes)
+					s.rasterizeTriangle(c, v0, v2, v1, texRes, texRes1)
 				} else {
-					s.rasterizeTriangle(c, v0, v1, v2, texRes)
+					s.rasterizeTriangle(c, v0, v1, v2, texRes, texRes1)
 				}
 			}
 			i0, i1 = i1, i2
@@ -981,9 +1077,27 @@ func (s *Subsystem) exportFramePNG() {
 }
 
 func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
-	const outFrames = 1024
-	var mixL [outFrames]int32
-	var mixR [outFrames]int32
+	const maxOutFrames = 4096
+	outFrames := 735 // ~16.67ms at 44.1 kHz
+	now := time.Now()
+	if s.ShmFile != nil && s.AutoKeysMode == "off" && !s.LastAudioTime.IsZero() {
+		dt := now.Sub(s.LastAudioTime).Seconds()
+		if dt < 0.005 {
+			dt = 0.005
+		} else if dt > 0.090 {
+			dt = 0.090
+		}
+		outFrames = int(dt * 44100.0)
+		if outFrames < 220 {
+			outFrames = 220
+		} else if outFrames > maxOutFrames {
+			outFrames = maxOutFrames
+		}
+	}
+	s.LastAudioTime = now
+
+	var mixL [maxOutFrames]int32
+	var mixR [maxOutFrames]int32
 	anyPlaying := false
 	memLen := uint32(len(c.Mem))
 
@@ -1068,7 +1182,7 @@ func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 	}
 
 	if s.ShmFile != nil && anyPlaying {
-		var pcm [outFrames * 4]byte
+		var pcm [maxOutFrames * 4]byte
 		for i := 0; i < outFrames; i++ {
 			l, r := mixL[i], mixR[i]
 			if l > 32767 {
@@ -1085,15 +1199,16 @@ func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 			binary.LittleEndian.PutUint16(pcm[i*4+2:i*4+4], uint16(int16(r)))
 		}
 		ringPos := s.AudioWriteSamples % ShmAudioFrames
-		firstFrames := uint64(outFrames)
+		uOut := uint64(outFrames)
+		firstFrames := uOut
 		if ringPos+firstFrames > ShmAudioFrames {
 			firstFrames = ShmAudioFrames - ringPos
 		}
 		_, _ = s.ShmFile.WriteAt(pcm[:firstFrames*4], int64(ShmAudioOffset+8+ringPos*4))
-		if firstFrames < outFrames {
-			_, _ = s.ShmFile.WriteAt(pcm[firstFrames*4:], int64(ShmAudioOffset+8))
+		if firstFrames < uOut {
+			_, _ = s.ShmFile.WriteAt(pcm[firstFrames*4:uOut*4], int64(ShmAudioOffset+8))
 		}
-		s.AudioWriteSamples += outFrames
+		s.AudioWriteSamples += uOut
 		var idxBuf [8]byte
 		binary.LittleEndian.PutUint64(idxBuf[:], s.AudioWriteSamples)
 		_, _ = s.ShmFile.WriteAt(idxBuf[:], int64(ShmAudioOffset))

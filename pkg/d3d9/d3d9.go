@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"sync"
+	"time"
 
 	"lsw64/pkg/cpu"
 )
@@ -31,6 +32,8 @@ type BufferDesc struct {
 	PlayCursor    uint32
 	Volume        int32
 	Frequency     uint32
+	RefCount      int
+	IsDuplicate   bool
 }
 
 type VertexDecl struct {
@@ -44,6 +47,9 @@ type VertexDecl struct {
 	HasColor0       bool
 	Color0Offset    uint16
 	Color0Type      uint8
+	HasColor1       bool
+	Color1Offset    uint16
+	Color1Type      uint8
 	HasTex0         bool
 	Tex0Offset      uint16
 	Tex0Type        uint8
@@ -83,6 +89,7 @@ type Subsystem struct {
 	vtDIDevice8  uint32
 	vtDSound8    uint32
 	vtDSBuffer8  uint32
+	vtDS3DBuffer uint32
 
 	d3d9Obj         uint32
 	device9Obj      uint32
@@ -91,12 +98,14 @@ type Subsystem struct {
 	defaultSwapChn  uint32
 	sharedAudioBuf  uint32
 	dupDSBuffer     uint32
+	dummy3DObj      uint32
 	mipScratchBuf   uint32
 
 	Resources         map[uint32]*BufferDesc
 	VertexDecls       map[uint32]*VertexDecl
 	CurrentVertexDecl uint32
 	CurrentVD         *VertexDecl
+	CurrentMaterial   uint32
 	RenderStates      [256]uint32
 	BoundTextures     [16]uint32
 	StreamSources     [16]uint32
@@ -121,6 +130,8 @@ type Subsystem struct {
 	ShmFile           *os.File
 	AudioBuffers      []*BufferDesc
 	AudioWriteSamples uint64
+	LastAudioTime     time.Time
+	LastPresentTime   time.Time
 
 	KeyMu             sync.Mutex
 	KeyHoldUntil      [256]uint64
@@ -151,7 +162,7 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		Resources:      make(map[uint32]*BufferDesc),
 		VertexDecls:    make(map[uint32]*VertexDecl),
 		AutoKeysMode:   autoKeys,
-		TraceLog:       true,
+		TraceLog:       os.Getenv("LSW_LIVE") != "1",
 	}
 
 	s.vtD3D9 = s.buildVTable(c, "IDirect3D9", 32, s.handleIDirect3D9)
@@ -173,11 +184,13 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 	s.vtDIDevice8 = s.buildVTable(c, "IDirectInputDevice8A", 40, s.handleIDirectInputDevice8)
 	s.vtDSound8 = s.buildVTable(c, "IDirectSound8", 24, s.handleIDirectSound8)
 	s.vtDSBuffer8 = s.buildVTable(c, "IDirectSoundBuffer8", 32, s.handleIDirectSoundBuffer8)
+	s.vtDS3DBuffer = s.buildVTable(c, "IDirectSound3DBuffer8", 32, s.handleSimpleCOM)
 
 	// Allocate default backbuffer & depth-stencil surface
 	s.defaultBackBuf = s.allocSurface(c, 1280, 720, 22)
 	s.defaultDepthBuf = s.allocSurface(c, 1280, 720, 75)
 	s.defaultSwapChn = s.allocCOMObject(c, s.vtSwapChain9, 32)
+	s.dummy3DObj = s.allocCOMObject(c, s.vtDS3DBuffer, 32)
 	framesDir := os.Getenv("LSW_FRAMES_DIR")
 	if framesDir == "" {
 		framesDir = "/workspace/lsw64/frames"
@@ -211,15 +224,59 @@ func (s *Subsystem) buildVTable(c *cpu.CPU, ifaceName string, slots int, handler
 				vm.Regs[cpu.RegEAX] = vm.Arg(0)
 				vm.Ret()
 			case 2: // AddRef
+				if ifaceName == "IDirectSoundBuffer8" {
+					if res := s.Resources[vm.Arg(0)]; res != nil {
+						res.RefCount++
+						vm.Regs[cpu.RegEAX] = uint32(res.RefCount)
+						vm.Ret()
+						return
+					}
+				}
 				vm.Regs[cpu.RegEAX] = 2
 				vm.Ret()
 			case 3: // Release
+				if ifaceName == "IDirectSoundBuffer8" {
+					thisObj := vm.Arg(0)
+					if res := s.Resources[thisObj]; res != nil {
+						res.RefCount--
+						if res.RefCount <= 0 {
+							res.Playing = false
+							if res.IsDuplicate {
+								for idx, ab := range s.AudioBuffers {
+									if ab == res {
+										s.AudioBuffers = append(s.AudioBuffers[:idx], s.AudioBuffers[idx+1:]...)
+										break
+									}
+								}
+								delete(s.Resources, thisObj)
+							}
+							vm.Regs[cpu.RegEAX] = 0
+							vm.Ret()
+							return
+						}
+						vm.Regs[cpu.RegEAX] = uint32(res.RefCount)
+						vm.Ret()
+						return
+					}
+				}
 				vm.Regs[cpu.RegEAX] = 1
 				vm.Ret()
 			case 4: // QueryInterface(this, riid, ppvObj)
+				thisObj := vm.Arg(0)
+				riid := vm.Arg(1)
 				ppv := vm.Arg(2)
+				outObj := thisObj
+				if ifaceName == "IDirectSoundBuffer8" && riid != 0 && riid+4 <= uint32(len(vm.Mem)) {
+					data1 := vm.Read32(riid)
+					// IID_IDirectSoundBuffer8 has Data1 == 0x6825a449; 3D buffer/listener interfaces use 0x279afa86 / 0x279afa84
+					if data1 != 0x6825a449 {
+						outObj = s.dummy3DObj
+					} else if res := s.Resources[thisObj]; res != nil {
+						res.RefCount++
+					}
+				}
 				if ppv != 0 {
-					vm.Write32(ppv, vm.Arg(0))
+					vm.Write32(ppv, outObj)
 				}
 				vm.Regs[cpu.RegEAX] = 0 // S_OK
 				vm.Ret()
@@ -327,6 +384,7 @@ func (s *Subsystem) RegisterIndirectXThunks(c *cpu.CPU) {
 	// Skip fullscreen bloom/blur post-processing pass over software framebuffer
 	c.RegisterIntercept(0x0001d900, "NuPostProcessRender", s.thunkReturnZero)
 	// Prevent directional lightmap binding from overwriting stage 0 diffuse texture (layer0_sampler)
+	c.RegisterIntercept(0x0006f840, "NuBindLightmaps", s.thunkReturnZero)
 	c.RegisterIntercept(0x00070730, "NuBindLightmapsA", s.thunkReturnZero)
 	c.RegisterIntercept(0x000708a0, "NuBindLightmapsB", s.thunkReturnZero)
 	// Capture skeletal animation bone matrices uploaded for skinned character meshes
@@ -360,21 +418,32 @@ func (s *Subsystem) thunkNuUploadSkinMatrices(c *cpu.CPU) {
 	c.Ret()
 }
 
+func (s *Subsystem) lookupNuTex(c *cpu.CPU, tid int32) uint32 {
+	if tid <= 0 {
+		return 0
+	}
+	texArr := c.Read32(0x02c25d08)
+	if texArr != 0 && texArr+uint32(tid)*4 <= uint32(len(c.Mem)) {
+		nuTex := c.Read32(texArr + uint32(tid)*4 - 4)
+		if nuTex != 0 && nuTex+0x28 <= uint32(len(c.Mem)) {
+			return c.Read32(nuTex + 0x24)
+		}
+	}
+	return 0
+}
+
 func (s *Subsystem) thunkNuShaderBindMaterial(c *cpu.CPU) {
 	mtl := c.Arg(1)
+	s.CurrentMaterial = mtl
 	if mtl != 0 && mtl+0x128 <= uint32(len(c.Mem)) {
-		var tex0 uint32
-		tid := int32(c.Read32(mtl + 0xb8))
-		if tid > 0 {
-			texArr := c.Read32(0x02c25d08)
-			if texArr != 0 && texArr+uint32(tid)*4 <= uint32(len(c.Mem)) {
-				nuTex := c.Read32(texArr + uint32(tid)*4 - 4)
-				if nuTex != 0 && nuTex+0x28 <= uint32(len(c.Mem)) {
-					tex0 = c.Read32(nuTex + 0x24)
-				}
-			}
-		}
+		tex0 := s.lookupNuTex(c, int32(c.Read32(mtl+0xb8)))
+		tex1 := s.lookupNuTex(c, int32(c.Read32(mtl+0xbc)))
+		texSurf := s.lookupNuTex(c, int32(c.Read32(mtl+0x100)))
+		texSurf2 := s.lookupNuTex(c, int32(c.Read32(mtl+0xec)))
 		s.BoundTextures[0] = tex0
+		s.BoundTextures[1] = tex1
+		s.BoundTextures[2] = texSurf
+		s.BoundTextures[3] = texSurf2
 		c.Write32(0x02b5af74, tex0)
 
 		const inv255 = 1.0 / 255.0
@@ -398,6 +467,19 @@ func (s *Subsystem) thunkNuShaderBindMaterial(c *cpu.CPU) {
 			float32((cSurf>>8)&0xFF) * inv255,
 			float32((cSurf>>16)&0xFF) * inv255,
 			float32((cSurf>>24)&0xFF) * inv255,
+		}
+		c1 := c.Read32(mtl + 0xcc)
+		s.PSConstants[115] = [4]float32{
+			float32(c1&0xFF) * inv255,
+			float32((c1>>8)&0xFF) * inv255,
+			float32((c1>>16)&0xFF) * inv255,
+			float32((c1>>24)&0xFF) * inv255,
+		}
+		s.PSConstants[116] = [4]float32{
+			c.ReadF32(mtl + 0xd8),
+			c.ReadF32(mtl + 0xdc),
+			c.ReadF32(mtl + 0xe0),
+			c.ReadF32(mtl + 0xe4),
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -647,6 +729,15 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		if s.rendering && (s.FrameDrawCalls > 0 || s.FrameCount == 1) {
 			s.exportFramePNG()
+		}
+		if s.ShmFile != nil && s.AutoKeysMode == "off" {
+			if !s.LastPresentTime.IsZero() {
+				const targetFrame = 16667 * time.Microsecond
+				if elapsed := time.Since(s.LastPresentTime); elapsed < targetFrame {
+					time.Sleep(targetFrame - elapsed)
+				}
+			}
+			s.LastPresentTime = time.Now()
 		}
 		s.mixAudioFrame(c)
 		s.rendering = s.wantRender(s.FrameCount + 1)
@@ -931,6 +1022,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 				case 10: // D3DDECLUSAGE_COLOR
 					if usageIdx == 0 {
 						vd.HasColor0, vd.Color0Offset, vd.Color0Type = true, off, elType
+					} else if usageIdx == 1 {
+						vd.HasColor1, vd.Color1Offset, vd.Color1Type = true, off, elType
 					}
 				}
 			}
@@ -1411,7 +1504,7 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 
 				f := s.FrameCount
 				switch mode {
-				case "boot", "episode1":
+				case "boot", "episode1", "outside":
 					// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
 					if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
 						df := (f - s.TitleFirstFrame) % 50
@@ -1422,7 +1515,7 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 					if s.CantinaFirstFrame > 0 && f >= s.CantinaFirstFrame {
 						cf := f - s.CantinaFirstFrame
 						if (cf >= 10 && cf < 16) || (cf >= 40 && cf < 46) {
-							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN (select Save Slot 1 -> start Cantina gameplay)
+							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
 						}
 						if mode == "episode1" && cf >= 55 {
 							switch {
@@ -1438,6 +1531,19 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 							}
 							if cf >= 300 && (cf%40) < 6 {
 								c.Mem[lpvData+0x16] = 0x80 // Tap DIK_U (Player 1 Jump / Confirm in chapter menu)
+							}
+						}
+						if mode == "outside" && cf >= 55 {
+							// Walk south around the bottom of the bar counter, left past the barista, then north through the exit to the right of the band.
+							switch {
+							case cf < 80: // Walk south to clear the bottom edge of the bar counter
+								c.Mem[lpvData+0x1F] = 0x80 // DIK_S (Down)
+							case cf < 99: // Walk left past the barista, lining up with the exit archway to the right of the band
+								c.Mem[lpvData+0x1E] = 0x80 // DIK_A (Left)
+							case cf < 170: // Walk straight north through the exit archway to the outside of the Cantina
+								c.Mem[lpvData+0x11] = 0x80 // DIK_W (Up)
+							case cf < 210: // Once outside (where the camera faces South toward the exit door), walk away from the door into the courtyard
+								c.Mem[lpvData+0x1F] = 0x80 // DIK_S (Down)
 							}
 						}
 					}
@@ -1517,6 +1623,7 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 			BitsPerSample: bits,
 			Frequency:     sampleRate,
 			Volume:        0,
+			RefCount:      1,
 		}
 		s.Resources[sb] = bd
 		s.AudioBuffers = append(s.AudioBuffers, bd)
@@ -1544,6 +1651,8 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 				BitsPerSample: orig.BitsPerSample,
 				Frequency:     orig.Frequency,
 				Volume:        orig.Volume,
+				RefCount:      1,
+				IsDuplicate:   true,
 			}
 		} else {
 			bd = &BufferDesc{
@@ -1552,6 +1661,8 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 				SampleRate:    44100,
 				BitsPerSample: 16,
 				Frequency:     44100,
+				RefCount:      1,
+				IsDuplicate:   true,
 			}
 		}
 		s.Resources[sb] = bd
@@ -1632,12 +1743,28 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 			if (dwFlags & 0x2) != 0 { // DSBLOCK_ENTIREBUFFER
 				dwBytes = res.Length
 			}
+			if dwBytes == 0 {
+				if ppv1 != 0 {
+					c.Write32(ppv1, 0)
+				}
+				if pdw1 != 0 {
+					c.Write32(pdw1, 0)
+				}
+				if ppv2 != 0 {
+					c.Write32(ppv2, 0)
+				}
+				if pdw2 != 0 {
+					c.Write32(pdw2, 0)
+				}
+				c.Regs[cpu.RegEAX] = 0x80070057 // DSERR_INVALIDPARAM
+				break
+			}
 			if (dwFlags & 0x1) != 0 { // DSBLOCK_FROMWRITECURSOR
 				dwOffset = (res.PlayCursor + 4096) % res.Length
 			} else {
 				dwOffset %= res.Length
 			}
-			if dwBytes == 0 || dwBytes > res.Length {
+			if dwBytes > res.Length {
 				dwBytes = res.Length
 			}
 			bytes1 := dwBytes
@@ -1717,6 +1844,8 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 		if res != nil {
 			res.Playing = false
 		}
+		c.Regs[cpu.RegEAX] = 0
+	case 19: // Unlock(this, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2, dwAudioBytes2)
 		c.Regs[cpu.RegEAX] = 0
 	default:
 		c.Regs[cpu.RegEAX] = 0
