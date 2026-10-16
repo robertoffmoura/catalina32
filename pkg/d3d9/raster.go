@@ -780,7 +780,9 @@ func (s *Subsystem) queueClear(color, flags uint32) {
 // submitFrame hands the frame's queued operations to the render goroutine, which draws and exports
 // them while the emulator runs the next frame. At most one frame is in flight.
 func (s *Subsystem) submitFrame() {
+	t := time.Now()
 	s.WaitRender()
+	s.renderWait += time.Since(t)
 	info := frameInfo{frame: s.FrameCount, drawCalls: s.DrawCallCount, triangles: s.TriangleCount,
 		frameDrawCalls: s.FrameDrawCalls, cubeTexCount: s.CubeTexCount}
 	if s.VM != nil {
@@ -824,9 +826,10 @@ func (s *Subsystem) reportFPS(c *cpu.CPU) {
 		return
 	}
 	if dt := now.Sub(s.fpsTime).Seconds(); dt >= 2 {
-		fmt.Printf("[catalina32] %.1f FPS, %.1fM x86 instructions/s (frame %d)\n",
-			float64(s.FrameCount-s.fpsFrame)/dt, float64(c.Steps-s.fpsStep)/dt/1e6, s.FrameCount)
-		s.fpsTime, s.fpsFrame, s.fpsStep = now, s.FrameCount, c.Steps
+		fmt.Printf("[catalina32] %.1f FPS, %.1fM x86 instructions/s, %.0f%% waiting for the renderer (frame %d)\n",
+			float64(s.FrameCount-s.fpsFrame)/dt, float64(c.Steps-s.fpsStep)/dt/1e6,
+			100*s.renderWait.Seconds()/dt, s.FrameCount)
+		s.fpsTime, s.fpsFrame, s.fpsStep, s.renderWait = now, s.FrameCount, c.Steps, 0
 	}
 }
 

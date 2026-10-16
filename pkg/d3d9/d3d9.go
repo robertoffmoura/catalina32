@@ -135,6 +135,7 @@ type Subsystem struct {
 	LastPresentTime   time.Time
 	fpsTime           time.Time // live-mode FPS report window start
 	fpsFrame, fpsStep uint64
+	renderWait        time.Duration // emulator time blocked on the previous frame's drawing
 
 	KeyMu             sync.Mutex
 	KeyHoldUntil      [256]uint64
