@@ -175,7 +175,17 @@ func (c *CPU) checkAddr(addr uint32, sz uint32) bool {
 	return true
 }
 
+// Each accessor has an inlinable fast path for in-bounds accesses with no watchpoint armed;
+// everything else goes through the *Slow variant, which halts on OOB and reports to WatchFn.
+
 func (c *CPU) Read8(addr uint32) uint8 {
+	if addr < ArenaSize && c.WatchFn == nil {
+		return c.Mem[addr]
+	}
+	return c.read8Slow(addr)
+}
+
+func (c *CPU) read8Slow(addr uint32) uint8 {
 	if !c.checkAddr(addr, 1) {
 		return 0
 	}
@@ -186,13 +196,21 @@ func (c *CPU) Read8(addr uint32) uint8 {
 }
 
 func (c *CPU) Read16(addr uint32) uint16 {
-	if !c.checkAddr(addr, 2) {
-		return 0
+	if addr <= ArenaSize-2 {
+		return binary.LittleEndian.Uint16(c.Mem[addr : addr+2])
 	}
-	return binary.LittleEndian.Uint16(c.Mem[addr : addr+2])
+	c.checkAddr(addr, 2)
+	return 0
 }
 
 func (c *CPU) Read32(addr uint32) uint32 {
+	if addr <= ArenaSize-4 && c.WatchFn == nil {
+		return binary.LittleEndian.Uint32(c.Mem[addr : addr+4])
+	}
+	return c.read32Slow(addr)
+}
+
+func (c *CPU) read32Slow(addr uint32) uint32 {
 	if !c.checkAddr(addr, 4) {
 		return 0
 	}
@@ -203,10 +221,11 @@ func (c *CPU) Read32(addr uint32) uint32 {
 }
 
 func (c *CPU) Read64(addr uint32) uint64 {
-	if !c.checkAddr(addr, 8) {
-		return 0
+	if addr <= ArenaSize-8 {
+		return binary.LittleEndian.Uint64(c.Mem[addr : addr+8])
 	}
-	return binary.LittleEndian.Uint64(c.Mem[addr : addr+8])
+	c.checkAddr(addr, 8)
+	return 0
 }
 
 func (c *CPU) ReadF32(addr uint32) float32 {
@@ -218,6 +237,14 @@ func (c *CPU) ReadF64(addr uint32) float64 {
 }
 
 func (c *CPU) Write8(addr uint32, val uint8) {
+	if addr < ArenaSize && c.WatchFn == nil {
+		c.Mem[addr] = val
+		return
+	}
+	c.write8Slow(addr, val)
+}
+
+func (c *CPU) write8Slow(addr uint32, val uint8) {
 	if !c.checkAddr(addr, 1) {
 		return
 	}
@@ -228,24 +255,27 @@ func (c *CPU) Write8(addr uint32, val uint8) {
 }
 
 func (c *CPU) Write16(addr uint32, val uint16) {
-	if !c.checkAddr(addr, 2) {
+	if addr <= ArenaSize-2 {
+		binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
 		return
 	}
-	binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
+	c.checkAddr(addr, 2)
 }
 
 func (c *CPU) Write32(addr uint32, val uint32) {
-	if !c.checkAddr(addr, 4) {
+	if addr <= ArenaSize-4 {
+		binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
 		return
 	}
-	binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
+	c.checkAddr(addr, 4)
 }
 
 func (c *CPU) Write64(addr uint32, val uint64) {
-	if !c.checkAddr(addr, 8) {
+	if addr <= ArenaSize-8 {
+		binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
 		return
 	}
-	binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
+	c.checkAddr(addr, 8)
 }
 
 func (c *CPU) WriteF32(addr uint32, val float32) {
@@ -467,79 +497,74 @@ func (c *CPU) GetFlag(mask uint32) bool {
 	return (c.Flags & mask) != 0
 }
 
+// parityTab[v] is FlagPF when v has an even number of set bits.
+var parityTab = func() (t [256]uint32) {
+	for i := range t {
+		if parity8(uint8(i)) {
+			t[i] = FlagPF
+		}
+	}
+	return
+}()
+
+const arithFlags = FlagCF | FlagPF | FlagAF | FlagZF | FlagSF | FlagOF
+
+func flagIf(cond bool, mask uint32) uint32 {
+	if cond {
+		return mask
+	}
+	return 0
+}
+
+// The UpdateFlags* helpers rebuild all six arithmetic flags in one store; SF and OF are moved into
+// place with shifts (SF = bit 7, OF = bit 11) instead of per-flag read-modify-writes.
+
 func (c *CPU) UpdateFlagsLogic32(res uint32) {
-	c.SetFlag(FlagCF|FlagOF|FlagAF, false)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x80000000) != 0)
-	c.SetFlag(FlagPF, parity8(uint8(res)))
+	c.Flags = c.Flags&^arithFlags | flagIf(res == 0, FlagZF) | (res>>24)&FlagSF | parityTab[uint8(res)]
 }
 
 func (c *CPU) UpdateFlagsLogic16(res uint16) {
-	c.SetFlag(FlagCF|FlagOF|FlagAF, false)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x8000) != 0)
-	c.SetFlag(FlagPF, parity8(uint8(res)))
+	r := uint32(res)
+	c.Flags = c.Flags&^arithFlags | flagIf(r == 0, FlagZF) | (r>>8)&FlagSF | parityTab[uint8(r)]
 }
 
 func (c *CPU) UpdateFlagsLogic8(res uint8) {
-	c.SetFlag(FlagCF|FlagOF|FlagAF, false)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x80) != 0)
-	c.SetFlag(FlagPF, parity8(res))
+	r := uint32(res)
+	c.Flags = c.Flags&^arithFlags | flagIf(r == 0, FlagZF) | r&FlagSF | parityTab[r]
 }
 
 func (c *CPU) UpdateFlagsAdd32(a, b, res uint32) {
-	c.SetFlag(FlagCF, res < a)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x80000000) != 0)
-	c.SetFlag(FlagPF, parity8(uint8(res)))
-	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, ((^(a^b)&(a^res))&0x80000000) != 0)
+	c.Flags = c.Flags&^arithFlags | flagIf(res < a, FlagCF) | flagIf(res == 0, FlagZF) | (res>>24)&FlagSF |
+		parityTab[uint8(res)] | (a^b^res)&FlagAF | ((^(a^b)&(a^res))>>20)&FlagOF
 }
 
 func (c *CPU) UpdateFlagsSub32(a, b, res uint32) {
-	c.SetFlag(FlagCF, a < b)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x80000000) != 0)
-	c.SetFlag(FlagPF, parity8(uint8(res)))
-	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, (((a^b)&(a^res))&0x80000000) != 0)
+	c.Flags = c.Flags&^arithFlags | flagIf(a < b, FlagCF) | flagIf(res == 0, FlagZF) | (res>>24)&FlagSF |
+		parityTab[uint8(res)] | (a^b^res)&FlagAF | (((a^b)&(a^res))>>20)&FlagOF
 }
 
 func (c *CPU) UpdateFlagsAdd16(a, b, res uint16) {
-	c.SetFlag(FlagCF, res < a)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x8000) != 0)
-	c.SetFlag(FlagPF, parity8(uint8(res)))
-	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, ((^(a^b)&(a^res))&0x8000) != 0)
+	A, B, R := uint32(a), uint32(b), uint32(res)
+	c.Flags = c.Flags&^arithFlags | flagIf(res < a, FlagCF) | flagIf(R == 0, FlagZF) | (R>>8)&FlagSF |
+		parityTab[uint8(R)] | (A^B^R)&FlagAF | ((^(A^B)&(A^R))>>4)&FlagOF
 }
 
 func (c *CPU) UpdateFlagsSub16(a, b, res uint16) {
-	c.SetFlag(FlagCF, a < b)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x8000) != 0)
-	c.SetFlag(FlagPF, parity8(uint8(res)))
-	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, (((a^b)&(a^res))&0x8000) != 0)
+	A, B, R := uint32(a), uint32(b), uint32(res)
+	c.Flags = c.Flags&^arithFlags | flagIf(a < b, FlagCF) | flagIf(R == 0, FlagZF) | (R>>8)&FlagSF |
+		parityTab[uint8(R)] | (A^B^R)&FlagAF | (((A^B)&(A^R))>>4)&FlagOF
 }
 
 func (c *CPU) UpdateFlagsAdd8(a, b, res uint8) {
-	c.SetFlag(FlagCF, res < a)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x80) != 0)
-	c.SetFlag(FlagPF, parity8(res))
-	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, ((^(a^b)&(a^res))&0x80) != 0)
+	A, B, R := uint32(a), uint32(b), uint32(res)
+	c.Flags = c.Flags&^arithFlags | flagIf(res < a, FlagCF) | flagIf(R == 0, FlagZF) | R&FlagSF |
+		parityTab[R] | (A^B^R)&FlagAF | ((^(A^B)&(A^R))<<4)&FlagOF
 }
 
 func (c *CPU) UpdateFlagsSub8(a, b, res uint8) {
-	c.SetFlag(FlagCF, a < b)
-	c.SetFlag(FlagZF, res == 0)
-	c.SetFlag(FlagSF, (res&0x80) != 0)
-	c.SetFlag(FlagPF, parity8(res))
-	c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-	c.SetFlag(FlagOF, (((a^b)&(a^res))&0x80) != 0)
+	A, B, R := uint32(a), uint32(b), uint32(res)
+	c.Flags = c.Flags&^arithFlags | flagIf(a < b, FlagCF) | flagIf(R == 0, FlagZF) | R&FlagSF |
+		parityTab[R] | (A^B^R)&FlagAF | (((A^B)&(A^R))<<4)&FlagOF
 }
 
 func (c *CPU) EvalCond(cc uint8) bool {
