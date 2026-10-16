@@ -95,6 +95,7 @@ type CPU struct {
 
 	// Decoded-instruction cache (dcache.go); active once SetCodeRange is called.
 	dcache           []dInst
+	blocks           []dBlock
 	CodeLo, CodeHi   uint32
 	CodeCacheFlushes uint64
 	// Stores with addr-CodeHi <= writeSpan are in bounds and above guest code (the inlined fast path).
@@ -157,6 +158,9 @@ func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 	if addr < ArenaSize {
 		c.icept[addr>>6] |= 1 << (addr & 63)
 	}
+	if addr >= c.CodeLo && addr < c.CodeHi && c.blocks != nil {
+		c.FlushCodeCache() // blocks are built assuming no intercept inside them
+	}
 	c.InterceptTag[addr] = name
 }
 
@@ -170,6 +174,9 @@ func (c *CPU) SetInterceptEnabled(addr uint32, on bool) {
 		c.icept[addr>>6] |= 1 << (addr & 63)
 	} else {
 		c.icept[addr>>6] &^= 1 << (addr & 63)
+	}
+	if addr >= c.CodeLo && addr < c.CodeHi && c.blocks != nil {
+		c.FlushCodeCache()
 	}
 }
 

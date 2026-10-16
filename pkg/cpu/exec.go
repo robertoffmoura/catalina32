@@ -531,8 +531,8 @@ func (c *CPU) Step() {
 			c.decodeCached(d, c.EIP)
 		}
 		if d.kind != dSlow {
-			c.Steps++
-			c.execCached(d)
+			i := c.EIP & dcacheMask
+			c.execBlock(c.dcache[i : i+1])
 			return
 		}
 	}
@@ -1939,8 +1939,10 @@ func (c *CPU) nextEventStep() uint64 {
 	return limit
 }
 
-// runCached executes decoded instructions until limit steps, stopEIP, a halt, or an instruction
-// that needs the full decoder (intercepts, uncached forms, code outside [CodeLo, CodeHi)).
+// runCached executes cached straight-line blocks until limit steps, stopEIP, a halt, or an
+// instruction that needs the full decoder (intercepts, uncached forms, code outside
+// [CodeLo, CodeHi)). Stop addresses lie outside guest code, so they can only be reached by a
+// control transfer, which always ends a block; checking them at block starts is enough.
 func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 	span := c.CodeHi - c.CodeLo
 	for c.Steps < limit {
@@ -1948,15 +1950,18 @@ func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 		if eip == stopEIP || c.Halted || eip-c.CodeLo >= span || c.icept[eip>>6]&(1<<(eip&63)) != 0 {
 			return
 		}
-		d := &c.dcache[eip&dcacheMask]
-		if d.tag != eip {
-			c.decodeCached(d, eip)
+		b := &c.blocks[eip&blockMask]
+		if b.tag != eip {
+			c.buildBlock(b, eip)
 		}
-		if d.kind == dSlow {
+		insts := b.insts
+		if len(insts) == 0 {
 			return
 		}
-		c.Steps++
-		c.execCached(d)
+		if rem := limit - c.Steps; uint64(len(insts)) > rem {
+			insts = insts[:rem]
+		}
+		c.execBlock(insts)
 	}
 }
 

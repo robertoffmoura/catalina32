@@ -94,12 +94,58 @@ func newDCache() []dInst {
 	return d
 }
 
-// FlushCodeCache discards all decoded instructions (call after modifying guest code from the host).
+// Straight-line blocks: a run of cached instructions starting at tag that ends after the first
+// control transfer (or before an uncached instruction, an intercepted address, or blockMax).
+// Blocks hold copies of their instructions so collisions in the instruction cache cannot alter them.
+const (
+	blockBits = 16
+	blockMask = 1<<blockBits - 1
+	blockMax  = 64
+)
+
+type dBlock struct {
+	tag   uint32
+	insts []dInst
+}
+
+// FlushCodeCache discards all decoded instructions and blocks (call after modifying guest code
+// from the host).
 func (c *CPU) FlushCodeCache() {
 	for i := range c.dcache {
 		c.dcache[i].tag = dNoTag
 	}
+	for i := range c.blocks {
+		c.blocks[i].tag = dNoTag
+	}
 	c.CodeCacheFlushes++
+}
+
+func endsBlock(kind uint8) bool {
+	switch kind {
+	case dJcc, dJmp, dCall, dRet, dCallInd, dJmpInd:
+		return true
+	}
+	return false
+}
+
+func (c *CPU) buildBlock(b *dBlock, eip uint32) {
+	b.tag = eip
+	b.insts = b.insts[:0]
+	span := c.CodeHi - c.CodeLo
+	for len(b.insts) < blockMax && eip-c.CodeLo < span && c.icept[eip>>6]&(1<<(eip&63)) == 0 {
+		d := &c.dcache[eip&dcacheMask]
+		if d.tag != eip {
+			c.decodeCached(d, eip)
+		}
+		if d.kind == dSlow {
+			return
+		}
+		b.insts = append(b.insts, *d)
+		if endsBlock(d.kind) {
+			return
+		}
+		eip += uint32(d.len)
+	}
 }
 
 // SetCodeRange enables the decoded-instruction cache for guest code in [lo, hi).
@@ -108,6 +154,7 @@ func (c *CPU) SetCodeRange(lo, hi uint32) {
 	c.writeSpan = ArenaSize - 8 - hi
 	if c.dcache == nil {
 		c.dcache = newDCache()
+		c.blocks = make([]dBlock, 1<<blockBits)
 	}
 	c.FlushCodeCache()
 }
@@ -410,308 +457,317 @@ func (c *CPU) ea(d *dInst) uint32 {
 	return a
 }
 
-// execCached runs a decoded instruction. c.EIP is advanced first, matching the full decoder (which
-// has fetched the whole instruction before executing it).
-func (c *CPU) execCached(d *dInst) {
-	start := c.EIP
-	c.EIP = start + uint32(d.len)
-	switch d.kind {
-	case dMovLoad32:
-		if d.isMem {
-			c.Regs[d.reg] = c.Read32(c.ea(d))
-		} else {
-			c.Regs[d.reg] = c.Regs[d.rm]
-		}
-	case dMovStore32:
-		if d.isMem {
-			c.Write32(c.ea(d), c.Regs[d.reg])
-		} else {
-			c.Regs[d.rm] = c.Regs[d.reg]
-		}
-	case dMovImm32:
-		if d.isMem {
-			c.Write32(c.ea(d), d.imm)
-		} else {
-			c.Regs[d.rm] = d.imm
-		}
-	case dAluRMR32:
-		if d.isMem {
-			addr := c.ea(d)
-			if res, wb := c.aluOp32(int(d.aux), c.Read32(addr), c.Regs[d.reg]); wb {
-				c.Write32(addr, res)
+// execBlock runs decoded instructions in order, stopping early if one halts the CPU. c.EIP is
+// advanced before each instruction executes, matching the full decoder (which has fetched the
+// whole instruction first). Keeping the loop inside the switch function avoids a call per
+// instruction.
+func (c *CPU) execBlock(insts []dInst) {
+	for i := range insts {
+		d := &insts[i]
+		c.Steps++
+		start := c.EIP
+		c.EIP = start + uint32(d.len)
+		switch d.kind {
+		case dMovLoad32:
+			if d.isMem {
+				c.Regs[d.reg] = c.Read32(c.ea(d))
+			} else {
+				c.Regs[d.reg] = c.Regs[d.rm]
 			}
-		} else if res, wb := c.aluOp32(int(d.aux), c.Regs[d.rm], c.Regs[d.reg]); wb {
-			c.Regs[d.rm] = res
-		}
-	case dAluRRM32:
-		var b uint32
-		if d.isMem {
-			b = c.Read32(c.ea(d))
-		} else {
-			b = c.Regs[d.rm]
-		}
-		if res, wb := c.aluOp32(int(d.aux), c.Regs[d.reg], b); wb {
-			c.Regs[d.reg] = res
-		}
-	case dAluEAXImm:
-		if res, wb := c.aluOp32(int(d.aux), c.Regs[RegEAX], d.imm); wb {
-			c.Regs[RegEAX] = res
-		}
-	case dGrp1RM32:
-		if d.isMem {
-			addr := c.ea(d)
-			if res, wb := c.aluOp32(int(d.aux), c.Read32(addr), d.imm); wb {
-				c.Write32(addr, res)
+		case dMovStore32:
+			if d.isMem {
+				c.Write32(c.ea(d), c.Regs[d.reg])
+			} else {
+				c.Regs[d.rm] = c.Regs[d.reg]
 			}
-		} else if res, wb := c.aluOp32(int(d.aux), c.Regs[d.rm], d.imm); wb {
-			c.Regs[d.rm] = res
-		}
-	case dGrp1RM8:
-		if d.isMem {
-			addr := c.ea(d)
-			if res, wb := c.aluOp8(int(d.aux), c.Read8(addr), uint8(d.imm)); wb {
-				c.Write8(addr, res)
+		case dMovImm32:
+			if d.isMem {
+				c.Write32(c.ea(d), d.imm)
+			} else {
+				c.Regs[d.rm] = d.imm
 			}
-		} else if res, wb := c.aluOp8(int(d.aux), c.GetReg8(int(d.rm)), uint8(d.imm)); wb {
-			c.SetReg8(int(d.rm), res)
-		}
-	case dTestRMR32:
-		var a uint32
-		if d.isMem {
-			a = c.Read32(c.ea(d))
-		} else {
-			a = c.Regs[d.rm]
-		}
-		c.UpdateFlagsLogic32(a & c.Regs[d.reg])
-	case dTestRMI8:
-		var a uint8
-		if d.isMem {
-			a = c.Read8(c.ea(d))
-		} else {
-			a = c.GetReg8(int(d.rm))
-		}
-		c.UpdateFlagsLogic8(a & uint8(d.imm))
-	case dLea:
-		c.Regs[d.reg] = c.ea(d)
-	case dIncR:
-		cf := c.Flags & FlagCF
-		v := c.Regs[d.reg]
-		c.UpdateFlagsAdd32(v, 1, v+1)
-		c.Regs[d.reg] = v + 1
-		c.Flags = c.Flags&^FlagCF | cf
-	case dDecR:
-		cf := c.Flags & FlagCF
-		v := c.Regs[d.reg]
-		c.UpdateFlagsSub32(v, 1, v-1)
-		c.Regs[d.reg] = v - 1
-		c.Flags = c.Flags&^FlagCF | cf
-	case dPushR:
-		c.Push32(c.Regs[d.reg])
-	case dPopR:
-		c.Regs[d.reg] = c.Pop32()
-	case dJcc:
-		if c.EvalCond(d.aux) {
+		case dAluRMR32:
+			if d.isMem {
+				addr := c.ea(d)
+				if res, wb := c.aluOp32(int(d.aux), c.Read32(addr), c.Regs[d.reg]); wb {
+					c.Write32(addr, res)
+				}
+			} else if res, wb := c.aluOp32(int(d.aux), c.Regs[d.rm], c.Regs[d.reg]); wb {
+				c.Regs[d.rm] = res
+			}
+		case dAluRRM32:
+			var b uint32
+			if d.isMem {
+				b = c.Read32(c.ea(d))
+			} else {
+				b = c.Regs[d.rm]
+			}
+			if res, wb := c.aluOp32(int(d.aux), c.Regs[d.reg], b); wb {
+				c.Regs[d.reg] = res
+			}
+		case dAluEAXImm:
+			if res, wb := c.aluOp32(int(d.aux), c.Regs[RegEAX], d.imm); wb {
+				c.Regs[RegEAX] = res
+			}
+		case dGrp1RM32:
+			if d.isMem {
+				addr := c.ea(d)
+				if res, wb := c.aluOp32(int(d.aux), c.Read32(addr), d.imm); wb {
+					c.Write32(addr, res)
+				}
+			} else if res, wb := c.aluOp32(int(d.aux), c.Regs[d.rm], d.imm); wb {
+				c.Regs[d.rm] = res
+			}
+		case dGrp1RM8:
+			if d.isMem {
+				addr := c.ea(d)
+				if res, wb := c.aluOp8(int(d.aux), c.Read8(addr), uint8(d.imm)); wb {
+					c.Write8(addr, res)
+				}
+			} else if res, wb := c.aluOp8(int(d.aux), c.GetReg8(int(d.rm)), uint8(d.imm)); wb {
+				c.SetReg8(int(d.rm), res)
+			}
+		case dTestRMR32:
+			var a uint32
+			if d.isMem {
+				a = c.Read32(c.ea(d))
+			} else {
+				a = c.Regs[d.rm]
+			}
+			c.UpdateFlagsLogic32(a & c.Regs[d.reg])
+		case dTestRMI8:
+			var a uint8
+			if d.isMem {
+				a = c.Read8(c.ea(d))
+			} else {
+				a = c.GetReg8(int(d.rm))
+			}
+			c.UpdateFlagsLogic8(a & uint8(d.imm))
+		case dLea:
+			c.Regs[d.reg] = c.ea(d)
+		case dIncR:
+			cf := c.Flags & FlagCF
+			v := c.Regs[d.reg]
+			c.UpdateFlagsAdd32(v, 1, v+1)
+			c.Regs[d.reg] = v + 1
+			c.Flags = c.Flags&^FlagCF | cf
+		case dDecR:
+			cf := c.Flags & FlagCF
+			v := c.Regs[d.reg]
+			c.UpdateFlagsSub32(v, 1, v-1)
+			c.Regs[d.reg] = v - 1
+			c.Flags = c.Flags&^FlagCF | cf
+		case dPushR:
+			c.Push32(c.Regs[d.reg])
+		case dPopR:
+			c.Regs[d.reg] = c.Pop32()
+		case dJcc:
+			if c.EvalCond(d.aux) {
+				c.EIP = d.imm
+			}
+		case dJmp:
 			c.EIP = d.imm
+		case dCall:
+			c.Push32(c.EIP)
+			if c.TraceCalls && d.aux != 0 {
+				c.CallStack = append(c.CallStack, CallFrame{CallerEIP: start, TargetEIP: d.imm, ESP: c.Regs[RegESP]})
+				c.VisitedFuncs[d.imm]++
+			}
+			c.EIP = d.imm
+		case dRet:
+			c.Ret()
+		case dMovzx8, dMovsx8:
+			var v uint8
+			if d.isMem {
+				v = c.Read8(c.ea(d))
+			} else {
+				v = c.GetReg8(int(d.rm))
+			}
+			if d.kind == dMovzx8 {
+				c.Regs[d.reg] = uint32(v)
+			} else {
+				c.Regs[d.reg] = uint32(int32(int8(v)))
+			}
+		case dMovzx16, dMovsx16:
+			var v uint16
+			if d.isMem {
+				v = c.Read16(c.ea(d))
+			} else {
+				v = c.GetReg16(int(d.rm))
+			}
+			if d.kind == dMovzx16 {
+				c.Regs[d.reg] = uint32(v)
+			} else {
+				c.Regs[d.reg] = uint32(int32(int16(v)))
+			}
+		case dCmov:
+			var v uint32
+			if d.isMem {
+				v = c.Read32(c.ea(d))
+			} else {
+				v = c.Regs[d.rm]
+			}
+			if c.EvalCond(d.aux) {
+				c.Regs[d.reg] = v
+			}
+		case dMovssLoad:
+			if d.isMem {
+				addr := c.ea(d)
+				clear(c.XMM[d.reg][:])
+				c.setXMMF32(int(d.reg), 0, c.ReadF32(addr))
+			} else {
+				c.setXMMF32(int(d.reg), 0, c.getXMMF32(int(d.rm), 0))
+			}
+		case dMovssStore:
+			if d.isMem {
+				c.WriteF32(c.ea(d), c.getXMMF32(int(d.reg), 0))
+			} else {
+				c.setXMMF32(int(d.rm), 0, c.getXMMF32(int(d.reg), 0))
+			}
+		case dMovsdLoad:
+			if d.isMem {
+				addr := c.ea(d)
+				clear(c.XMM[d.reg][:])
+				c.setXMMF64(int(d.reg), 0, c.ReadF64(addr))
+			} else {
+				c.setXMMF64(int(d.reg), 0, c.getXMMF64(int(d.rm), 0))
+			}
+		case dMovsdStore:
+			if d.isMem {
+				c.WriteF64(c.ea(d), c.getXMMF64(int(d.reg), 0))
+			} else {
+				c.setXMMF64(int(d.rm), 0, c.getXMMF64(int(d.reg), 0))
+			}
+		case dArithSS:
+			a := c.getXMMF32(int(d.reg), 0)
+			var b float32
+			if d.isMem {
+				b = c.ReadF32(c.ea(d))
+			} else {
+				b = c.getXMMF32(int(d.rm), 0)
+			}
+			var r float32
+			switch d.aux {
+			case 0x58:
+				r = a + b
+			case 0x59:
+				r = a * b
+			case 0x5C:
+				r = a - b
+			case 0x5E:
+				r = a / b
+			}
+			c.setXMMF32(int(d.reg), 0, r)
+		case dMovapsLoad:
+			if d.isMem {
+				addr := c.ea(d)
+				copy(c.XMM[d.reg][:], c.Mem[addr:addr+16])
+			} else {
+				c.XMM[d.reg] = c.XMM[d.rm]
+			}
+		case dMovapsStore:
+			if d.isMem {
+				addr := c.ea(d)
+				c.storeCode128(addr, c.XMM[d.reg])
+			} else {
+				c.XMM[d.rm] = c.XMM[d.reg]
+			}
+		case dUcomiss:
+			a := float64(c.getXMMF32(int(d.reg), 0))
+			var b float64
+			if d.isMem {
+				b = float64(c.ReadF32(c.ea(d)))
+			} else {
+				b = float64(c.getXMMF32(int(d.rm), 0))
+			}
+			c.fpuCompareEFlags(a, b)
+		case dNop:
+		case dMovRImm32:
+			c.Regs[d.reg] = d.imm
+		case dShift32, dShift32CL:
+			cnt := uint8(d.imm)
+			if d.kind == dShift32CL {
+				cnt = c.GetReg8(RegECX)
+			}
+			if d.isMem {
+				addr := c.ea(d)
+				c.Write32(addr, c.shiftOp32(int(d.aux), c.Read32(addr), cnt))
+			} else {
+				c.Regs[d.rm] = c.shiftOp32(int(d.aux), c.Regs[d.rm], cnt)
+			}
+		case dImul32:
+			src := int64(int32(c.rm32(d)))
+			prod := src * int64(int32(d.imm))
+			res := uint32(prod)
+			c.Regs[d.reg] = res
+			c.SetFlag(FlagCF|FlagOF, prod != int64(int32(res)))
+		case dMovStore8:
+			if d.isMem {
+				c.Write8(c.ea(d), c.GetReg8(int(d.reg)))
+			} else {
+				c.SetReg8(int(d.rm), c.GetReg8(int(d.reg)))
+			}
+		case dMovLoad8:
+			c.SetReg8(int(d.reg), c.rm8(d))
+		case dMovImm8:
+			if d.isMem {
+				c.Write8(c.ea(d), uint8(d.imm))
+			} else {
+				c.SetReg8(int(d.rm), uint8(d.imm))
+			}
+		case dTestRMR8:
+			c.UpdateFlagsLogic8(c.rm8(d) & c.GetReg8(int(d.reg)))
+		case dTestALImm:
+			c.UpdateFlagsLogic8(c.GetReg8(RegEAX) & uint8(d.imm))
+		case dIncRM32, dDecRM32:
+			cf := c.Flags & FlagCF
+			var addr, v uint32
+			if d.isMem {
+				addr = c.ea(d)
+				v = c.Read32(addr)
+			} else {
+				v = c.Regs[d.rm]
+			}
+			var res uint32
+			if d.kind == dIncRM32 {
+				res = v + 1
+				c.UpdateFlagsAdd32(v, 1, res)
+			} else {
+				res = v - 1
+				c.UpdateFlagsSub32(v, 1, res)
+			}
+			if d.isMem {
+				c.Write32(addr, res)
+			} else {
+				c.Regs[d.rm] = res
+			}
+			c.Flags = c.Flags&^FlagCF | cf
+		case dCallInd:
+			target := c.rm32(d)
+			c.Push32(c.EIP)
+			if c.TraceCalls {
+				c.CallStack = append(c.CallStack, CallFrame{CallerEIP: start, TargetEIP: target, ESP: c.Regs[RegESP]})
+				c.VisitedFuncs[target]++
+			}
+			c.EIP = target
+		case dJmpInd:
+			c.EIP = c.rm32(d)
+		case dPushRM32:
+			c.Push32(c.rm32(d))
+		case dXorps:
+			var src [16]byte
+			if d.isMem {
+				addr := c.ea(d)
+				copy(src[:], c.Mem[addr:addr+16])
+			} else {
+				src = c.XMM[d.rm]
+			}
+			for i := range src {
+				c.XMM[d.reg][i] ^= src[i]
+			}
 		}
-	case dJmp:
-		c.EIP = d.imm
-	case dCall:
-		c.Push32(c.EIP)
-		if c.TraceCalls && d.aux != 0 {
-			c.CallStack = append(c.CallStack, CallFrame{CallerEIP: start, TargetEIP: d.imm, ESP: c.Regs[RegESP]})
-			c.VisitedFuncs[d.imm]++
-		}
-		c.EIP = d.imm
-	case dRet:
-		c.Ret()
-	case dMovzx8, dMovsx8:
-		var v uint8
-		if d.isMem {
-			v = c.Read8(c.ea(d))
-		} else {
-			v = c.GetReg8(int(d.rm))
-		}
-		if d.kind == dMovzx8 {
-			c.Regs[d.reg] = uint32(v)
-		} else {
-			c.Regs[d.reg] = uint32(int32(int8(v)))
-		}
-	case dMovzx16, dMovsx16:
-		var v uint16
-		if d.isMem {
-			v = c.Read16(c.ea(d))
-		} else {
-			v = c.GetReg16(int(d.rm))
-		}
-		if d.kind == dMovzx16 {
-			c.Regs[d.reg] = uint32(v)
-		} else {
-			c.Regs[d.reg] = uint32(int32(int16(v)))
-		}
-	case dCmov:
-		var v uint32
-		if d.isMem {
-			v = c.Read32(c.ea(d))
-		} else {
-			v = c.Regs[d.rm]
-		}
-		if c.EvalCond(d.aux) {
-			c.Regs[d.reg] = v
-		}
-	case dMovssLoad:
-		if d.isMem {
-			addr := c.ea(d)
-			clear(c.XMM[d.reg][:])
-			c.setXMMF32(int(d.reg), 0, c.ReadF32(addr))
-		} else {
-			c.setXMMF32(int(d.reg), 0, c.getXMMF32(int(d.rm), 0))
-		}
-	case dMovssStore:
-		if d.isMem {
-			c.WriteF32(c.ea(d), c.getXMMF32(int(d.reg), 0))
-		} else {
-			c.setXMMF32(int(d.rm), 0, c.getXMMF32(int(d.reg), 0))
-		}
-	case dMovsdLoad:
-		if d.isMem {
-			addr := c.ea(d)
-			clear(c.XMM[d.reg][:])
-			c.setXMMF64(int(d.reg), 0, c.ReadF64(addr))
-		} else {
-			c.setXMMF64(int(d.reg), 0, c.getXMMF64(int(d.rm), 0))
-		}
-	case dMovsdStore:
-		if d.isMem {
-			c.WriteF64(c.ea(d), c.getXMMF64(int(d.reg), 0))
-		} else {
-			c.setXMMF64(int(d.rm), 0, c.getXMMF64(int(d.reg), 0))
-		}
-	case dArithSS:
-		a := c.getXMMF32(int(d.reg), 0)
-		var b float32
-		if d.isMem {
-			b = c.ReadF32(c.ea(d))
-		} else {
-			b = c.getXMMF32(int(d.rm), 0)
-		}
-		var r float32
-		switch d.aux {
-		case 0x58:
-			r = a + b
-		case 0x59:
-			r = a * b
-		case 0x5C:
-			r = a - b
-		case 0x5E:
-			r = a / b
-		}
-		c.setXMMF32(int(d.reg), 0, r)
-	case dMovapsLoad:
-		if d.isMem {
-			addr := c.ea(d)
-			copy(c.XMM[d.reg][:], c.Mem[addr:addr+16])
-		} else {
-			c.XMM[d.reg] = c.XMM[d.rm]
-		}
-	case dMovapsStore:
-		if d.isMem {
-			addr := c.ea(d)
-			c.storeCode128(addr, c.XMM[d.reg])
-		} else {
-			c.XMM[d.rm] = c.XMM[d.reg]
-		}
-	case dUcomiss:
-		a := float64(c.getXMMF32(int(d.reg), 0))
-		var b float64
-		if d.isMem {
-			b = float64(c.ReadF32(c.ea(d)))
-		} else {
-			b = float64(c.getXMMF32(int(d.rm), 0))
-		}
-		c.fpuCompareEFlags(a, b)
-	case dNop:
-	case dMovRImm32:
-		c.Regs[d.reg] = d.imm
-	case dShift32, dShift32CL:
-		cnt := uint8(d.imm)
-		if d.kind == dShift32CL {
-			cnt = c.GetReg8(RegECX)
-		}
-		if d.isMem {
-			addr := c.ea(d)
-			c.Write32(addr, c.shiftOp32(int(d.aux), c.Read32(addr), cnt))
-		} else {
-			c.Regs[d.rm] = c.shiftOp32(int(d.aux), c.Regs[d.rm], cnt)
-		}
-	case dImul32:
-		src := int64(int32(c.rm32(d)))
-		prod := src * int64(int32(d.imm))
-		res := uint32(prod)
-		c.Regs[d.reg] = res
-		c.SetFlag(FlagCF|FlagOF, prod != int64(int32(res)))
-	case dMovStore8:
-		if d.isMem {
-			c.Write8(c.ea(d), c.GetReg8(int(d.reg)))
-		} else {
-			c.SetReg8(int(d.rm), c.GetReg8(int(d.reg)))
-		}
-	case dMovLoad8:
-		c.SetReg8(int(d.reg), c.rm8(d))
-	case dMovImm8:
-		if d.isMem {
-			c.Write8(c.ea(d), uint8(d.imm))
-		} else {
-			c.SetReg8(int(d.rm), uint8(d.imm))
-		}
-	case dTestRMR8:
-		c.UpdateFlagsLogic8(c.rm8(d) & c.GetReg8(int(d.reg)))
-	case dTestALImm:
-		c.UpdateFlagsLogic8(c.GetReg8(RegEAX) & uint8(d.imm))
-	case dIncRM32, dDecRM32:
-		cf := c.Flags & FlagCF
-		var addr, v uint32
-		if d.isMem {
-			addr = c.ea(d)
-			v = c.Read32(addr)
-		} else {
-			v = c.Regs[d.rm]
-		}
-		var res uint32
-		if d.kind == dIncRM32 {
-			res = v + 1
-			c.UpdateFlagsAdd32(v, 1, res)
-		} else {
-			res = v - 1
-			c.UpdateFlagsSub32(v, 1, res)
-		}
-		if d.isMem {
-			c.Write32(addr, res)
-		} else {
-			c.Regs[d.rm] = res
-		}
-		c.Flags = c.Flags&^FlagCF | cf
-	case dCallInd:
-		target := c.rm32(d)
-		c.Push32(c.EIP)
-		if c.TraceCalls {
-			c.CallStack = append(c.CallStack, CallFrame{CallerEIP: start, TargetEIP: target, ESP: c.Regs[RegESP]})
-			c.VisitedFuncs[target]++
-		}
-		c.EIP = target
-	case dJmpInd:
-		c.EIP = c.rm32(d)
-	case dPushRM32:
-		c.Push32(c.rm32(d))
-	case dXorps:
-		var src [16]byte
-		if d.isMem {
-			addr := c.ea(d)
-			copy(src[:], c.Mem[addr:addr+16])
-		} else {
-			src = c.XMM[d.rm]
-		}
-		for i := range src {
-			c.XMM[d.reg][i] ^= src[i]
+		if c.Halted {
+			return
 		}
 	}
 }
