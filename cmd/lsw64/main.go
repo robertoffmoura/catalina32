@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"runtime/pprof"
@@ -11,34 +10,10 @@ import (
 	"lsw64/pkg/cpu"
 	"lsw64/pkg/crt"
 	"lsw64/pkg/d3d9"
-	"lsw64/pkg/lifted"
+	"lsw64/pkg/games"
 	"lsw64/pkg/macho32"
 	"lsw64/pkg/win32"
 )
-
-type BoundaryCatalog struct {
-	BoundaryFunctions []struct {
-		Address string `json:"address"`
-	} `json:"boundary_functions"`
-}
-
-func loadBoundaryAddrs(path string) []uint32 {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var cat BoundaryCatalog
-	if err := json.Unmarshal(b, &cat); err != nil {
-		return nil
-	}
-	var out []uint32
-	for _, fn := range cat.BoundaryFunctions {
-		if v, err := strconv.ParseUint(fn.Address, 0, 32); err == nil {
-			out = append(out, uint32(v))
-		}
-	}
-	return out
-}
 
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -51,15 +26,26 @@ func main() {
 	binPath := envOrDefault("LSW_BIN_PATH", "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga")
 	dataRoot := envOrDefault("LSW_DATA_ROOT", "/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData")
 	saveRoot := envOrDefault("LSW_SAVE_ROOT", "/workspace/Lego Star Wars Saga/SaveData")
-	boundaryPath := envOrDefault("LSW_BOUNDARY_JSON", "/workspace/lego_star_wars_193_boundary_catalog.json")
 
 	img, err := macho32.LoadImage(binPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load Mach-O image: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("[lsw64] Loaded 32-bit Mach-O (%d segments, %d sections, %d symbols, %d FDEs, %d NuEngine static initializers)\n",
-		len(img.Segments), len(img.Sections), len(img.Symbols), len(img.FDEs), len(img.NuModInits))
+	game, err := games.Detect(img.Raw, os.Getenv("LSW_PROFILE"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	prof := game.Profile
+	var modInits []uint32
+	for _, fn := range img.ModInitFuncs {
+		if fn != 0 && (prof.ModInitLimit == 0 || fn < prof.ModInitLimit) {
+			modInits = append(modInits, fn)
+		}
+	}
+	fmt.Printf("[lsw64] Loaded 32-bit Mach-O (%d segments, %d sections, %d symbols, %d FDEs, %d game static initializers) -> %s\n",
+		len(img.Segments), len(img.Sections), len(img.Symbols), len(img.FDEs), len(modInits), prof.Name)
 
 	vm := cpu.NewCPU()
 	if err := img.MapIntoArena(vm.Mem); err != nil {
@@ -67,27 +53,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	crt.RegisterCRT(vm, img)
+	prof.Attach(img, vm.Mem)
+	entry, ok := prof.Addr(prof.EntryPoint)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "profile %q does not locate entry point %q\n", prof.Name, prof.EntryPoint)
+		os.Exit(1)
+	}
+
+	crt.RegisterCRT(vm, img, prof)
 	w32 := win32.NewWin32Env(vm, dataRoot, saveRoot)
-	boundaryAddrs := loadBoundaryAddrs(boundaryPath)
-	w32.RegisterBoundaryThunks(vm, boundaryAddrs)
+	w32.RegisterBoundaryThunks(vm, prof)
 	d3d := d3d9.NewSubsystem(vm)
-	d3d.RegisterIndirectXThunks(vm)
-	lifted.RegisterLiftedFunctions(vm)
+	d3d.RegisterIndirectXThunks(vm, prof)
+	game.Install(vm, d3d, prof)
+	fmt.Printf("[lsw64] %s\n", prof.Report())
 
 	// 1. Execute all 18 NuEngine static initializers
-	fmt.Printf("[lsw64] Running %d NuEngine C++ static initializers (__mod_init_func)...\n", len(img.NuModInits))
-	for i, fnAddr := range img.NuModInits {
+	fmt.Printf("[lsw64] Running %d game C++ static initializers (__mod_init_func)...\n", len(modInits))
+	for i, fnAddr := range modInits {
 		_, err := vm.CallGuest(fnAddr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  [Init %2d] 0x%08x FAILED: %v\n  State: %s\n", i+1, fnAddr, err, vm.DumpState())
 			os.Exit(1)
 		}
 	}
-	fmt.Printf("[lsw64] All %d NuEngine C++ static initializers completed (%d instructions).\n", len(img.NuModInits), vm.Steps)
+	fmt.Printf("[lsw64] All %d game C++ static initializers completed (%d instructions).\n", len(modInits), vm.Steps)
 
-	// 2. Call WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1) at 0x00209d10
-	fmt.Printf("[lsw64] Launching WinMain(0x00001000, 0, 0x%08x, 1) @ 0x00209d10...\n", w32.CmdLineAddr)
+	// 2. Call the entry point: WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1)
+	fmt.Printf("[lsw64] Launching %s(0x00001000, 0, 0x%08x, 1) @ 0x%08x...\n", prof.EntryPoint, w32.CmdLineAddr, entry)
 	vm.MaxSteps = 1_100_000_000
 	vm.TraceCalls = os.Getenv("LSW_TRACE_CALLS") == "1"
 	if v := os.Getenv("LSW_GUEST_PROF"); v != "" { // value = first step to sample from
@@ -119,7 +112,7 @@ func main() {
 		}
 	}
 	vm.NestDepth = -1 // WinMain is the top-level thread; keep depth 0 inside it so the scheduler may preempt
-	ret, err := vm.CallGuest(0x00209d10, 0x00001000, 0, w32.CmdLineAddr, 1)
+	ret, err := vm.CallGuest(entry, 0x00001000, 0, w32.CmdLineAddr, 1)
 	pprof.StopCPUProfile()
 	dumpGuestProfile(vm)
 	if err != nil {

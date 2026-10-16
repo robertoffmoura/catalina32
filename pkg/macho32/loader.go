@@ -12,8 +12,6 @@ const (
 	LcSymtab    = 0x2
 	LcUnixThread = 0x5
 	LcDysymtab  = 0xB
-
-	NuEngineSplitAddr = 0x002e3be0
 )
 
 type SegmentInfo struct {
@@ -57,7 +55,6 @@ type Image struct {
 	NlPtrByAddr  map[uint32]string
 	FDEs         map[uint32]uint32
 	ModInitFuncs []uint32
-	NuModInits   []uint32
 }
 
 func readCString(b []byte, off int) string {
@@ -256,9 +253,6 @@ func LoadImage(path string) (*Image, error) {
 				if off+4 <= len(data) {
 					fn := binary.LittleEndian.Uint32(data[off : off+4])
 					img.ModInitFuncs = append(img.ModInitFuncs, fn)
-					if fn > 0 && fn < NuEngineSplitAddr {
-						img.NuModInits = append(img.NuModInits, fn)
-					}
 				}
 			}
 		}

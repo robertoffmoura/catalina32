@@ -12,6 +12,7 @@ import (
 
 	"lsw64/pkg/cpu"
 	"lsw64/pkg/macho32"
+	"lsw64/pkg/profile"
 )
 
 const (
@@ -20,7 +21,7 @@ const (
 	NlTrampolineBase    = 0x0e000000
 )
 
-func RegisterCRT(c *CPUWrapper, img *macho32.Image) {
+func RegisterCRT(c *CPUWrapper, img *macho32.Image, prof *profile.Profile) {
 	// Set up ___stack_chk_guard -> 0x03000100 -> 0xDEADBEEF
 	c.Write32(StackGuardGuestAddr, 0xDEADBEEF)
 	for nlAddr, symName := range img.NlPtrByAddr {
@@ -43,14 +44,16 @@ func RegisterCRT(c *CPUWrapper, img *macho32.Image) {
 	}
 
 	// Register all external __symbol_stub entries
+	stubLo, stubHi := symbolStubRange(img)
 	for stubAddr, symName := range img.StubsByAddr {
-		// Check corresponding __la_symbol_ptr to see if it is already bound to an internal function (< 0x008d9f82)
-		idx := (stubAddr - 0x008d9f82) / 6
-		laAddr := 0x00b2c434 + idx*4
-		laVal := c.Read32(laAddr)
-		if laVal != 0 && laVal < 0x008d9f82 {
-			// Internal weak C++ template function already bound in binary!
-			continue
+		// An i386 stub is `jmp *[lazy_ptr]` (FF 25 disp32). If the lazy pointer already holds an
+		// address below the stub section, the symbol is a weak C++ template defined in this binary:
+		// leave the stub alone so it jumps to the real code.
+		if c.Read8(stubAddr) == 0xFF && c.Read8(stubAddr+1) == 0x25 {
+			laVal := c.Read32(c.Read32(stubAddr + 2))
+			if laVal != 0 && laVal < stubLo && stubLo < stubHi {
+				continue
+			}
 		}
 		if fn := lookupCRTThunk(symName); fn != nil {
 			c.RegisterIntercept(stubAddr, symName, fn)
@@ -69,13 +72,25 @@ func RegisterCRT(c *CPUWrapper, img *macho32.Image) {
 	}
 
 	// Native fast-paths for hot statically linked libogg / libvorbis bitstream & Huffman functions
-	c.RegisterIntercept(0x008be6c0, "oggpack_look", thunkOggpackLook)
-	c.RegisterIntercept(0x008be770, "oggpack_adv", thunkOggpackAdv)
-	c.RegisterIntercept(0x008be7a0, "oggpack_read", thunkOggpackRead)
-	c.RegisterIntercept(0x008c17a0, "decode_packed_entry_number", thunkVorbisDecodePackedEntryNumber)
-	c.RegisterIntercept(0x008c1ef0, "vorbis_book_decodev_set", thunkVorbisBookDecodevSet)
-	c.RegisterIntercept(0x008c1fe0, "vorbis_book_decodevv_add", thunkVorbisBookDecodevvAdd)
-	c.RegisterIntercept(mdctBackwardAddr, "mdct_backward", thunkMdctBackward)
+	prof.Bind(c, "ogg:oggpack_look", thunkOggpackLook)
+	prof.Bind(c, "ogg:oggpack_adv", thunkOggpackAdv)
+	prof.Bind(c, "ogg:oggpack_read", thunkOggpackRead)
+	prof.Bind(c, "vorbis:decode_packed_entry_number", thunkVorbisDecodePackedEntryNumber)
+	prof.Bind(c, "vorbis:vorbis_book_decodev_set", thunkVorbisBookDecodevSet)
+	prof.Bind(c, "vorbis:vorbis_book_decodevv_add", thunkVorbisBookDecodevvAdd)
+	if prof.Bind(c, "vorbis:mdct_backward", thunkMdctBackward) {
+		mdct.addr, _ = prof.Addr("vorbis:mdct_backward")
+	}
+}
+
+// symbolStubRange returns the address range of the S_SYMBOL_STUBS (__symbol_stub) section.
+func symbolStubRange(img *macho32.Image) (lo, hi uint32) {
+	for _, sec := range img.Sections {
+		if sec.Flags&0xFF == 0x8 {
+			return sec.Addr, sec.Addr + sec.Size
+		}
+	}
+	return 0, 0
 }
 
 type CPUWrapper = cpu.CPU
@@ -1178,13 +1193,13 @@ func vorbisDecodePackedEntryNumber(c *cpu.CPU, book uint32, b uint32) int32 {
 	return -1
 }
 
-// 0x008c17a0: decode_packed_entry_number (fastcall: ECX = book, EDX = b)
+// decode_packed_entry_number (fastcall: ECX = book, EDX = b)
 func thunkVorbisDecodePackedEntryNumber(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = uint32(vorbisDecodePackedEntryNumber(c, c.Regs[cpu.RegECX], c.Regs[cpu.RegEDX]))
 	c.Ret()
 }
 
-// 0x008c1ef0: vorbis_book_decodev_set(codebook *book, float *a, oggpack_buffer *b, int n)
+// vorbis_book_decodev_set(codebook *book, float *a, oggpack_buffer *b, int n)
 func thunkVorbisBookDecodevSet(c *cpu.CPU) {
 	book := c.Arg(0)
 	a := c.Arg(1)
@@ -1213,7 +1228,7 @@ func thunkVorbisBookDecodevSet(c *cpu.CPU) {
 	c.Ret()
 }
 
-// 0x008c1fe0: vorbis_book_decodevv_add(codebook *book, float **a, long offset, int ch, oggpack_buffer *b, int n)
+// vorbis_book_decodevv_add(codebook *book, float **a, long offset, int ch, oggpack_buffer *b, int n)
 func thunkVorbisBookDecodevvAdd(c *cpu.CPU) {
 	book := c.Arg(0)
 	a := c.Arg(1)

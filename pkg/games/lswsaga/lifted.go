@@ -1,4 +1,4 @@
-package lifted
+package lswsaga
 
 import (
 	"encoding/binary"
@@ -7,10 +7,10 @@ import (
 	"lsw64/pkg/cpu"
 )
 
-// RegisterLiftedFunctions registers statically lifted 64-bit Go translations of
-// hot NuEngine and IndirectX inner-loop functions (LZHUF archive decompression,
-// xxHash32 string hashing, SSE matrix math, and buffer copy/search routines).
-func RegisterLiftedFunctions(c *cpu.CPU) {
+// registerLifted registers statically lifted 64-bit Go translations of hot NuEngine inner-loop
+// functions in this binary (LZHUF archive decompression, string helpers, SSE matrix math, and
+// buffer copy/search routines).
+func registerLifted(c *cpu.CPU) {
 	c.RegisterIntercept(0x0027ce00, "lifted::NuLZHUF_DecodeC_0027ce00", liftedNuLZHUFDecodeC)
 	c.RegisterIntercept(0x0027d9d0, "lifted::NuLZHUF_DecodeP_0027d9d0", liftedNuLZHUFDecodeP)
 	c.RegisterIntercept(0x00270500, "lifted::NuStrLen_00270500", liftedNuStrLen)
@@ -30,7 +30,6 @@ func RegisterLiftedFunctions(c *cpu.CPU) {
 	c.RegisterIntercept(0x0002cb10, "lifted::NuFindSpecialObject_0002cb10", liftedNuFindSpecialObject)
 	c.RegisterIntercept(0x001052a0, "lifted::NuMtxMul_001052a0", liftedNuMtxMul)
 	c.RegisterIntercept(0x002e2dc0, "lifted::NuBufReadF32_002e2dc0", liftedNuBufReadF32)
-	c.RegisterIntercept(0x0068f570, "lifted::D3DXMatrixMultiply_0068f570", liftedD3DXMatrixMultiply)
 	c.RegisterIntercept(0x0006e050, "lifted::NuInitMtlItem_0006e050", liftedNuInitMtlItem)
 	c.RegisterIntercept(0x0006e090, "lifted::NuNoOp_0006e090", liftedNuNoOp)
 	c.RegisterIntercept(0x0006e0a0, "lifted::NuNoOp_0006e0a0", liftedNuNoOp)
@@ -932,31 +931,6 @@ func liftedNuLZHUFDecodeP(c *cpu.CPU) {
 	}
 
 	c.Regs[cpu.RegEAX] = dist
-	c.Ret()
-}
-
-// Statically lifted 64-bit translation of D3DXMatrixMultiply (0x0068f570)
-func liftedD3DXMatrixMultiply(c *cpu.CPU) {
-	pOut := c.Arg(0)
-	pM1 := c.Arg(1)
-	pM2 := c.Arg(2)
-	var a, b, out [16]float32
-	for i := 0; i < 16; i++ {
-		a[i] = c.ReadF32(pM1 + uint32(i*4))
-		b[i] = c.ReadF32(pM2 + uint32(i*4))
-	}
-	for r := 0; r < 4; r++ {
-		for col := 0; col < 4; col++ {
-			out[r*4+col] = a[r*4+0]*b[0*4+col] +
-				a[r*4+1]*b[1*4+col] +
-				a[r*4+2]*b[2*4+col] +
-				a[r*4+3]*b[3*4+col]
-		}
-	}
-	for i := 0; i < 16; i++ {
-		c.WriteF32(pOut+uint32(i*4), out[i])
-	}
-	c.Regs[cpu.RegEAX] = pOut
 	c.Ret()
 }
 

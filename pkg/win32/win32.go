@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"lsw64/pkg/cpu"
+	"lsw64/pkg/profile"
 )
 
 const (
@@ -37,6 +38,7 @@ type Win32Env struct {
 	PerfCounter     uint64
 	TraceLog        bool
 	LiveClock       bool
+	prof            *profile.Profile
 	sched           *scheduler
 	WndProc         uint32
 	peekCount       uint64
@@ -127,14 +129,12 @@ func (env *Win32Env) ResolvePath(guestPath string, forWrite bool) string {
 	return filepath.Join(env.DataRoot, clean)
 }
 
-func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, boundaryAddrs []uint32) {
+// RegisterBoundaryThunks binds the MacDoze (Win32) shims to the functions the game profile names,
+// and turns the profile's unmapped platform boundary functions into logged "return 1" stubs.
+func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, prof *profile.Profile) {
+	env.prof = prof
 	env.initScheduler(c)
-	// Register default boundary tracer for boundary functions >= 0x00500000 first
-	// (pure Feral C++/NString helpers in 0x00390000..0x00420000 execute natively on our i386 CPU)
-	for _, addr := range boundaryAddrs {
-		if addr < 0x00500000 {
-			continue
-		}
+	for _, addr := range prof.UnmappedStubs {
 		fnAddr := addr
 		c.RegisterIntercept(fnAddr, fmt.Sprintf("boundary_0x%08x", fnAddr), func(vm *cpu.CPU) {
 			vm.UnmappedCalls[fnAddr]++
@@ -153,98 +153,104 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, boundaryAddrs []uint32) 
 
 	// Register concrete MacDoze Win32 API implementations
 	// Critical Sections & Synchronization
-	c.RegisterIntercept(0x006411d0, "InitializeCriticalSection", env.thunkInitializeCriticalSection)
-	c.RegisterIntercept(0x006412d0, "EnterCriticalSection", env.thunkEnterCriticalSection)
-	c.RegisterIntercept(0x00641340, "LeaveCriticalSection", env.thunkLeaveCriticalSection)
-	c.RegisterIntercept(0x00623f40, "CreateEventA", env.thunkCreateEventA)
-	c.RegisterIntercept(0x00623fb0, "SetEvent", env.thunkSetEvent)
-	c.RegisterIntercept(0x00623b90, "WaitForSingleObject", env.thunkWaitForSingleObject)
-	c.RegisterIntercept(0x00623c30, "ResetEvent", env.thunkResetEvent)
-	c.RegisterIntercept(0x00620660, "CloseHandle", env.thunkCloseHandle)
-	c.RegisterIntercept(0x00623ac0, "CreateThread_2", env.thunkCreateThread)
-	c.RegisterIntercept(0x00623b70, "ResumeThread_2", env.thunkResumeThread)
-	c.RegisterIntercept(0x00623c60, "Sleep", env.thunkSleep)
-	c.RegisterIntercept(0x00623d80, "GetCurrentThread", env.thunkGetCurrentThread)
-	c.RegisterIntercept(0x00623d90, "GetCurrentThread_2", env.thunkGetCurrentThread)
-	c.RegisterIntercept(0x00623d60, "SetThreadPriority", env.thunkSetThreadPriority)
-	c.RegisterIntercept(0x00623d70, "GetCurrentThreadId", env.thunkGetCurrentThreadId)
-	c.RegisterIntercept(0x00623cc0, "SetThreadIdealProcessor", env.thunkReturnOne)
+	prof.Bind(c, "InitializeCriticalSection", env.thunkInitializeCriticalSection)
+	prof.Bind(c, "EnterCriticalSection", env.thunkEnterCriticalSection)
+	prof.Bind(c, "LeaveCriticalSection", env.thunkLeaveCriticalSection)
+	prof.Bind(c, "CreateEventA", env.thunkCreateEventA)
+	prof.Bind(c, "SetEvent", env.thunkSetEvent)
+	prof.Bind(c, "WaitForSingleObject", env.thunkWaitForSingleObject)
+	prof.Bind(c, "ResetEvent", env.thunkResetEvent)
+	prof.Bind(c, "CloseHandle", env.thunkCloseHandle)
+	prof.Bind(c, "CreateThread_2", env.thunkCreateThread)
+	prof.Bind(c, "ResumeThread_2", env.thunkResumeThread)
+	prof.Bind(c, "Sleep", env.thunkSleep)
+	prof.Bind(c, "GetCurrentThread", env.thunkGetCurrentThread)
+	prof.Bind(c, "GetCurrentThread_2", env.thunkGetCurrentThread)
+	prof.Bind(c, "SetThreadPriority", env.thunkSetThreadPriority)
+	prof.Bind(c, "GetCurrentThreadId", env.thunkGetCurrentThreadId)
+	prof.Bind(c, "SetThreadIdealProcessor", env.thunkReturnOne)
 
 	// System / Process / Startup
-	c.RegisterIntercept(0x00620db0, "SystemParametersInfoA", env.thunkSystemParametersInfoA)
-	c.RegisterIntercept(0x00620f90, "SetErrorMode", env.thunkSetErrorMode)
-	c.RegisterIntercept(0x0061f990, "CoInitializeEx", env.thunkCoInitializeEx)
-	c.RegisterIntercept(0x0061f9a0, "CoUninitialize", env.thunkReturnZero)
-	c.RegisterIntercept(0x0060d6f0, "GetModuleHandleA", env.thunkGetModuleHandleA)
-	c.RegisterIntercept(0x0060d600, "GetModuleFileNameA", env.thunkGetModuleFileNameA)
-	c.RegisterIntercept(0x006428a0, "GetCommandLineA", env.thunkGetCommandLineA)
-	c.RegisterIntercept(0x00624cb0, "SetLastError", env.thunkSetLastError)
-	c.RegisterIntercept(0x00624cd0, "GetLastError", env.thunkGetLastError)
-	c.RegisterIntercept(0x00620da0, "NoOp_620da0", env.thunkReturnZero)
-	c.RegisterIntercept(0x00620810, "IsDebuggerPresent_OrOne", env.thunkReturnOne)
+	prof.Bind(c, "SystemParametersInfoA", env.thunkSystemParametersInfoA)
+	prof.Bind(c, "SetErrorMode", env.thunkSetErrorMode)
+	prof.Bind(c, "CoInitializeEx", env.thunkCoInitializeEx)
+	prof.Bind(c, "CoUninitialize", env.thunkReturnZero)
+	prof.Bind(c, "GetModuleHandleA", env.thunkGetModuleHandleA)
+	prof.Bind(c, "GetModuleFileNameA", env.thunkGetModuleFileNameA)
+	prof.Bind(c, "GetCommandLineA", env.thunkGetCommandLineA)
+	prof.Bind(c, "SetLastError", env.thunkSetLastError)
+	prof.Bind(c, "GetLastError", env.thunkGetLastError)
+	prof.Bind(c, "IsDebuggerPresent_OrOne", env.thunkReturnOne)
 
 	// High-Resolution & Multimedia Timers
-	c.RegisterIntercept(0x00624700, "QueryPerformanceFrequency", env.thunkQueryPerformanceFrequency)
-	c.RegisterIntercept(0x00624720, "QueryPerformanceCounter", env.thunkQueryPerformanceCounter)
-	c.RegisterIntercept(0x006242d0, "timeGetTime_OrDouble", env.thunkTimeGetTime)
-	c.RegisterIntercept(0x00624290, "GetTickCount", env.thunkTimeGetTime)
-	c.RegisterIntercept(0x00624310, "timeSetEvent", env.thunkTimeSetEvent)
-	c.RegisterIntercept(0x006245f0, "timeKillEvent", env.thunkTimeKillEvent)
+	prof.Bind(c, "QueryPerformanceFrequency", env.thunkQueryPerformanceFrequency)
+	prof.Bind(c, "QueryPerformanceCounter", env.thunkQueryPerformanceCounter)
+	prof.Bind(c, "timeGetTime_OrDouble", env.thunkTimeGetTime)
+	prof.Bind(c, "GetTickCount", env.thunkTimeGetTime)
+	prof.Bind(c, "timeSetEvent", env.thunkTimeSetEvent)
+	prof.Bind(c, "timeKillEvent", env.thunkTimeKillEvent)
 
 	// Win32 File I/O (CreateFileA, ReadFile, WriteFile, SetFilePointerEx, GetFileSize, etc.)
-	c.RegisterIntercept(0x0060a600, "CreateFileA", env.thunkCreateFileA)
-	c.RegisterIntercept(0x0060ae10, "ReadFile", env.thunkReadFile)
-	c.RegisterIntercept(0x0060b2d0, "WriteFile", env.thunkWriteFile)
-	c.RegisterIntercept(0x0060b8e0, "SetFilePointerEx", env.thunkSetFilePointerEx)
-	c.RegisterIntercept(0x0060b8a0, "GetFileSize", env.thunkGetFileSize)
-	c.RegisterIntercept(0x0060b790, "CreateDirectoryA", env.thunkCreateDirectoryA)
-	c.RegisterIntercept(0x0060bb30, "GetFileAttributesA", env.thunkGetFileAttributesA)
-	c.RegisterIntercept(0x0060bd50, "GetDiskFreeSpaceExA", env.thunkGetDiskFreeSpaceExA)
-	c.RegisterIntercept(0x0060f610, "SHGetFolderPathA", env.thunkSHGetFolderPathA)
-	c.RegisterIntercept(0x0060f850, "ShowCursor", env.thunkReturnOne)
+	prof.Bind(c, "CreateFileA", env.thunkCreateFileA)
+	prof.Bind(c, "ReadFile", env.thunkReadFile)
+	prof.Bind(c, "WriteFile", env.thunkWriteFile)
+	prof.Bind(c, "SetFilePointerEx", env.thunkSetFilePointerEx)
+	prof.Bind(c, "GetFileSize", env.thunkGetFileSize)
+	prof.Bind(c, "CreateDirectoryA", env.thunkCreateDirectoryA)
+	prof.Bind(c, "GetFileAttributesA", env.thunkGetFileAttributesA)
+	prof.Bind(c, "GetDiskFreeSpaceExA", env.thunkGetDiskFreeSpaceExA)
+	prof.Bind(c, "SHGetFolderPathA", env.thunkSHGetFolderPathA)
+	prof.Bind(c, "ShowCursor", env.thunkReturnOne)
 
 	// MacdozeFile (stdio wrappers)
-	c.RegisterIntercept(0x00612ce0, "MacdozeFile::fopen", env.thunkFopen)
-	c.RegisterIntercept(0x006137e0, "MacdozeFile::fread", env.thunkFread)
-	c.RegisterIntercept(0x00613a90, "MacdozeFile::fwrite", env.thunkFwrite)
-	c.RegisterIntercept(0x00613b60, "MacdozeFile::fseek", env.thunkFseek)
-	c.RegisterIntercept(0x00613c10, "MacdozeFile::ftell", env.thunkFtell)
-	c.RegisterIntercept(0x00613420, "MacdozeFile::fclose", env.thunkFclose)
-	c.RegisterIntercept(0x006139e0, "MacdozeFile::fputc", env.thunkFputc)
-	c.RegisterIntercept(0x006137d0, "MacdozeFile::fflush", env.thunkReturnZero)
-	c.RegisterIntercept(0x00613c60, "MacdozeFile::fprintf", env.thunkReturnZero)
+	prof.Bind(c, "MacdozeFile::fopen", env.thunkFopen)
+	prof.Bind(c, "MacdozeFile::fread", env.thunkFread)
+	prof.Bind(c, "MacdozeFile::fwrite", env.thunkFwrite)
+	prof.Bind(c, "MacdozeFile::fseek", env.thunkFseek)
+	prof.Bind(c, "MacdozeFile::ftell", env.thunkFtell)
+	prof.Bind(c, "MacdozeFile::fclose", env.thunkFclose)
+	prof.Bind(c, "MacdozeFile::fputc", env.thunkFputc)
+	prof.Bind(c, "MacdozeFile::fflush", env.thunkReturnZero)
+	prof.Bind(c, "MacdozeFile::fprintf", env.thunkReturnZero)
 
 	// Registry & Window Message Pump
-	c.RegisterIntercept(0x00610fe0, "RegOpenKeyExA", env.thunkRegOpenKeyExA)
-	c.RegisterIntercept(0x006110b0, "RegQueryValueExA", env.thunkRegQueryValueExA)
-	c.RegisterIntercept(0x006108d0, "RegCloseKey", env.thunkReturnZero)
-	c.RegisterIntercept(0x00611340, "MacdozeReg::ReadDword", env.thunkRegReadDword)
-	c.RegisterIntercept(0x006114b0, "MacdozeReg::WriteDword", env.thunkReturnOne)
-	c.RegisterIntercept(0x00612290, "MacdozeReg::Flush", env.thunkReturnOne)
-	c.RegisterIntercept(0x00610690, "MacdozeReg::ValueExists", env.thunkReturnZero)
-	c.RegisterIntercept(0x0016fc60, "FeralRegReadDwordIfPresent", env.thunkReturnZero)
-	c.RegisterIntercept(0x0016fd10, "FeralRegReadBoolIfPresent", env.thunkReturnZero)
-	c.RegisterIntercept(0x006353a0, "SendMessageA", env.thunkReturnOne)
-	c.RegisterIntercept(0x00635570, "PeekMessageA", env.thunkPeekMessageA)
-	c.RegisterIntercept(0x00635f90, "TranslateMessage", env.thunkReturnZero)
-	c.RegisterIntercept(0x006367f0, "DispatchMessageA", env.thunkReturnZero)
-	c.RegisterIntercept(0x00619c00, "MacDoze::SetFocus", env.thunkReturnOne)
-	c.RegisterIntercept(0x00832350, "FeralApp::GetInstance", env.thunkReturnOne)
-	c.RegisterIntercept(0x0082cdf0, "FeralApp::NotifyState", env.thunkReturnOne)
-	c.RegisterIntercept(0x0061aa90, "LoadIconA", env.thunkReturnOne)
-	c.RegisterIntercept(0x00619a80, "LoadCursorA", env.thunkReturnOne)
-	c.RegisterIntercept(0x0063e590, "RegisterClassExA", env.thunkRegisterClassExA)
-	c.RegisterIntercept(0x0063e8c0, "CreateWindowExA", env.thunkReturnOne)
-	c.RegisterIntercept(0x0063ea60, "ShowWindow", env.thunkShowWindow)
-	c.RegisterIntercept(0x0063eb40, "UpdateWindow", env.thunkReturnOne)
-	c.RegisterIntercept(0x006bd5b0, "IndirectX::SetCurrentShaderHint", env.thunkReturnZero)
+	prof.Bind(c, "RegOpenKeyExA", env.thunkRegOpenKeyExA)
+	prof.Bind(c, "RegQueryValueExA", env.thunkRegQueryValueExA)
+	prof.Bind(c, "RegCloseKey", env.thunkReturnZero)
+	prof.Bind(c, "MacdozeReg::ReadDword", env.thunkRegReadDword)
+	prof.Bind(c, "MacdozeReg::WriteDword", env.thunkReturnOne)
+	prof.Bind(c, "MacdozeReg::Flush", env.thunkReturnOne)
+	prof.Bind(c, "MacdozeReg::ValueExists", env.thunkReturnZero)
+	prof.Bind(c, "FeralRegReadDwordIfPresent", env.thunkReturnZero)
+	prof.Bind(c, "FeralRegReadBoolIfPresent", env.thunkReturnZero)
+	prof.Bind(c, "SendMessageA", env.thunkReturnOne)
+	prof.Bind(c, "PeekMessageA", env.thunkPeekMessageA)
+	prof.Bind(c, "TranslateMessage", env.thunkReturnZero)
+	prof.Bind(c, "DispatchMessageA", env.thunkReturnZero)
+	prof.Bind(c, "MacDoze::SetFocus", env.thunkReturnOne)
+	prof.Bind(c, "FeralApp::GetInstance", env.thunkReturnOne)
+	prof.Bind(c, "FeralApp::NotifyState", env.thunkReturnOne)
+	prof.Bind(c, "LoadIconA", env.thunkReturnOne)
+	prof.Bind(c, "LoadCursorA", env.thunkReturnOne)
+	prof.Bind(c, "RegisterClassExA", env.thunkRegisterClassExA)
+	prof.Bind(c, "CreateWindowExA", env.thunkReturnOne)
+	prof.Bind(c, "ShowWindow", env.thunkShowWindow)
+	prof.Bind(c, "UpdateWindow", env.thunkReturnOne)
+	prof.Bind(c, "IndirectX::SetCurrentShaderHint", env.thunkReturnZero)
 }
 
 func (env *Win32Env) thunkShowWindow(c *cpu.CPU) {
-	// Emulate WndProc WM_ACTIVATE (wParam=1) and WM_SIZE (1280x720)
-	c.Write32(0x00b67c20, 1)
-	c.Write32(0x00b67c38, 1280)
-	c.Write32(0x00b67c3c, 720)
+	// Emulate the window state WndProc would record for WM_ACTIVATE (wParam=1) and WM_SIZE (1280x720).
+	// TODO: deliver real WM_ACTIVATE/WM_SIZE messages to the registered WndProc instead.
+	if a := env.prof.Global("MacDoze.WindowActive"); a != 0 {
+		c.Write32(a, 1)
+	}
+	if a := env.prof.Global("MacDoze.WindowWidth"); a != 0 {
+		c.Write32(a, 1280)
+	}
+	if a := env.prof.Global("MacDoze.WindowHeight"); a != 0 {
+		c.Write32(a, 720)
+	}
 	c.Regs[cpu.RegEAX] = 1
 	c.Ret()
 }
@@ -343,7 +349,9 @@ func (env *Win32Env) thunkGetCommandLineA(c *cpu.CPU) {
 
 func (env *Win32Env) thunkSetLastError(c *cpu.CPU) {
 	env.LastError = c.Arg(0)
-	c.Write32(0x00b9fdac, env.LastError)
+	if a := env.prof.Global("MacDoze.LastError"); a != 0 {
+		c.Write32(a, env.LastError)
+	}
 	c.Ret()
 }
 

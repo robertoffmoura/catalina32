@@ -30,13 +30,16 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
 
 ## Layout
 - `cmd/lsw64` — main: loads image, registers shims, runs WinMain. `LSW_WATCH_KEYS=1` enables a debug memory watch.
-- `cmd/lift` — **disassembler/lifter; prints to stdout only (does not modify pkg/lifted)**. `go run ./cmd/lift -start=0x... -end=0x...`
+- `cmd/lift` — **disassembler/lifter; prints to stdout only (does not modify any package)**. `go run ./cmd/lift -start=0x... -end=0x...`
   VAs are the Mach-O VAs (e.g. WinMain 0x00209d10). Linear sweep: start at a function boundary or output desyncs.
 - `pkg/cpu` — x86 interpreter (`exec.go`), FPU/SSE, `Intercepts` (host thunks keyed by guest address), `context.go` (thread context).
 - `pkg/win32` — MacDoze/Win32 shims. `threads.go` = green-thread scheduler. `win32.go` = files, registry, timers, window class, input injection.
 - `pkg/d3d9` — IndirectX/D3D9 + DirectInput/DirectSound/XInput shims, software rasterizer (`raster.go`) writing `frames/frame_NNNN.png` and `frames/cantina_latest.png`.
-- `pkg/lifted` — generated Go for some hot NuEngine functions.  `pkg/crt` — libc shims.  `pkg/macho32` — loader.
-- Outside repo: `/workspace/run_on_mac.sh`, `/workspace/lego_star_wars_193_boundary_catalog.json`, `/workspace/macho32_host_loader.cpp`.
+- `pkg/profile` — **Layer 3 interface**: `Profile` maps well-known names (`CreateFileA`, `Direct3DCreate9`, `WinMain`, ...) and globals (`MacDoze.LastError`, ...) to addresses; `Bind(c, name, fn)` is how generic layers attach shims. `signatures.go` finds statically linked libraries (libogg/libvorbis) by byte signature, so a game with the same library build needs no addresses for them. `Report()` (printed at startup) lists what resolved by signature and what is unresolved.
+- `pkg/games` — registry; picks the game by executable SHA-256 (or `LSW_PROFILE=<id>`). `pkg/games/lswsaga` — this game: `profile.go` (address table, globals, mod-init limit, unmapped boundary stubs from the former boundary catalog), `engine.go` (NuEngine hooks, NuTexRead patch), `lifted.go` (lifted hot NuEngine functions).
+- `pkg/crt` — libc shims + native libvorbis fast paths (bound by signature).  `pkg/macho32` — loader (no game constants).
+- Outside repo: `/workspace/run_on_mac.sh`, `/workspace/macho32_host_loader.cpp`. (`/workspace/lego_star_wars_193_boundary_catalog.json` is no longer read; its stub list is embedded in `pkg/games/lswsaga/profile.go`.)
+- **Adding a game**: create `pkg/games/<id>` with a `Profile` (SHA256, Symbols for the MacDoze/IndirectX functions, Globals, EntryPoint) and an `Install` for engine hooks; add it to `games.All`. Run once and read the `profile ... unresolved: [...]` line.
 
 ## Run
 - On macOS (isolated in `/tmp/lsw64-mac-preview` on port `8088`):
@@ -91,7 +94,8 @@ To ensure this runtime can be open-sourced on GitHub as a general runner for 32-
 1. **Strict 3-Layer Separation**:
    - **Layer 1 (`pkg/macho32`, `pkg/cpu`, `pkg/crt`)**: Pure 32-bit `i386` Mach-O loader, CPU/FPU/SSE2 emulator, and `libSystem.B.dylib` (`libc`/`libm`/`pthread`) shims — zero game-specific or Win32-specific assumptions.
    - **Layer 2 (`pkg/win32`, `pkg/d3d9`)**: Generic Feral `MacDoze` (Win32 Kernel32/User32/Advapi32, cooperative green threads, VFS) and `IndirectX` (`IDirect3D9`, `IDirect3DDevice9`, `D3DX9`, `IDirectInput8A`, `IDirectSound8`, `Bink`) COM interfaces.
-   - **Layer 3 (Per-Binary / Engine Profile)**: All binary-specific addresses (`WinMain`, `NuEngineSplitAddr`, boundary function catalog, and optional lifted hot functions in `pkg/lifted`) should be driven by a binary profile or symbol/signature scanner rather than scattered across `pkg/cpu` or `pkg/win32`.
+   - **Layer 3 (Per-Binary / Engine Profile)**: DONE for addresses — everything binary-specific lives in `pkg/games/<game>` behind `pkg/profile`; `pkg/cpu`, `pkg/crt`, `pkg/win32`, `pkg/d3d9`, `pkg/macho32` contain no game addresses.
+   - **Still game-specific logic inside `pkg/d3d9` (not addresses)**: (a) rendering heuristics that stand in for real shader execution — `is2D` by vertex stride 20/24, `isGlyphQuad` colour `0x4BD5EE`, post-process grid skip (`numV==25 && prims==44 && stride==28`), warm-sand fallback for white c112, title/Cantina detection via `CubeTexCount`/`CantinaDIPLogged`, and the c0..c3/c16..c19 VS constant layout assumption in `transformVertex`; (b) the scripted `LSW_AUTO_KEYS` test inputs (`boot`, `episode1`, `outside`). Plan: (a) goes away by interpreting the game's real vs_3_0/ps_3_0 shaders; (b) should move to a per-game test-script hook.
 2. **Prefer Standard D3D9 / DirectSound8 / Win32 Interfaces Over Internal Engine Hooks**:
    - Whenever implementing a missing feature (audio, shaders, input, rendering), implement the standard `IDirect3DDevice9` / `IDirectSoundBuffer8` / `D3DXCompileShader` / `ID3DXConstantTable` interface rather than adding new hardcoded NuEngine internal address hooks.
 
@@ -103,6 +107,7 @@ To ensure this runtime can be open-sourced on GitHub as a general runner for 32-
    - Parallelize scanline band rasterization across host CPU cores (and/or offload triangles to Metal/OpenGL in `LSWWindow`) and support general `D3DXCompileShader` constant tables (`ID3DXConstantTable`).
 
 ## Session log (latest first)
+- **Generalisation refactor (Layer 3 profiles)**: added `pkg/profile` + `pkg/games/lswsaga`; 98 hardcoded `RegisterIntercept(0x...)` calls in win32/d3d9/crt became `prof.Bind(c, "Name", fn)`; NuEngine hooks + NuTexRead patch moved out of `pkg/d3d9`; `pkg/lifted` moved to `pkg/games/lswsaga/lifted.go`; `D3DXMatrixMultiply` is now a standard D3DX shim in `pkg/d3d9/d3dx_math.go`; crt finds each stub's lazy pointer from the stub's own `jmp *[ptr]` bytes instead of hardcoded section addresses; libogg/libvorbis fast paths are located by byte signature (all 7 found at the known addresses); `NuEngineSplitAddr` became `Profile.ModInitLimit`; WinMain comes from `Profile.EntryPoint`. Frame/step trace identical to before.
 - **Parallel band rasterizer, vertex cache, guest profiler**:
   - `rasterizeScreenTriangle` now queues `queuedTri`s into `s.frameTris`; `Present()` calls `flushFrameTriangles()`, which rasterizes 8 horizontal 90px bands on parallel goroutines (bands own disjoint framebuffer/Z rows, so no locks). Safe because `Clear` only acts when `FrameDrawCalls == 0` (no mid-frame clears); the queue is reset on clears and on the first-Cantina-DIP clear.
   - Additive blending (`ALPHABLENDENABLE` + `DESTBLEND == D3DBLEND_ONE`) no longer writes Z; Cantina band stage lights now glow instead of drawing black quads.

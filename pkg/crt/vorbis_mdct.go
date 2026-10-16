@@ -15,8 +15,8 @@ import (
 // Guest layout (statically linked libvorbis, i386):
 //   mdct_lookup { int n; int log2n; float *trig; int *bitrev; float scale; }
 //   void mdct_backward(mdct_lookup *init, float *in, float *out)   // cdecl, called with in == out
-
-const mdctBackwardAddr = 0x008c84c0
+//
+// The function is located by the "vorbis:mdct_backward" signature (pkg/profile).
 
 const (
 	cPI3_8 = float32(.38268343236508977175)
@@ -34,6 +34,7 @@ type mdctTables struct {
 
 type mdctState struct {
 	tables map[uint32]*mdctTables
+	addr   uint32
 	buf    []float32
 	verify bool
 
@@ -93,9 +94,9 @@ func thunkMdctBackward(c *cpu.CPU) {
 
 	if mdct.verify {
 		// Run the original x86 code on the same input and compare.
-		c.SetInterceptEnabled(mdctBackwardAddr, false)
-		_, err := c.CallGuestNested(mdctBackwardAddr, init, in, out)
-		c.SetInterceptEnabled(mdctBackwardAddr, true)
+		c.SetInterceptEnabled(mdct.addr, false)
+		_, err := c.CallGuestNested(mdct.addr, init, in, out)
+		c.SetInterceptEnabled(mdct.addr, true)
 		mdctBackward(t, src, dst)
 		ref := make([]float32, n)
 		guestF32s(c, out, ref)
