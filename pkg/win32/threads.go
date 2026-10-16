@@ -96,9 +96,9 @@ func (env *Win32Env) switchTo(c *cpu.CPU, next *guestThread) {
 	s.cur = next
 	env.CurrentThreadId = next.handle
 	if next == s.threads[0] {
-		c.PreemptInterval = preemptIntervalSt
+		c.SetPreemptInterval(preemptIntervalSt)
 	} else {
-		c.PreemptInterval = 100000
+		c.SetPreemptInterval(400000)
 	}
 }
 

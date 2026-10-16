@@ -105,6 +105,11 @@ type CPU struct {
 	WatchFn          func(c *CPU, addr uint32, size int, write bool)
 }
 
+func (c *CPU) SetPreemptInterval(interval uint64) {
+	c.PreemptInterval = interval
+	c.nextPreempt = c.Steps + interval
+}
+
 func NewCPU() *CPU {
 	c := &CPU{
 		Mem:           make([]byte, ArenaSize),

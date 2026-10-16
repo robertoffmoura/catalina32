@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	ScreenWidth  = 1280
-	ScreenHeight = 720
+	ScreenWidth   = 1280
+	ScreenHeight  = 720
+	ShmHeaderSize = 288
+	ShmTotalSize  = ShmHeaderSize + ScreenWidth*ScreenHeight*4
 )
 
 type screenVertex struct {
@@ -44,7 +46,7 @@ var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
 func (s *Subsystem) wantRender(frame uint64) bool {
 	if s.CantinaDIPLogged > 0 || (liveMode && s.TitleFirstFrame > 0) {
 		if liveMode {
-			return frame%2 == 0 || frame%uint64(renderEvery) == 0
+			return frame%3 == 0 || frame%uint64(renderEvery) == 0
 		}
 		return frame%5 == 0 || frame%uint64(renderEvery) == 0
 	}
@@ -54,10 +56,27 @@ func (s *Subsystem) wantRender(frame uint64) bool {
 func (s *Subsystem) initRasterizer(framesDir string) {
 	s.rendering = true
 	s.Framebuffer = image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	s.LatestRGBA = make([]byte, ScreenWidth*ScreenHeight*4)
 	s.ZBuffer = make([]float32, ScreenWidth*ScreenHeight)
 	s.FramesDir = framesDir
 	if s.FramesDir != "" {
 		_ = os.MkdirAll(s.FramesDir, 0755)
+	}
+	if shmPath := os.Getenv("LSW_SHM_FILE"); shmPath != "" {
+		if f, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE, 0666); err == nil {
+			_ = f.Truncate(ShmTotalSize)
+			var modeByte [1]byte
+			switch s.AutoKeysMode {
+			case "off":
+				modeByte[0] = 1
+			case "boot":
+				modeByte[0] = 2
+			case "loop":
+				modeByte[0] = 3
+			}
+			_, _ = f.WriteAt(modeByte[:], 32)
+			s.ShmFile = f
+		}
 	}
 	s.clearFramebuffer(0xFF000000)
 	s.clearZBuffer(1.0)
@@ -352,7 +371,7 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		u = c.ReadF32(vp + 16)
 		v = c.ReadF32(vp + 20)
 	} else if stride >= 20 && vp+stride <= uint32(len(c.Mem)) {
-		vd := s.VertexDecls[s.CurrentVertexDecl]
+		vd := s.CurrentVD
 		if vd != nil && !isUP && vd.HasTex0 {
 			if vd.Tex0Type == 3 && uint32(vd.Tex0Offset)+16 <= stride {
 				// D3DDECLTYPE_FLOAT4: .xy is normal/surface UV, .zw is layer0 diffuse/atlas UV
@@ -520,14 +539,36 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	return screenVertex{sx: sx, sy: sy, sz: 0.5, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
 }
 
-func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
+func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes *BufferDesc) {
 	if !v0.valid || !v1.valid || !v2.valid {
 		return
 	}
-	minX := int(math.Floor(math.Min(float64(v0.sx), math.Min(float64(v1.sx), float64(v2.sx)))))
-	maxX := int(math.Ceil(math.Max(float64(v0.sx), math.Max(float64(v1.sx), float64(v2.sx)))))
-	minY := int(math.Floor(math.Min(float64(v0.sy), math.Min(float64(v1.sy), float64(v2.sy)))))
-	maxY := int(math.Ceil(math.Max(float64(v0.sy), math.Max(float64(v1.sy), float64(v2.sy)))))
+	minXf, maxXf := v0.sx, v0.sx
+	if v1.sx < minXf {
+		minXf = v1.sx
+	} else if v1.sx > maxXf {
+		maxXf = v1.sx
+	}
+	if v2.sx < minXf {
+		minXf = v2.sx
+	} else if v2.sx > maxXf {
+		maxXf = v2.sx
+	}
+	minYf, maxYf := v0.sy, v0.sy
+	if v1.sy < minYf {
+		minYf = v1.sy
+	} else if v1.sy > maxYf {
+		maxYf = v1.sy
+	}
+	if v2.sy < minYf {
+		minYf = v2.sy
+	} else if v2.sy > maxYf {
+		maxYf = v2.sy
+	}
+	minX := int(math.Floor(float64(minXf)))
+	maxX := int(math.Ceil(float64(maxXf)))
+	minY := int(math.Floor(float64(minYf)))
+	maxY := int(math.Ceil(float64(maxYf)))
 
 	if maxX < 0 || minX >= ScreenWidth || maxY < 0 || minY >= ScreenHeight {
 		return
@@ -549,10 +590,6 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 		maxY = ScreenHeight - 1
 	}
 
-	var texRes *BufferDesc
-	if s.BoundTextures[0] != 0 {
-		texRes = s.ensureTextureDecoded(c, s.BoundTextures[0])
-	}
 	hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
 
 	// Skip fullscreen post-process / fade / pillarbox quads so they don't overwrite the software framebuffer
@@ -561,96 +598,134 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 	}
 
 	area := (v1.sx-v0.sx)*(v2.sy-v0.sy) - (v1.sy-v0.sy)*(v2.sx-v0.sx)
-	if math.Abs(float64(area)) < 0.001 {
+	if area > -0.001 && area < 0.001 {
 		return
 	}
 	invArea := 1.0 / area
+	dw0dx := (v1.sy - v2.sy) * invArea
+	dw1dx := (v2.sy - v0.sy) * invArea
+
 	isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (maxY-minY) <= 64
 	alphaEnabled := s.RenderStates[27] != 0 || s.RenderStates[15] != 0
+	sampleTex := hasTex && v0.u > -900.0
+
+	var texW, texH, wMask, hMask uint32
+	var texWf, texHf float32
+	var isPow2, isDXT1 bool
+	var texPixels []uint32
+	if sampleTex {
+		texW = texRes.Width
+		texH = texRes.Height
+		texWf = float32(texW)
+		texHf = float32(texH)
+		isPow2 = (texW&(texW-1)) == 0 && (texH&(texH-1)) == 0
+		wMask = texW - 1
+		hMask = texH - 1
+		isDXT1 = texRes.Format == 0x31545844
+		texPixels = texRes.Pixels
+	}
+
+	v0r, v1r, v2r := float32(v0.r), float32(v1.r), float32(v2.r)
+	v0g, v1g, v2g := float32(v0.g), float32(v1.g), float32(v2.g)
+	v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
+	v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
 
 	pix := s.Framebuffer.Pix
 	zbuf := s.ZBuffer
+	pxStart := float32(minX) + 0.5
 	for y := minY; y <= maxY; y++ {
 		py := float32(y) + 0.5
 		rowIdx := y * ScreenWidth
+		w0 := ((v1.sx-pxStart)*(v2.sy-py) - (v1.sy-py)*(v2.sx-pxStart)) * invArea
+		w1 := ((v2.sx-pxStart)*(v0.sy-py) - (v2.sy-py)*(v0.sx-pxStart)) * invArea
 		for x := minX; x <= maxX; x++ {
-			px := float32(x) + 0.5
-			w0 := ((v1.sx-px)*(v2.sy-py) - (v1.sy-py)*(v2.sx-px)) * invArea
-			w1 := ((v2.sx-px)*(v0.sy-py) - (v2.sy-py)*(v0.sx-px)) * invArea
 			w2 := 1.0 - w0 - w1
-			if (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0) {
-				if w0 < 0 {
-					w0, w1, w2 = -w0, -w1, -w2
-				}
+			if w0 >= 0 && w1 >= 0 && w2 >= 0 {
 				z := w0*v0.sz + w1*v1.sz + w2*v2.sz
 				zIdx := rowIdx + x
-				if is3D && z > zbuf[zIdx] {
-					continue
-				}
-				r := uint8(w0*float32(v0.r) + w1*float32(v1.r) + w2*float32(v2.r))
-				g := uint8(w0*float32(v0.g) + w1*float32(v1.g) + w2*float32(v2.g))
-				b := uint8(w0*float32(v0.b) + w1*float32(v1.b) + w2*float32(v2.b))
-				a := uint8(w0*float32(v0.a) + w1*float32(v1.a) + w2*float32(v2.a))
+				if !is3D || z <= zbuf[zIdx] {
+					r := uint8(w0*v0r + w1*v1r + w2*v2r)
+					g := uint8(w0*v0g + w1*v1g + w2*v2g)
+					b := uint8(w0*v0b + w1*v1b + w2*v2b)
+					a := uint8(w0*v0a + w1*v1a + w2*v2a)
+					skip := false
 
-				if hasTex && v0.u > -900.0 {
-					tu := w0*v0.u + w1*v1.u + w2*v2.u
-					tv := w0*v0.v + w1*v1.v + w2*v2.v
-					tu = tu - float32(math.Floor(float64(tu)))
-					tv = tv - float32(math.Floor(float64(tv)))
-					tx := uint32(tu*float32(texRes.Width)) % texRes.Width
-					ty := uint32(tv*float32(texRes.Height)) % texRes.Height
-					tp := texRes.Pixels[ty*texRes.Width+tx]
-					tr := uint8(tp & 0xFF)
-					tg := uint8((tp >> 8) & 0xFF)
-					tb := uint8((tp >> 16) & 0xFF)
-					ta := uint8((tp >> 24) & 0xFF)
-					if tr == 0 && tg == 0 && tb == 0 && ta == 0 && texRes.Format != 0x31545844 {
-						continue
+					if sampleTex {
+						tu := w0*v0.u + w1*v1.u + w2*v2.u
+						tv := w0*v0.v + w1*v1.v + w2*v2.v
+						var tx, ty uint32
+						if isPow2 {
+							ui := int32(tu * texWf)
+							if tu < 0 {
+								ui--
+							}
+							vi := int32(tv * texHf)
+							if tv < 0 {
+								vi--
+							}
+							tx = uint32(ui) & wMask
+							ty = uint32(vi) & hMask
+						} else {
+							tu = tu - float32(math.Floor(float64(tu)))
+							tv = tv - float32(math.Floor(float64(tv)))
+							tx = uint32(tu*texWf) % texW
+							ty = uint32(tv*texHf) % texH
+						}
+						tp := texPixels[ty*texW+tx]
+						if tp == 0 && !isDXT1 {
+							skip = true
+						} else {
+							tr := uint8(tp & 0xFF)
+							tg := uint8((tp >> 8) & 0xFF)
+							tb := uint8((tp >> 16) & 0xFF)
+							ta := uint8((tp >> 24) & 0xFF)
+							r = uint8((uint16(r) * uint16(tr)) / 255)
+							g = uint8((uint16(g) * uint16(tg)) / 255)
+							b = uint8((uint16(b) * uint16(tb)) / 255)
+							if !is3D || alphaEnabled {
+								a = uint8((uint16(a) * uint16(ta)) / 255)
+							} else {
+								a = 255
+							}
+						}
+					} else if isGlyphQuad {
+						rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
+						ry := float64(y-minY) / math.Max(1.0, float64(maxY-minY))
+						if rx < 0.15 || rx > 0.85 || ry < 0.15 || ry > 0.85 {
+							skip = true
+						} else {
+							uSeed := int(v0.u*256.0) + int(v0.v*512.0)
+							gx := int((rx - 0.15) / 0.70 * 5.0)
+							gy := int((ry - 0.15) / 0.70 * 7.0)
+							bit := ((uSeed*31 + gx*7 + gy*13) ^ (gx * gy)) & 3
+							if bit == 0 && gy != 0 && gy != 3 && gx != 2 {
+								skip = true
+							}
+						}
 					}
-					r = uint8((uint16(r) * uint16(tr)) / 255)
-					g = uint8((uint16(g) * uint16(tg)) / 255)
-					b = uint8((uint16(b) * uint16(tb)) / 255)
-					if !is3D || alphaEnabled {
-						a = uint8((uint16(a) * uint16(ta)) / 255)
-					} else {
-						a = 255
+					if !skip && a >= 8 {
+						if is3D && a >= 240 {
+							zbuf[zIdx] = z
+						}
+						off := zIdx * 4
+						if a == 255 {
+							pix[off+0] = r
+							pix[off+1] = g
+							pix[off+2] = b
+							pix[off+3] = 255
+						} else {
+							af := uint16(a)
+							ia := 255 - af
+							pix[off+0] = uint8((uint16(r)*af + uint16(pix[off+0])*ia) / 255)
+							pix[off+1] = uint8((uint16(g)*af + uint16(pix[off+1])*ia) / 255)
+							pix[off+2] = uint8((uint16(b)*af + uint16(pix[off+2])*ia) / 255)
+							pix[off+3] = 255
+						}
 					}
-				} else if isGlyphQuad {
-					// Procedural glyph stroke pattern derived from font atlas UV coordinates
-					rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
-					ry := float64(y-minY) / math.Max(1.0, float64(maxY-minY))
-					if rx < 0.15 || rx > 0.85 || ry < 0.15 || ry > 0.85 {
-						continue
-					}
-					uSeed := int(v0.u*256.0) + int(v0.v*512.0)
-					gx := int((rx - 0.15) / 0.70 * 5.0)
-					gy := int((ry - 0.15) / 0.70 * 7.0)
-					bit := ((uSeed*31 + gx*7 + gy*13) ^ (gx * gy)) & 3
-					if bit == 0 && gy != 0 && gy != 3 && gx != 2 {
-						continue
-					}
-				}
-				if a < 8 {
-					continue
-				}
-				if is3D && a >= 240 {
-					zbuf[zIdx] = z
-				}
-				off := zIdx * 4
-				if a == 255 {
-					pix[off+0] = r
-					pix[off+1] = g
-					pix[off+2] = b
-					pix[off+3] = 255
-				} else {
-					af := uint16(a)
-					ia := 255 - af
-					pix[off+0] = uint8((uint16(r)*af + uint16(pix[off+0])*ia) / 255)
-					pix[off+1] = uint8((uint16(g)*af + uint16(pix[off+1])*ia) / 255)
-					pix[off+2] = uint8((uint16(b)*af + uint16(pix[off+2])*ia) / 255)
-					pix[off+3] = 255
 				}
 			}
+			w0 += dw0dx
+			w1 += dw1dx
 		}
 	}
 }
@@ -659,8 +734,13 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 	if pVerts == 0 || stride < 12 || primCount == 0 || !s.rendering {
 		return
 	}
+	s.fbDirty = true
 	if primCount > 4096 {
 		primCount = 4096
+	}
+	var texRes *BufferDesc
+	if s.BoundTextures[0] != 0 {
+		texRes = s.ensureTextureDecoded(c, s.BoundTextures[0])
 	}
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
@@ -668,24 +748,27 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 			v0 := s.transformVertex(c, pVerts+(i*3+0)*stride, stride, isUP)
 			v1 := s.transformVertex(c, pVerts+(i*3+1)*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+(i*3+2)*stride, stride, isUP)
-			s.rasterizeTriangle(c, v0, v1, v2)
+			s.rasterizeTriangle(c, v0, v1, v2, texRes)
 		}
 	case 5: // D3DPT_TRIANGLESTRIP
+		v0 := s.transformVertex(c, pVerts, stride, isUP)
+		v1 := s.transformVertex(c, pVerts+stride, stride, isUP)
 		for i := uint32(0); i < primCount; i++ {
-			v0 := s.transformVertex(c, pVerts+(i+0)*stride, stride, isUP)
-			v1 := s.transformVertex(c, pVerts+(i+1)*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+(i+2)*stride, stride, isUP)
-			if i%2 == 1 {
-				v1, v2 = v2, v1
+			if i&1 == 1 {
+				s.rasterizeTriangle(c, v0, v2, v1, texRes)
+			} else {
+				s.rasterizeTriangle(c, v0, v1, v2, texRes)
 			}
-			s.rasterizeTriangle(c, v0, v1, v2)
+			v0, v1 = v1, v2
 		}
 	case 6: // D3DPT_TRIANGLEFAN
 		v0 := s.transformVertex(c, pVerts, stride, isUP)
+		v1 := s.transformVertex(c, pVerts+stride, stride, isUP)
 		for i := uint32(0); i < primCount; i++ {
-			v1 := s.transformVertex(c, pVerts+(i+1)*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+(i+2)*stride, stride, isUP)
-			s.rasterizeTriangle(c, v0, v1, v2)
+			s.rasterizeTriangle(c, v0, v1, v2, texRes)
+			v1 = v2
 		}
 	}
 }
@@ -697,8 +780,13 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	if !s.rendering {
 		return // frame will not be exported: skip software rasterization entirely
 	}
+	s.fbDirty = true
 	if primCount > 4096 {
 		primCount = 4096
+	}
+	var texRes *BufferDesc
+	if s.BoundTextures[0] != 0 {
+		texRes = s.ensureTextureDecoded(c, s.BoundTextures[0])
 	}
 	readIdx := func(n uint32) uint32 {
 		pos := startIdx + n
@@ -723,23 +811,25 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 			v0 := s.transformVertex(c, pVerts+i0*stride, stride, isUP)
 			v1 := s.transformVertex(c, pVerts+i1*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+i2*stride, stride, isUP)
-			s.rasterizeTriangle(c, v0, v1, v2)
+			s.rasterizeTriangle(c, v0, v1, v2, texRes)
 		}
 	case 5: // D3DPT_TRIANGLESTRIP
+		i0 := readIdx(0)
+		i1 := readIdx(1)
+		v0 := s.transformVertex(c, pVerts+i0*stride, stride, isUP)
+		v1 := s.transformVertex(c, pVerts+i1*stride, stride, isUP)
 		for i := uint32(0); i < primCount; i++ {
-			i0 := readIdx(i + 0)
-			i1 := readIdx(i + 1)
 			i2 := readIdx(i + 2)
-			if i0 == i1 || i1 == i2 || i0 == i2 {
-				continue
-			}
-			v0 := s.transformVertex(c, pVerts+i0*stride, stride, isUP)
-			v1 := s.transformVertex(c, pVerts+i1*stride, stride, isUP)
 			v2 := s.transformVertex(c, pVerts+i2*stride, stride, isUP)
-			if i%2 == 1 {
-				v1, v2 = v2, v1
+			if i0 != i1 && i1 != i2 && i0 != i2 {
+				if i&1 == 1 {
+					s.rasterizeTriangle(c, v0, v2, v1, texRes)
+				} else {
+					s.rasterizeTriangle(c, v0, v1, v2, texRes)
+				}
 			}
-			s.rasterizeTriangle(c, v0, v1, v2)
+			i0, i1 = i1, i2
+			v0, v1 = v1, v2
 		}
 	}
 }
@@ -748,25 +838,50 @@ func (s *Subsystem) exportFramePNG() {
 	if s.Framebuffer == nil {
 		return
 	}
-	var buf bytes.Buffer
-	if err := fastPNG.Encode(&buf, s.Framebuffer); err != nil {
-		return
-	}
-	pngBytes := buf.Bytes()
 
 	s.FrameMu.Lock()
-	s.LatestPNG = pngBytes
+	copy(s.LatestRGBA, s.Framebuffer.Pix)
+	s.LatestPNG = nil
 	s.FrameMu.Unlock()
 
+	if s.ShmFile != nil {
+		var hdr [32]byte
+		steps := uint64(0)
+		if s.VM != nil {
+			steps = s.VM.Steps
+		}
+		binary.LittleEndian.PutUint64(hdr[0:8], s.FrameCount)
+		binary.LittleEndian.PutUint64(hdr[8:16], s.DrawCallCount)
+		binary.LittleEndian.PutUint64(hdr[16:24], s.TriangleCount)
+		binary.LittleEndian.PutUint64(hdr[24:32], steps)
+		_, _ = s.ShmFile.WriteAt(s.Framebuffer.Pix, ShmHeaderSize)
+		_, _ = s.ShmFile.WriteAt(hdr[:], 0)
+	}
+
 	if liveMode {
+		if s.ShmFile != nil {
+			return
+		}
 		if s.FramesDir != "" && s.FrameCount%60 == 0 {
-			latestPath := filepath.Join(s.FramesDir, "latest.png")
-			_ = os.WriteFile(latestPath, pngBytes, 0644)
+			var buf bytes.Buffer
+			if err := fastPNG.Encode(&buf, s.Framebuffer); err == nil {
+				latestPath := filepath.Join(s.FramesDir, "latest.png")
+				_ = os.WriteFile(latestPath, buf.Bytes(), 0644)
+			}
 		}
 		return
 	}
 
 	if s.FramesDir != "" && (s.FrameDrawCalls > 0 || s.FrameCount == 1 || s.FrameCount%30 == 0) {
+		var buf bytes.Buffer
+		if err := fastPNG.Encode(&buf, s.Framebuffer); err != nil {
+			return
+		}
+		pngBytes := buf.Bytes()
+		s.FrameMu.Lock()
+		s.LatestPNG = pngBytes
+		s.FrameMu.Unlock()
+
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
 		_ = os.WriteFile(latestPath, pngBytes, 0644)
 		if s.CubeTexCount >= 8 && s.FrameDrawCalls > 50 {
@@ -932,6 +1047,18 @@ func (s *Subsystem) startDisplayServer() {
 	mux.HandleFunc("/latest.png", func(w http.ResponseWriter, r *http.Request) {
 		s.FrameMu.Lock()
 		data := s.LatestPNG
+		if len(data) == 0 && len(s.LatestRGBA) == ScreenWidth*ScreenHeight*4 {
+			img := &image.RGBA{
+				Pix:    s.LatestRGBA,
+				Stride: ScreenWidth * 4,
+				Rect:   image.Rect(0, 0, ScreenWidth, ScreenHeight),
+			}
+			var buf bytes.Buffer
+			if err := fastPNG.Encode(&buf, img); err == nil {
+				data = buf.Bytes()
+				s.LatestPNG = data
+			}
+		}
 		s.FrameMu.Unlock()
 		if len(data) == 0 {
 			http.Error(w, "no frame yet", http.StatusNotFound)

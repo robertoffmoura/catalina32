@@ -88,7 +88,8 @@ type Subsystem struct {
 	Resources         map[uint32]*BufferDesc
 	VertexDecls       map[uint32]*VertexDecl
 	CurrentVertexDecl uint32
-	RenderStates      map[uint32]uint32
+	CurrentVD         *VertexDecl
+	RenderStates      [256]uint32
 	BoundTextures     [16]uint32
 	StreamSources     [16]uint32
 	StreamOffsets     [16]uint32
@@ -108,10 +109,12 @@ type Subsystem struct {
 	DIPCount       uint64
 	FrameMu        sync.Mutex
 	LatestPNG      []byte
+	LatestRGBA     []byte
+	ShmFile        *os.File
 
-	KeyMu           sync.Mutex
-	KeyHoldUntil    [256]uint64
-	AutoKeysMode    string
+	KeyMu             sync.Mutex
+	KeyHoldUntil      [256]uint64
+	AutoKeysMode      string
 	CubeTexCount      uint64
 	TitleFirstFrame   uint64
 	CantinaFirstFrame uint64
@@ -122,6 +125,7 @@ type Subsystem struct {
 	TriangleCount  uint64
 	ClearCount     uint64
 	LastClearColor uint32
+	fbDirty        bool
 	TraceLog       bool
 }
 
@@ -136,7 +140,6 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		nextTrampAddr:  TrampArenaBase,
 		Resources:      make(map[uint32]*BufferDesc),
 		VertexDecls:    make(map[uint32]*VertexDecl),
-		RenderStates:   make(map[uint32]uint32),
 		AutoKeysMode:   autoKeys,
 		TraceLog:       true,
 	}
@@ -320,6 +323,7 @@ func (s *Subsystem) RegisterIndirectXThunks(c *cpu.CPU) {
 	c.RegisterIntercept(0x00070110, "NuUploadSkinMatrices", s.thunkNuUploadSkinMatrices)
 	// Populate NuShader constant & sampler descriptors so NuShaderBindMaterial (0x001538f0) binds textures & material colors
 	c.RegisterIntercept(0x001535c0, "NuShaderParseConstantTable", s.thunkNuShaderParseConstantTable)
+	c.RegisterIntercept(0x001538f0, "NuShaderBindMaterial", s.thunkNuShaderBindMaterial)
 	// Patch NuTexRead (0x00078df0) at 0x00079088 (jne 0x000791d0 -> 6x NOP) so .GSC textures with flags & 0x3c0c are never skipped
 	for i := uint32(0); i < 6; i++ {
 		c.Mem[0x00079088+i] = 0x90
@@ -340,6 +344,50 @@ func (s *Subsystem) thunkNuUploadSkinMatrices(c *cpu.CPU) {
 				s.SkinMatrices[i][j] = c.ReadF32(ptr + j*4)
 			}
 			ptr += 64
+		}
+	}
+	c.Regs[cpu.RegEAX] = 0
+	c.Ret()
+}
+
+func (s *Subsystem) thunkNuShaderBindMaterial(c *cpu.CPU) {
+	mtl := c.Arg(1)
+	if mtl != 0 && mtl+0x128 <= uint32(len(c.Mem)) {
+		var tex0 uint32
+		tid := int32(c.Read32(mtl + 0xb8))
+		if tid > 0 {
+			texArr := c.Read32(0x02c25d08)
+			if texArr != 0 && texArr+uint32(tid)*4 <= uint32(len(c.Mem)) {
+				nuTex := c.Read32(texArr + uint32(tid)*4 - 4)
+				if nuTex != 0 && nuTex+0x28 <= uint32(len(c.Mem)) {
+					tex0 = c.Read32(nuTex + 0x24)
+				}
+			}
+		}
+		s.BoundTextures[0] = tex0
+		c.Write32(0x02b5af74, tex0)
+
+		const inv255 = 1.0 / 255.0
+		c0 := c.Read32(mtl + 0xc8)
+		s.PSConstants[112] = [4]float32{
+			float32(c0&0xFF) * inv255,
+			float32((c0>>8)&0xFF) * inv255,
+			float32((c0>>16)&0xFF) * inv255,
+			float32((c0>>24)&0xFF) * inv255,
+		}
+		cAmb := c.Read32(mtl + 0x11c)
+		s.PSConstants[113] = [4]float32{
+			float32(cAmb&0xFF) * inv255,
+			float32((cAmb>>8)&0xFF) * inv255,
+			float32((cAmb>>16)&0xFF) * inv255,
+			float32((cAmb>>24)&0xFF) * inv255,
+		}
+		cSurf := c.Read32(mtl + 0x120)
+		s.VSConstants[114] = [4]float32{
+			float32(cSurf&0xFF) * inv255,
+			float32((cSurf>>8)&0xFF) * inv255,
+			float32((cSurf>>16)&0xFF) * inv255,
+			float32((cSurf>>24)&0xFF) * inv255,
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -587,7 +635,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			s.TitleFirstFrame = s.FrameCount
 			fmt.Printf("[D3D9] Title screen detected at Frame #%d (CubeTexCount=%d, FrameDrawCalls=%d)\n", s.FrameCount, s.CubeTexCount, s.FrameDrawCalls)
 		}
-		if s.rendering {
+		if s.rendering && (s.FrameDrawCalls > 0 || s.FrameCount == 1) {
 			s.exportFramePNG()
 		}
 		s.rendering = s.wantRender(s.FrameCount + 1)
@@ -717,11 +765,14 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		flags := c.Arg(3)
 		col := c.Arg(4)
 		s.LastClearColor = col
-		if s.rendering && (flags&1) != 0 && s.FrameDrawCalls == 0 {
-			s.clearFramebuffer(col)
-		}
-		if s.rendering && (flags&2) != 0 {
-			s.clearZBuffer(1.0)
+		if s.rendering && s.fbDirty && s.FrameDrawCalls == 0 {
+			if (flags & 1) != 0 {
+				s.clearFramebuffer(col)
+			}
+			if (flags & 2) != 0 {
+				s.clearZBuffer(1.0)
+			}
+			s.fbDirty = false
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 48: // GetViewport(this, pViewport)
@@ -736,12 +787,18 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 57: // SetRenderState
-		s.RenderStates[c.Arg(1)] = c.Arg(2)
+		if rs := c.Arg(1); rs < 256 {
+			s.RenderStates[rs] = c.Arg(2)
+		}
 		c.Regs[cpu.RegEAX] = 0
 	case 58: // GetRenderState
 		pVal := c.Arg(2)
 		if pVal != 0 {
-			c.Write32(pVal, s.RenderStates[c.Arg(1)])
+			var v uint32
+			if rs := c.Arg(1); rs < 256 {
+				v = s.RenderStates[rs]
+			}
+			c.Write32(pVal, v)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 59: // CreateStateBlock(this, Type, ppSB)
@@ -773,40 +830,40 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		s.DrawCallCount++
 		s.FrameDrawCalls++
 		s.TriangleCount += uint64(c.Arg(3))
-		if vbRes := s.Resources[s.StreamSources[0]]; vbRes != nil {
-			stride := s.StreamStrides[0]
-			pVerts := vbRes.DataPtr + s.StreamOffsets[0] + c.Arg(2)*stride
-			is2D := (stride == 24 || stride == 20)
-			s.rasterizePrimitiveBatch(c, c.Arg(1), c.Arg(3), pVerts, stride, is2D)
+		if s.rendering {
+			if vbRes := s.Resources[s.StreamSources[0]]; vbRes != nil {
+				stride := s.StreamStrides[0]
+				pVerts := vbRes.DataPtr + s.StreamOffsets[0] + c.Arg(2)*stride
+				is2D := (stride == 24 || stride == 20)
+				s.rasterizePrimitiveBatch(c, c.Arg(1), c.Arg(3), pVerts, stride, is2D)
+			}
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 82: // DrawIndexedPrimitive(this, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount)
 		s.DrawCallCount++
 		s.FrameDrawCalls++
 		s.DIPCount++
-		s.TriangleCount += uint64(c.Arg(6))
-		vbRes := s.Resources[s.StreamSources[0]]
-		ibRes := s.Resources[s.BoundIndices]
-		stride := s.StreamStrides[0]
-		numV := c.Arg(4)
 		prims := c.Arg(6)
-		// Skip the 5x5 fullscreen post-process grid from 0x0001d900 so it doesn't overwrite the software framebuffer
-		isPostProcessGrid := (numV == 25 && prims == 44 && stride == 28)
-		if vbRes != nil && ibRes != nil && !isPostProcessGrid {
-			pVerts := vbRes.DataPtr + s.StreamOffsets[0]
-			is32 := ibRes.Format == 102 // D3DFMT_INDEX32
-			if s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0 {
-				s.CantinaDIPLogged = 1
-				s.CantinaFirstFrame = s.FrameCount
-				s.rendering = true
-				s.clearFramebuffer(0xFF000000)
-				s.clearZBuffer(1.0)
+		s.TriangleCount += uint64(prims)
+		if s.rendering || (s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0) {
+			vbRes := s.Resources[s.StreamSources[0]]
+			ibRes := s.Resources[s.BoundIndices]
+			stride := s.StreamStrides[0]
+			numV := c.Arg(4)
+			// Skip the 5x5 fullscreen post-process grid from 0x0001d900 so it doesn't overwrite the software framebuffer
+			isPostProcessGrid := (numV == 25 && prims == 44 && stride == 28)
+			if vbRes != nil && ibRes != nil && !isPostProcessGrid {
+				pVerts := vbRes.DataPtr + s.StreamOffsets[0]
+				is32 := ibRes.Format == 102 // D3DFMT_INDEX32
+				if s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0 {
+					s.CantinaDIPLogged = 1
+					s.CantinaFirstFrame = s.FrameCount
+					s.rendering = true
+					s.clearFramebuffer(0xFF000000)
+					s.clearZBuffer(1.0)
+				}
+				s.rasterizeIndexedBatch(c, c.Arg(1), int32(c.Arg(2)), c.Arg(5), prims, pVerts, stride, ibRes.DataPtr, ibRes.Length, is32, false)
 			}
-			s.rasterizeIndexedBatch(c, c.Arg(1), int32(c.Arg(2)), c.Arg(5), prims, pVerts, stride, ibRes.DataPtr, ibRes.Length, is32, false)
-		}
-		if s.TraceLog && s.DIPCount <= 15 {
-			fmt.Printf("[D3D9-DIP #%d] frame=%d type=%d baseV=%d numV=%d startIdx=%d prims=%d stride=%d tex0=0x%x post=%v\n",
-				s.DIPCount, s.FrameCount, c.Arg(1), int32(c.Arg(2)), numV, c.Arg(5), prims, stride, s.BoundTextures[0], isPostProcessGrid)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 83: // DrawPrimitiveUP(this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride)
@@ -874,6 +931,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 87: // SetVertexDeclaration(this, pDecl)
 		s.CurrentVertexDecl = c.Arg(1)
+		s.CurrentVD = s.VertexDecls[s.CurrentVertexDecl]
 		c.Regs[cpu.RegEAX] = 0
 	case 91: // CreateVertexShader(this, pFunction, ppShader)
 		pp := c.Arg(2)
@@ -1307,6 +1365,30 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 		if lpvData != 0 && cbData > 0 && cbData <= 4096 {
 			clear(c.Mem[lpvData : lpvData+cbData])
 			if cbData == 256 {
+				if s.ShmFile != nil {
+					var shmKeys [256]byte
+					if _, err := s.ShmFile.ReadAt(shmKeys[:], 32); err == nil {
+						switch shmKeys[0] {
+						case 1:
+							s.KeyMu.Lock()
+							s.AutoKeysMode = "off"
+							s.KeyMu.Unlock()
+						case 2:
+							s.KeyMu.Lock()
+							s.AutoKeysMode = "boot"
+							s.KeyMu.Unlock()
+						case 3:
+							s.KeyMu.Lock()
+							s.AutoKeysMode = "loop"
+							s.KeyMu.Unlock()
+						}
+						for dik := 1; dik < 256; dik++ {
+							if shmKeys[dik] != 0 {
+								c.Mem[lpvData+uint32(dik)] = 0x80
+							}
+						}
+					}
+				}
 				s.KeyMu.Lock()
 				mode := s.AutoKeysMode
 				for dik := 0; dik < 256; dik++ {
@@ -1321,8 +1403,8 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 				case "boot":
 					// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
 					if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
-						df := f - s.TitleFirstFrame
-						if (df >= 20 && df < 26) || (df >= 60 && df < 66) || (df >= 110 && df < 116) {
+						df := (f - s.TitleFirstFrame) % 50
+						if df >= 20 && df < 26 {
 							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
 						}
 					}
