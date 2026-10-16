@@ -52,8 +52,23 @@ const (
 	dArithSS          // F3 0F 58/59/5C/5E (aux = op2)
 	dMovapsLoad       // 0F 28 / 0F 10 (no prefix)
 	dMovapsStore
-	dUcomiss // 0F 2E / 0F 2F (no prefix)
-	dXorps   // 0F 57 (no prefix)
+	dUcomiss   // 0F 2E / 0F 2F (no prefix)
+	dXorps     // 0F 57 (no prefix)
+	dNop       // 90, and [66|2E]* 0F 1F /0 padding
+	dMovRImm32 // B8+r
+	dShift32   // C1 / D1 (imm = count)
+	dShift32CL // D3
+	dImul32    // 69 / 6B (imm = sign-extended immediate)
+	dMovStore8 // 88
+	dMovLoad8  // 8A
+	dMovImm8   // C6 /0
+	dTestRMR8  // 84
+	dTestALImm // A8
+	dIncRM32   // FF /0
+	dDecRM32   // FF /1
+	dCallInd   // FF /2
+	dJmpInd    // FF /4
+	dPushRM32  // FF /6
 )
 
 type dInst struct {
@@ -152,6 +167,16 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	d.tag = eip
 	d.kind = dSlow
 	p := eip
+	if q := p; m[q] == 0x66 || m[q] == 0x2E || m[q] == 0x0F {
+		for m[q] == 0x66 || m[q] == 0x2E {
+			q++
+		}
+		if m[q] == 0x0F && m[q+1] == 0x1F && (m[q+2]>>3)&7 == 0 {
+			n := decodeModRM(m, q+2, d)
+			d.kind, d.len = dNop, uint8(q+2+n-eip)
+			return
+		}
+	}
 	pfx := uint8(0)
 	if b := m[p]; b == 0xF3 || b == 0xF2 {
 		pfx = b
@@ -246,6 +271,62 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	case op == 0x85:
 		n := decodeModRM(m, p, d)
 		set(dTestRMR32, p+n)
+	case op == 0x84:
+		set(dTestRMR8, p+decodeModRM(m, p, d))
+	case op == 0x88:
+		set(dMovStore8, p+decodeModRM(m, p, d))
+	case op == 0x8A:
+		set(dMovLoad8, p+decodeModRM(m, p, d))
+	case op == 0x90:
+		set(dNop, p)
+	case op == 0xA8:
+		d.imm = uint32(m[p])
+		set(dTestALImm, p+1)
+	case op >= 0xB8 && op <= 0xBF:
+		d.reg = op & 7
+		d.imm = le32(m, p)
+		set(dMovRImm32, p+4)
+	case op == 0xC1:
+		n := decodeModRM(m, p, d)
+		d.aux = d.reg
+		d.imm = uint32(m[p+n])
+		set(dShift32, p+n+1)
+	case op == 0xD1:
+		n := decodeModRM(m, p, d)
+		d.aux = d.reg
+		d.imm = 1
+		set(dShift32, p+n)
+	case op == 0xD3:
+		n := decodeModRM(m, p, d)
+		d.aux = d.reg
+		set(dShift32CL, p+n)
+	case op == 0x69:
+		n := decodeModRM(m, p, d)
+		d.imm = le32(m, p+n)
+		set(dImul32, p+n+4)
+	case op == 0x6B:
+		n := decodeModRM(m, p, d)
+		d.imm = uint32(int32(int8(m[p+n])))
+		set(dImul32, p+n+1)
+	case op == 0xC6:
+		if n := decodeModRM(m, p, d); d.reg == 0 {
+			d.imm = uint32(m[p+n])
+			set(dMovImm8, p+n+1)
+		}
+	case op == 0xFF:
+		n := decodeModRM(m, p, d)
+		switch d.reg {
+		case 0:
+			set(dIncRM32, p+n)
+		case 1:
+			set(dDecRM32, p+n)
+		case 2:
+			set(dCallInd, p+n)
+		case 4:
+			set(dJmpInd, p+n)
+		case 6:
+			set(dPushRM32, p+n)
+		}
 	case op == 0x89:
 		n := decodeModRM(m, p, d)
 		set(dMovStore32, p+n)
@@ -548,6 +629,79 @@ func (c *CPU) execCached(d *dInst) {
 			b = float64(c.getXMMF32(int(d.rm), 0))
 		}
 		c.fpuCompareEFlags(a, b)
+	case dNop:
+	case dMovRImm32:
+		c.Regs[d.reg] = d.imm
+	case dShift32, dShift32CL:
+		cnt := uint8(d.imm)
+		if d.kind == dShift32CL {
+			cnt = c.GetReg8(RegECX)
+		}
+		if d.isMem {
+			addr := c.ea(d)
+			c.Write32(addr, c.shiftOp32(int(d.aux), c.Read32(addr), cnt))
+		} else {
+			c.Regs[d.rm] = c.shiftOp32(int(d.aux), c.Regs[d.rm], cnt)
+		}
+	case dImul32:
+		src := int64(int32(c.rm32(d)))
+		prod := src * int64(int32(d.imm))
+		res := uint32(prod)
+		c.Regs[d.reg] = res
+		c.SetFlag(FlagCF|FlagOF, prod != int64(int32(res)))
+	case dMovStore8:
+		if d.isMem {
+			c.Write8(c.ea(d), c.GetReg8(int(d.reg)))
+		} else {
+			c.SetReg8(int(d.rm), c.GetReg8(int(d.reg)))
+		}
+	case dMovLoad8:
+		c.SetReg8(int(d.reg), c.rm8(d))
+	case dMovImm8:
+		if d.isMem {
+			c.Write8(c.ea(d), uint8(d.imm))
+		} else {
+			c.SetReg8(int(d.rm), uint8(d.imm))
+		}
+	case dTestRMR8:
+		c.UpdateFlagsLogic8(c.rm8(d) & c.GetReg8(int(d.reg)))
+	case dTestALImm:
+		c.UpdateFlagsLogic8(c.GetReg8(RegEAX) & uint8(d.imm))
+	case dIncRM32, dDecRM32:
+		cf := c.Flags & FlagCF
+		var addr, v uint32
+		if d.isMem {
+			addr = c.ea(d)
+			v = c.Read32(addr)
+		} else {
+			v = c.Regs[d.rm]
+		}
+		var res uint32
+		if d.kind == dIncRM32 {
+			res = v + 1
+			c.UpdateFlagsAdd32(v, 1, res)
+		} else {
+			res = v - 1
+			c.UpdateFlagsSub32(v, 1, res)
+		}
+		if d.isMem {
+			c.Write32(addr, res)
+		} else {
+			c.Regs[d.rm] = res
+		}
+		c.Flags = c.Flags&^FlagCF | cf
+	case dCallInd:
+		target := c.rm32(d)
+		c.Push32(c.EIP)
+		if c.TraceCalls {
+			c.CallStack = append(c.CallStack, CallFrame{CallerEIP: start, TargetEIP: target, ESP: c.Regs[RegESP]})
+			c.VisitedFuncs[target]++
+		}
+		c.EIP = target
+	case dJmpInd:
+		c.EIP = c.rm32(d)
+	case dPushRM32:
+		c.Push32(c.rm32(d))
 	case dXorps:
 		var src [16]byte
 		if d.isMem {
@@ -560,6 +714,20 @@ func (c *CPU) execCached(d *dInst) {
 			c.XMM[d.reg][i] ^= src[i]
 		}
 	}
+}
+
+func (c *CPU) rm32(d *dInst) uint32 {
+	if d.isMem {
+		return c.Read32(c.ea(d))
+	}
+	return c.Regs[d.rm]
+}
+
+func (c *CPU) rm8(d *dInst) uint8 {
+	if d.isMem {
+		return c.Read8(c.ea(d))
+	}
+	return c.GetReg8(int(d.rm))
 }
 
 // storeCode128 writes 16 bytes like writeXMMOrMem128, flushing the cache if it lands in guest code.
