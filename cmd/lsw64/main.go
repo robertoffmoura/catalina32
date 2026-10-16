@@ -79,7 +79,12 @@ func main() {
 
 	// 2. Call WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1) at 0x00209d10
 	fmt.Printf("[lsw64] Launching WinMain(0x00001000, 0, 0x%08x, 1) @ 0x00209d10...\n", w32.CmdLineAddr)
-	vm.MaxSteps = 1_200_000_000
+	vm.MaxSteps = 1_100_000_000
+	if v := os.Getenv("LSW_MAX_STEPS"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			vm.MaxSteps = n
+		}
+	}
 	if os.Getenv("LSW_WATCH_KEYS") != "" {
 		seen := map[uint32]bool{}
 		vm.WatchLo, vm.WatchHi = 0x02C317E8, 0x02C319EA

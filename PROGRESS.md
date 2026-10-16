@@ -20,8 +20,9 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
 | Load Mach-O, run 18 static initialisers, WinMain, mount 7 .DAT archives | DONE |
 | Title/attract loop renders (logo, text) via software D3D9 | DONE but crude (3D scene not right) |
 | Real threads (green threads) | DONE (this session) — fixed the hang at frame 420 |
-| Keyboard input reaching the game | IN PROGRESS (see below) |
-| Get past "Press a key..." / menus / level load / gameplay | NOT STARTED |
+| Keyboard input reaching the game | DONE (DirectInput keyboard via EnumDevices; scripted Enter/F2 taps) |
+| Get past "Press a key..." | DONE -> game then showed "Press F2 or any button to start", then started loading LEVELS\MAP (hub map) |
+| Level load finishing / menus / gameplay | IN PROGRESS: load is just very slow in the interpreter (~6M instr/s); long run in scratch/run_long.log |
 | Audio | NOT STARTED (DirectSound shims are stubs) |
 | Speed | UNSOLVED: interpreter ~10M instr/s; gameplay likely needs 50-100x. Probably needs much more recompilation (lift more code) or a JIT. This is the biggest risk to "playable". |
 | Universal macOS .app packaging | NOT STARTED |
@@ -55,14 +56,19 @@ is desynced at the start (header data); regenerate per-range if needed.
   0x001601e0 (wait-for-job loop polling 0x001e8fa0) after frame 420. Fixed by green threads (`pkg/win32/threads.go`):
   switch on Sleep / blocking WaitForSingleObject / contended critical section / preemption every 20000 steps; switches only at
   `NestDepth==0` (main sets `vm.NestDepth=-1` so WinMain counts as depth 0). Threads from CreateThread are created suspended by the game
-  (0x001e79d0 x2) and resumed via ResumeThread. Mapped `WaitForSingleObjectEx` (0x00623c30). ResetEvent is NOT mapped (address unknown)
-  so manual-reset events stay signalled forever. The `SetEvent` BGWorker hack (runs jobs inline) is still in place.
+  (0x001e79d0 x2) and resumed via ResumeThread. Mapped `WaitForSingleObjectEx` (0x00623c30). ResetEvent = 0x00623c30 (1 arg; NOT WaitForSingleObjectEx - that was a misidentification fixed 2026-10-16)
+  (previously this caused a worker busy-spin: ~28M Enter/Leave/Wait calls). The `SetEvent` BGWorker hack (runs jobs inline) is still in place.
 - **Input**: WndProc = 0x00208b60 (captured from RegisterClassExA). WM_KEYDOWN(0x100)/WM_KEYUP(0x101) take scancode from lParam bits 16-23
   (+ extended bit) and call 0x000c0390 (down) / 0x000c04d0 (up), which maintain a key table at 0x02C31C86 (+scancode) and a queue.
   `PeekMessageA` thunk (win32.go) injects scripted messages into WndProc (`defaultInputScript`: Enter every 120 peeks after #200).
   Edge test `0x000c0480(scancode)` compares two 256-byte snapshots at 0x02C31DE9 + 256*idx, idx byte at 0x02C31DE8.
   Callers testing Enter/Space/Esc: 0x00240429 (menu), 0x002686fc ("any confirm key" helper). The functions 0x000c0450/60/70 are empty stubs.
-  **Open question**: nothing seen so far swaps/fills the snapshot buffers, and injected Enter does not dismiss "Press a key or controller
+  **RESOLVED (2026-10-16)**: the game's real keyboard path is DirectInput, not WM_KEY*: it calls `IDirectInput8::EnumDevices(DI8DEVCLASS_KEYBOARD)`,
+  and in the callback (0x000be3d0) creates the device via `CreateDevice(guidInstance)`, then SetDataFormat (256 objs) + Acquire; each frame
+  0x000bb9f0 polls `GetDeviceState(256)` (skips if the device pointer [kbobj+0x24] is NULL). Our EnumDevices stub never called the callback, so the
+  keyboard never existed. Fixed in d3d9.go (`EnumDevices` reports a keyboard; `GetDeviceState` returns scripted DIK_RETURN 0x1C / DIK_F2 0x3C taps).
+  The WM_KEYDOWN path (0xc0390 key table) is a secondary path whose consumers (0xc0480) never ran in this session.
+  (Old open question, now moot:) nothing seen so far swaps/fills the snapshot buffers, and injected Enter does not dismiss "Press a key or controller
   button to select a game input device" (frame draw counts identical with/without injection). Last experiment: watching writes to idx byte 0x02C31DE8.
   Possibly the Mac port fills the snapshots from a Cocoa-side routine that our shim layer never calls (look for what writes idx / copies 256 bytes;
   memcpy-style host thunks bypass cpu.Read8/Write8 and so are invisible to the watchpoint).
@@ -71,6 +77,12 @@ is desynced at the start (header data); regenerate per-range if needed.
 - Rendering notes: untextured full-screen quads are skipped; texture RGBA is now always modulated (fixed grey boxes behind glyphs).
   Vertex transform tries param[20] then 19,21,17,18. The title 3D scene (character, studs) is not rendering correctly yet.
 - Missing files logged as NOT FOUND (harmless so far): MOVIES.TXT, per-level .TXT/.PTL/.PAR/... (they live inside the .DAT archives).
+
+## Run notes (long runs)
+`go build -o bin/lsw64 ./cmd/lsw64 && LSW_MAX_STEPS=40000000000 ./bin/lsw64 2>&1 | grep -vE "DInput8|D3D9-DIP|inject|GAME.DAT|NOT FOUND" > scratch/run_long.log`
+(`LSW_MAX_STEPS` overrides the step limit; ~6M steps/s on this box, 12 cores / 15GB RAM). Look at `frames/latest.png` for the current screen.
+Guest heap fix: D3DX textures keep decoded pixels host-side (`allocTextureLazy`); guest memory only allocated on LockRect (`guestBuf`) — before that,
+loading levels crashed with "guest heap exhausted".
 
 ## Next steps (priority order)
 1. Find what feeds key snapshots (or whether the prompt uses a different input path e.g. mouse/XInput); get past the prompt.

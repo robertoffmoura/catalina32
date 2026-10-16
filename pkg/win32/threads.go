@@ -281,3 +281,13 @@ func (env *Win32Env) thunkLeaveCriticalSection(c *cpu.CPU) {
 	}
 	c.Ret()
 }
+
+// thunkResetEvent: 0x00623c30 takes exactly one argument (the event handle) and is called by the worker loop
+// at 0x001e7a67 right after its WaitForSingleObject(h, INFINITE) returns.
+func (env *Win32Env) thunkResetEvent(c *cpu.CPU) {
+	if ev, ok := env.sched.events[c.Arg(0)]; ok {
+		ev.signaled = false
+	}
+	c.Regs[cpu.RegEAX] = 1
+	c.Ret()
+}

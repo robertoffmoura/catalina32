@@ -1138,9 +1138,14 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 		}
 		if lpvData != 0 && cbData > 0 && cbData <= 4096 {
 			clear(c.Mem[lpvData : lpvData+cbData])
-			// Keyboard state (256 bytes, DIK-indexed): scripted Enter taps (DIK_RETURN=0x1C) for 6 frames every 60 frames after frame 200.
-			if cbData == 256 && s.FrameCount >= 200 && (s.FrameCount-200)%60 < 6 {
-				c.Mem[lpvData+0x1C] = 0x80
+			// Keyboard state (256 bytes, DIK-indexed): scripted Enter (DIK_RETURN=0x1C) and F2 (0x3C) taps, 6 frames each, alternating every 60 frames after frame 200.
+			if cbData == 256 && s.FrameCount >= 200 {
+				switch ph := (s.FrameCount - 200) % 120; {
+				case ph < 6:
+					c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
+				case ph >= 60 && ph < 66:
+					c.Mem[lpvData+0x3C] = 0x80 // DIK_F2
+				}
 			}
 		}
 		c.Regs[cpu.RegEAX] = 0
