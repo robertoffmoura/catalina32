@@ -38,8 +38,14 @@ var renderEvery = func() int {
 	return 30
 }()
 
+var liveMode = os.Getenv("LSW_LIVE") == "1"
+var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
+
 func (s *Subsystem) wantRender(frame uint64) bool {
 	if s.CantinaDIPLogged > 0 {
+		if liveMode {
+			return frame%2 == 0 || frame%uint64(renderEvery) == 0
+		}
 		return frame%5 == 0 || frame%uint64(renderEvery) == 0
 	}
 	return frame <= 2 || frame%uint64(renderEvery) == 0
@@ -346,22 +352,70 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		u = c.ReadF32(vp + 16)
 		v = c.ReadF32(vp + 20)
 	} else if stride >= 20 && vp+stride <= uint32(len(c.Mem)) {
-		if stride <= 32 {
-			u = c.ReadF32(vp + stride - 8)
-			v = c.ReadF32(vp + stride - 4)
-		} else if stride == 48 {
-			// Cantina floor (stride 48) binds a multi-UV lightmap atlas on stage 0; shade smoothly with sandstone normal lighting
-			u = -999.0
-			v = -999.0
+		vd := s.VertexDecls[s.CurrentVertexDecl]
+		if vd != nil && !isUP && vd.HasTex0 {
+			if vd.Tex0Type == 3 && uint32(vd.Tex0Offset)+16 <= stride {
+				// D3DDECLTYPE_FLOAT4: .xy is normal/surface UV, .zw is layer0 diffuse/atlas UV
+				u = c.ReadF32(vp + uint32(vd.Tex0Offset) + 8)
+				v = c.ReadF32(vp + uint32(vd.Tex0Offset) + 12)
+				if math.Abs(float64(u)) < 0.001 && math.Abs(float64(v+1.0)) < 0.001 {
+					u = -1000.0
+					v = -1000.0
+				}
+			} else if uint32(vd.Tex0Offset)+8 <= stride {
+				u = c.ReadF32(vp + uint32(vd.Tex0Offset))
+				v = c.ReadF32(vp + uint32(vd.Tex0Offset) + 4)
+			}
 		} else {
-			// Sample base material texel (0,0) modulated by UBYTE4N 3D vertex normal lighting (preserves Jedi robe colors & door lights)
-			u = 0.0
-			v = 0.0
+			switch stride {
+			case 32, 40, 48:
+				u = c.ReadF32(vp + 24)
+				v = c.ReadF32(vp + 28)
+			case 36, 44, 52:
+				u = c.ReadF32(vp + 28)
+				v = c.ReadF32(vp + 32)
+			case 56, 64:
+				u = c.ReadF32(vp + 32)
+				v = c.ReadF32(vp + 36)
+			default:
+				u = c.ReadF32(vp + stride - 8)
+				v = c.ReadF32(vp + stride - 4)
+			}
 		}
 		// Decode packed UBYTE4N normal at vp+12 for directional 3D lighting
 		nx := float32(int(c.Mem[vp+12])-128) / 127.0
 		ny := float32(int(c.Mem[vp+13])-128) / 127.0
 		nz := float32(int(c.Mem[vp+14])-128) / 127.0
+		// Apply skeletal animation bone matrices (NuUploadSkinMatrices, 0x00070110) for skinned character meshes
+		bwOff, biOff := uint32(36), uint32(40)
+		isSkinned := stride == 44
+		if vd != nil && !isUP && vd.HasBlendWeight && vd.HasBlendIndices {
+			bwOff = uint32(vd.BlendWOffset)
+			biOff = uint32(vd.BlendIOffset)
+			isSkinned = true
+		}
+		if isSkinned && s.NumSkinMatrices > 0 && vp+bwOff+4 <= uint32(len(c.Mem)) && vp+biOff+4 <= uint32(len(c.Mem)) {
+			var bx, by, bz, bnx, bny, bnz, totalW float32
+			for k := uint32(0); k < 3; k++ {
+				wb := c.Mem[vp+bwOff+k]
+				bi := uint32(c.Mem[vp+biOff+k])
+				if wb > 0 && bi < s.NumSkinMatrices {
+					wf := float32(wb) / 255.0
+					m := s.SkinMatrices[bi]
+					bx += wf * (x*m[0] + y*m[4] + z*m[8] + m[12])
+					by += wf * (x*m[1] + y*m[5] + z*m[9] + m[13])
+					bz += wf * (x*m[2] + y*m[6] + z*m[10] + m[14])
+					bnx += wf * (nx*m[0] + ny*m[4] + nz*m[8])
+					bny += wf * (nx*m[1] + ny*m[5] + nz*m[9])
+					bnz += wf * (nx*m[2] + ny*m[6] + nz*m[10])
+					totalW += wf
+				}
+			}
+			if totalW > 0.01 {
+				x, y, z = bx, by, bz
+				nx, ny, nz = bnx, bny, bnz
+			}
+		}
 		dot := nx*0.45 + ny*0.70 - nz*0.45
 		shade := float32(0.60) + 0.40*dot
 		if shade < 0.32 {
@@ -369,14 +423,46 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		} else if shade > 1.0 {
 			shade = 1.0
 		}
-		mr, mg, mb := float32(225), float32(210), float32(185)
-		// If layer0_diffuse (PSConstants[112]) was bound by NuShaderBindMaterial, modulate by material diffuse color
+		mr, mg, mb := float32(235), float32(222), float32(198)
+		// Check material colors bound by NuShaderBindMaterial:
+		// PSConstants[112] = layer0_diffuse ([material+0xc8])
+		// VSConstants[114] = surface diffuse ([material+0x120])
+		// PSConstants[113] = ambientColor ([material+0x11c])
 		mc := s.PSConstants[112]
+		if mc[0] <= 0.01 && mc[1] <= 0.01 && mc[2] <= 0.01 {
+			mc = s.VSConstants[114]
+		}
+		if mc[0] <= 0.01 && mc[1] <= 0.01 && mc[2] <= 0.01 {
+			mc = s.PSConstants[113]
+		}
 		if mc[0] > 0.01 || mc[1] > 0.01 || mc[2] > 0.01 {
 			if mc[0] <= 1.0 && mc[1] <= 1.0 && mc[2] <= 1.0 {
-				mr = float32(math.Min(255.0, float64(0.30+0.70*mc[0])*255.0))
-				mg = float32(math.Min(255.0, float64(0.30+0.70*mc[1])*255.0))
-				mb = float32(math.Min(255.0, float64(0.30+0.70*mc[2])*255.0))
+				// If c112 is pure white (1,1,1) on an untextured FLOAT4 surface mesh, keep warm Cantina sandstone tint
+				if !(u < -900.0 && mc[0] > 0.98 && mc[1] > 0.98 && mc[2] > 0.98) {
+					mr = float32(math.Min(255.0, float64(0.20+0.80*mc[0])*255.0))
+					mg = float32(math.Min(255.0, float64(0.20+0.80*mc[1])*255.0))
+					mb = float32(math.Min(255.0, float64(0.20+0.80*mc[2])*255.0))
+				}
+			}
+		}
+		if vd != nil && !isUP && vd.HasColor0 && uint32(vd.Color0Offset)+4 <= stride {
+			col0 := c.Read32(vp + uint32(vd.Color0Offset))
+			cr := float32((col0>>16)&0xFF) / 127.0
+			cg := float32((col0>>8)&0xFF) / 127.0
+			cb := float32(col0&0xFF) / 127.0
+			if cr > 1.0 {
+				cr = 1.0
+			}
+			if cg > 1.0 {
+				cg = 1.0
+			}
+			if cb > 1.0 {
+				cb = 1.0
+			}
+			if cr > 0.02 || cg > 0.02 || cb > 0.02 {
+				mr *= 0.55 + 0.45*cr
+				mg *= 0.55 + 0.45*cg
+				mb *= 0.55 + 0.45*cb
 			}
 		}
 		r = uint8(mr * shade)
@@ -389,8 +475,10 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		return screenVertex{sx: x, sy: y, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
 	}
 
-	// Case 1: DrawPrimitiveUP 2D UI/splash quads ([-1, 1] x [-1, 1])
-	if isUP {
+	// Case 1: DrawPrimitiveUP 2D UI/splash quads ([-1, 1] x [-1, 1]), excluding 3D in-world DrawPrimitiveUP (shadows & 3D Cantina text)
+	is3DUP := isUP && (math.Abs(float64(x)) > 2.0 || math.Abs(float64(y)) > 2.0 || math.Abs(float64(z)) > 0.01 ||
+		(math.Abs(float64(s.VSConstants[17][1]-1.0)) < 0.05 && (math.Abs(float64(s.VSConstants[16][3])) > 1.0 || math.Abs(float64(s.VSConstants[18][3])) > 1.0)))
+	if isUP && !is3DUP {
 		sx := (x + 1.0) * 0.5 * float32(ScreenWidth)
 		sy := (1.0 - y) * 0.5 * float32(ScreenHeight)
 		return screenVertex{sx: sx, sy: sy, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
@@ -478,6 +566,7 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 	}
 	invArea := 1.0 / area
 	isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (maxY-minY) <= 64
+	alphaEnabled := s.RenderStates[27] != 0 || s.RenderStates[15] != 0
 
 	pix := s.Framebuffer.Pix
 	zbuf := s.ZBuffer
@@ -515,19 +604,16 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex) {
 					tg := uint8((tp >> 8) & 0xFF)
 					tb := uint8((tp >> 16) & 0xFF)
 					ta := uint8((tp >> 24) & 0xFF)
-					if is3D {
-						// In 3D opaque shaders, texture alpha is specular glossiness, not opacity
-						if tr > 0 || tg > 0 || tb > 0 {
-							r = uint8((uint16(r) * uint16(tr)) / 255)
-							g = uint8((uint16(g) * uint16(tg)) / 255)
-							b = uint8((uint16(b) * uint16(tb)) / 255)
-						}
-						a = 255
-					} else {
-						r = uint8((uint16(r) * uint16(tr)) / 255)
-						g = uint8((uint16(g) * uint16(tg)) / 255)
-						b = uint8((uint16(b) * uint16(tb)) / 255)
+					if tr == 0 && tg == 0 && tb == 0 && ta == 0 && texRes.Format != 0x31545844 {
+						continue
+					}
+					r = uint8((uint16(r) * uint16(tr)) / 255)
+					g = uint8((uint16(g) * uint16(tg)) / 255)
+					b = uint8((uint16(b) * uint16(tb)) / 255)
+					if !is3D || alphaEnabled {
 						a = uint8((uint16(a) * uint16(ta)) / 255)
+					} else {
+						a = 255
 					}
 				} else if isGlyphQuad {
 					// Procedural glyph stroke pattern derived from font atlas UV coordinates
@@ -663,7 +749,7 @@ func (s *Subsystem) exportFramePNG() {
 		return
 	}
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, s.Framebuffer); err != nil {
+	if err := fastPNG.Encode(&buf, s.Framebuffer); err != nil {
 		return
 	}
 	pngBytes := buf.Bytes()
@@ -671,6 +757,14 @@ func (s *Subsystem) exportFramePNG() {
 	s.FrameMu.Lock()
 	s.LatestPNG = pngBytes
 	s.FrameMu.Unlock()
+
+	if liveMode {
+		if s.FramesDir != "" && s.FrameCount%60 == 0 {
+			latestPath := filepath.Join(s.FramesDir, "latest.png")
+			_ = os.WriteFile(latestPath, pngBytes, 0644)
+		}
+		return
+	}
 
 	if s.FramesDir != "" && (s.FrameDrawCalls > 0 || s.FrameCount == 1 || s.FrameCount%30 == 0) {
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
@@ -696,15 +790,15 @@ func (s *Subsystem) startDisplayServer() {
 <head>
   <title>LEGO Star Wars: The Complete Saga (64-Bit Recompiled Engine)</title>
   <style>
-    body { background: #0d1117; color: #e6edf3; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 16px; }
-    h1 { font-size: 18px; margin: 0 0 6px 0; }
-    .hud { font-family: monospace; font-size: 13px; color: #58a6ff; margin-bottom: 10px; }
-    .controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 10px; }
-    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; font-family: monospace; font-size: 12px; cursor: pointer; }
+    body { background: #0d1117; color: #e6edf3; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 12px; user-select: none; }
+    h1 { font-size: 16px; margin: 0 0 4px 0; }
+    .hud { font-family: monospace; font-size: 13px; color: #58a6ff; margin-bottom: 8px; }
+    .controls { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; margin-bottom: 8px; }
+    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 10px; font-family: monospace; font-size: 12px; cursor: pointer; }
     button:hover { background: #30363d; border-color: #58a6ff; }
     button:active { background: #1f6feb; color: #fff; }
     canvas, img { border: 2px solid #30363d; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); max-width: 100%%; width: 1120px; height: auto; aspect-ratio: 16/9; background: #000; }
-    .hint { font-size: 12px; color: #8b949e; margin-top: 8px; font-family: monospace; }
+    .hint { font-size: 12px; color: #8b949e; margin-top: 6px; font-family: monospace; }
   </style>
 </head>
 <body>
@@ -754,13 +848,37 @@ func (s *Subsystem) startDisplayServer() {
         fetch('/key?dik=' + keyMap[e.code] + '&action=up', {method: 'POST'});
       }
     });
+    const screenImg = document.getElementById('screen');
+    let frameBusy = false;
+    function pumpFrame() {
+      if (frameBusy) return;
+      frameBusy = true;
+      const next = new Image();
+      next.onload = () => {
+        screenImg.src = next.src;
+        frameBusy = false;
+        setTimeout(pumpFrame, 30);
+      };
+      next.onerror = () => {
+        frameBusy = false;
+        setTimeout(pumpFrame, 80);
+      };
+      next.src = '/latest.png?t=' + performance.now();
+    }
+    pumpFrame();
+    let lastFrame = 0, lastTime = performance.now(), fps = 0;
     setInterval(async () => {
-      document.getElementById('screen').src = '/latest.png?t=' + Date.now();
       try {
         const res = await fetch('/status.json');
         const st = await res.json();
+        const now = performance.now();
+        if (lastFrame > 0 && st.frame >= lastFrame) {
+          fps = ((st.frame - lastFrame) * 1000 / Math.max(1, now - lastTime)).toFixed(1);
+        }
+        lastFrame = st.frame;
+        lastTime = now;
         document.getElementById('hud').textContent =
-          'Frame: ' + st.frame + ' | DrawCalls: ' + st.drawCalls +
+          'Frame: ' + st.frame + ' (' + fps + ' FPS) | DrawCalls: ' + st.drawCalls +
           ' | Triangles: ' + st.triangles + ' | Steps: ' + (st.steps / 1e6).toFixed(1) + 'M';
         autoMode = st.autoKeys;
         document.getElementById('autokeys-btn').textContent = 'AutoKeys: ' + st.autoKeys;

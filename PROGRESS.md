@@ -53,9 +53,17 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
     - `VSConstants[0..3]` (`c0..c3`) = `viewProj` matrix.
   - `transformVertex` (`pkg/d3d9/raster.go`) transforms 3D vertices by `VSConstants[16..18]` (`world`) followed by `VSConstants[0..3]` (`viewProj`), decodes packed `UBYTE4N` vertex normals at `vp+12` for directional 3D lighting, and performs per-pixel Z-buffering (`s.ZBuffer`).
   - `DrawPrimitive` (`case 81`) passes `is2D := (stride == 24 || stride == 20)` so `NuFont`'s dynamic vertex buffer path (`0x00075d51`) uses 2D NDC `[-1, 1]` coordinates just like `DrawPrimitiveUP` (`0x00075d04`).
-- Texture binding: DDS loaded by `D3DXCreateTextureFromFileInMemoryEx` (0x0007912b), copied to NuTex+0x24 in 0x00079560;
-  render-command binding 0x00079620+. `s.BoundTextures[0]` in d3d9 is what the rasterizer samples.
-- Post-process `NuPostProcessRender` 0x0001d900 is intercepted as a no-op.
+  - **3D vs. 2D `DrawPrimitiveUP` (`case 83`)**: In the Cantina, `DrawPrimitiveUP` (`stride == 24`) is called during the 3D pass for character blob shadows (`v0 = (-26.52, 0.00, -50.79)`) and 3D in-world hologram save-slot text (`0.0%` and `0:03:39.95` with 3D world matrix `w` at `(-26.71, 0.71..0.87, -48.78)`), and later during the 2D HUD pass for `Press F2 or any button to start`. `transformVertex` checks `is3DUP` so 3D `DrawPrimitiveUP` calls go through the 3D `world` + `viewProj` transform instead of being plastered across the center of the screen.
+- **Skeletal Character Animation (`NuUploadSkinMatrices` at `0x00070110`)**:
+  - `0x00070110(buf)` uploads `n = [buf]` 4x4 bone matrices at `buf + 4` before drawing skinned character submeshes (`stride == 40` `decl=0x14242270` and `stride == 44`).
+  - `thunkNuUploadSkinMatrices` captures `s.SkinMatrices[0..n-1]`, `SetVertexShaderConstantF(startReg == 16)` resets `s.NumSkinMatrices = 0` for subsequent rigid meshes, and `transformVertex` applies 3-bone weighted skinning (`UBYTE4N` weights at `vd.BlendWOffset`, `UBYTE4` indices at `vd.BlendIOffset`) to both vertex positions and normals.
+- **`IDirect3DVertexDeclaration9` Parsing & `FLOAT4` `TEXCOORD0` Atlas UVs**:
+  - `CreateVertexDeclaration` (`case 86`) and `SetVertexDeclaration` (`case 87`) track the active `D3DVERTEXELEMENT9` layout (`s.VertexDecls[s.CurrentVertexDecl]`).
+  - Static Cantina surface/lightmapped meshes (`stride == 36, 48, 52, 64`) declare `u5.0` (`TEXCOORD0`) as `D3DDECLTYPE_FLOAT4` (`t3`), where `.xy` (`+0, +4`) holds normal-map tiling UVs (`surface_sampler`) and `.zw` (`+8, +12`) holds the `1024x1024` Cantina atlas UVs (`layer0_sampler`, `0x1230b9d0`), or `(0.0, -1.0)` for untextured sandstone/stucco surfaces.
+  - `NuTexRead` (`0x00078df0`) is patched at `0x00079088` (`6x NOP`) so `.GSC` scene textures with `flags & 0x3c0c != 0` are never skipped, and `thunkNuShaderParseConstantTable` (`0x001535c0`) links `layer0_sampler` (36), `layer1_sampler` (37), `surface_sampler` (42), `surface2_sampler` (43), `layer0_diffuse` (51 -> `PSConstants[112]`), `ambientColor` (0 -> `PSConstants[113]`), and `incandescentGlow` (2 -> `VSConstants[114]`).
+- **HUD Character Rings & Mip-Level Locking**:
+  - `IDirect3DTexture9::LockRect` (`case 19`) routes `Level > 0` locks to `s.mipScratchBuf` so smaller mip levels in `NuTexRead` (`0x00079250`) never overwrite mip level 0 (`res.DataPtr`).
+  - `rasterizeTriangle` discards transparent `(0,0,0,0)` texels on non-DXT1 textures (`D3DFMT_DXT5` HUD rings `0x11f90c30`/`0x11f90c50` and hearts `0x11f90c90`) and modulates RGB by texel color on all formats so black DXT1 outlines/eyes render cleanly.
 - **Threads**: Fixed by green threads (`pkg/win32/threads.go`):
   switch on Sleep / blocking WaitForSingleObject / contended critical section / preemption every 20000 steps; switches only at
   `NestDepth==0` (main sets `vm.NestDepth=-1` so WinMain counts as depth 0).
@@ -66,7 +74,8 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
   - `CantinaFirstFrame` is detected dynamically on the first 3D `DrawIndexedPrimitive` when `s.CubeTexCount >= 8` (~Frame 2467).
   - In `LSW_AUTO_KEYS=boot` mode, `GetDeviceState` taps `DIK_RETURN` at `df = 20, 60, 110` after `TitleFirstFrame` and `cf = 10, 40` after `CantinaFirstFrame` to advance automatically from Title Screen -> Main Menu -> New Game -> Save Slot 1 -> active Mos Eisley Cantina gameplay.
 - **Guest Heap**: Lazy allocation (`guestBuf` on `LockRect`/`Lock`) covers `allocTexture`, `allocSurface`, and `IDirectSound8::CreateSoundBuffer`, and `DuplicateSoundBuffer` reuses `pOrig`.
-- **macOS Quick-Run Preview (`/workspace/run_on_mac.sh`) & Universal `.app` Bundle**:
+- **macOS Quick-Run Preview (`/workspace/run_on_mac.sh`), Fast Streaming & Native Window**:
   - Cross-compiled `bin/lsw64-darwin-arm64` and `bin/lsw64-darwin-amd64` and packaged `dist/LEGO Star Wars Saga 64-Bit.app`.
-  - `/workspace/run_on_mac.sh` writes frames/saves to `/tmp/lsw64-mac-preview`, listens on `http://127.0.0.1:8088`, and forwards browser keyboard/button input directly to DirectInput8.
+  - `exportFramePNG` uses `png.BestSpeed` and skips synchronous disk writes when `LSW_LIVE=1`, while the viewer JS streams frames via a low-latency non-overlapping `Image` preloader loop.
+  - `/workspace/run_on_mac.sh` compiles and launches a native macOS Cocoa `NSWindow` viewer (`/tmp/lsw64-mac-preview/LSWViewer`) via `swiftc` (or falls back to browser if `LSW_BROWSER=1`).
 

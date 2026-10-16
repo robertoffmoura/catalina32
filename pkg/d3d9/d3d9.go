@@ -25,6 +25,31 @@ type BufferDesc struct {
 	Pixels  []uint32
 }
 
+type VertexDecl struct {
+	Summary         string
+	HasPos          bool
+	PosOffset       uint16
+	PosType         uint8
+	HasNormal       bool
+	NormalOffset    uint16
+	NormalType      uint8
+	HasColor0       bool
+	Color0Offset    uint16
+	Color0Type      uint8
+	HasTex0         bool
+	Tex0Offset      uint16
+	Tex0Type        uint8
+	HasTex1         bool
+	Tex1Offset      uint16
+	Tex1Type        uint8
+	HasBlendWeight  bool
+	BlendWOffset    uint16
+	BlendWType      uint8
+	HasBlendIndices bool
+	BlendIOffset    uint16
+	BlendIType      uint8
+}
+
 type Subsystem struct {
 	VM             *cpu.CPU
 	rendering      bool // true while the frame being drawn will be rasterized/exported
@@ -58,16 +83,22 @@ type Subsystem struct {
 	defaultSwapChn  uint32
 	sharedAudioBuf  uint32
 	dupDSBuffer     uint32
+	mipScratchBuf   uint32
 
-	Resources      map[uint32]*BufferDesc
-	RenderStates   map[uint32]uint32
-	BoundTextures  [16]uint32
-	StreamSources  [16]uint32
-	StreamOffsets  [16]uint32
-	StreamStrides  [16]uint32
-	BoundIndices   uint32
-	VSConstants    [256][4]float32
-	PSConstants    [256][4]float32
+	Resources         map[uint32]*BufferDesc
+	VertexDecls       map[uint32]*VertexDecl
+	CurrentVertexDecl uint32
+	RenderStates      map[uint32]uint32
+	BoundTextures     [16]uint32
+	StreamSources     [16]uint32
+	StreamOffsets     [16]uint32
+	StreamStrides     [16]uint32
+	BoundIndices      uint32
+	VSConstants       [256][4]float32
+	PSConstants       [256][4]float32
+	SkinMatrices      [64][16]float32
+	NumSkinMatrices   uint32
+	SkinLogCount      int
 
 	Framebuffer    *image.RGBA
 	ZBuffer        []float32
@@ -104,6 +135,7 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		nextVTableAddr: VTableArenaBase,
 		nextTrampAddr:  TrampArenaBase,
 		Resources:      make(map[uint32]*BufferDesc),
+		VertexDecls:    make(map[uint32]*VertexDecl),
 		RenderStates:   make(map[uint32]uint32),
 		AutoKeysMode:   autoKeys,
 		TraceLog:       true,
@@ -281,8 +313,37 @@ func (s *Subsystem) RegisterIndirectXThunks(c *cpu.CPU) {
 
 	// Skip fullscreen bloom/blur post-processing pass over software framebuffer
 	c.RegisterIntercept(0x0001d900, "NuPostProcessRender", s.thunkReturnZero)
+	// Prevent directional lightmap binding from overwriting stage 0 diffuse texture (layer0_sampler)
+	c.RegisterIntercept(0x00070730, "NuBindLightmapsA", s.thunkReturnZero)
+	c.RegisterIntercept(0x000708a0, "NuBindLightmapsB", s.thunkReturnZero)
+	// Capture skeletal animation bone matrices uploaded for skinned character meshes
+	c.RegisterIntercept(0x00070110, "NuUploadSkinMatrices", s.thunkNuUploadSkinMatrices)
 	// Populate NuShader constant & sampler descriptors so NuShaderBindMaterial (0x001538f0) binds textures & material colors
 	c.RegisterIntercept(0x001535c0, "NuShaderParseConstantTable", s.thunkNuShaderParseConstantTable)
+	// Patch NuTexRead (0x00078df0) at 0x00079088 (jne 0x000791d0 -> 6x NOP) so .GSC textures with flags & 0x3c0c are never skipped
+	for i := uint32(0); i < 6; i++ {
+		c.Mem[0x00079088+i] = 0x90
+	}
+}
+
+func (s *Subsystem) thunkNuUploadSkinMatrices(c *cpu.CPU) {
+	buf := c.Arg(0)
+	if buf != 0 && buf+4 <= uint32(len(c.Mem)) {
+		n := c.Read32(buf)
+		if n > 64 {
+			n = 64
+		}
+		s.NumSkinMatrices = n
+		ptr := buf + 4
+		for i := uint32(0); i < n && ptr+64 <= uint32(len(c.Mem)); i++ {
+			for j := uint32(0); j < 16; j++ {
+				s.SkinMatrices[i][j] = c.ReadF32(ptr + j*4)
+			}
+			ptr += 64
+		}
+	}
+	c.Regs[cpu.RegEAX] = 0
+	c.Ret()
 }
 
 func (s *Subsystem) thunkNuShaderParseConstantTable(c *cpu.CPU) {
@@ -296,16 +357,52 @@ func (s *Subsystem) thunkNuShaderParseConstantTable(c *cpu.CPU) {
 		}
 	}
 	if shader != 0 {
-		// Node 36: layer0_sampler -> sampler stage 0
+		// Node 36: layer0_sampler ([material+0xb8]) -> sampler stage 0
 		node36 := shader + 0x1c + 36*12
 		c.Write16(node36+0x00, 0)
 		c.Write32(node36+0x04, 0x24000000|(36<<16))
-		// Node 51: layer0_diffuse -> PS constant register 112
+		// Node 37: layer1_sampler ([material+0xbc]) -> sampler stage 1
+		node37 := shader + 0x1c + 37*12
+		c.Write16(node37+0x00, 1)
+		c.Write32(node37+0x04, 0x24000000|(37<<16))
+		// Node 42: surface_sampler ([material+0x100]) -> sampler stage 2
+		node42 := shader + 0x1c + 42*12
+		c.Write16(node42+0x00, 2)
+		c.Write32(node42+0x04, 0x24000000|(42<<16))
+		// Node 43: surface2_sampler ([material+0xec]) -> sampler stage 3
+		node43 := shader + 0x1c + 43*12
+		c.Write16(node43+0x00, 3)
+		c.Write32(node43+0x04, 0x24000000|(43<<16))
+		// Node 51: layer0_diffuse ([material+0xc8]) -> PS constant register 112
 		node51 := shader + 0x1c + 51*12
 		c.Write16(node51+0x00, 112)
 		c.Write32(node51+0x04, 0x22000101|(51<<16))
-		c.Write32(node51+0x08, 0)
-		c.Write32(node36+0x08, node51)
+		// Node 52: layer1_diffuse ([material+0xcc]) -> PS constant register 115
+		node52 := shader + 0x1c + 52*12
+		c.Write16(node52+0x00, 115)
+		c.Write32(node52+0x04, 0x22000101|(52<<16))
+		// Node 58: surface_diffuse ([material+0xf4]) -> PS constant register 116
+		node58 := shader + 0x1c + 58*12
+		c.Write16(node58+0x00, 116)
+		c.Write32(node58+0x04, 0x22000101|(58<<16))
+		// Node 0: ambientColor ([material+0x11c]) -> PS constant register 113
+		node0 := shader + 0x1c + 0*12
+		c.Write16(node0+0x00, 113)
+		c.Write32(node0+0x04, 0x22000101|(0<<16))
+		// Node 2: incandescentGlow / surface diffuse ([material+0x120]) -> VS constant register 114
+		node2 := shader + 0x1c + 2*12
+		c.Write16(node2+0x00, 114)
+		c.Write32(node2+0x04, 0x12000101|(2<<16))
+
+		c.Write32(node36+0x08, node37)
+		c.Write32(node37+0x08, node42)
+		c.Write32(node42+0x08, node43)
+		c.Write32(node43+0x08, node51)
+		c.Write32(node51+0x08, node52)
+		c.Write32(node52+0x08, node58)
+		c.Write32(node58+0x08, node0)
+		c.Write32(node0+0x08, node2)
+		c.Write32(node2+0x08, 0)
 		c.Write32(shader+0x10, node36)
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -726,10 +823,57 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		s.rasterizeIndexedBatch(c, c.Arg(1), 0, 0, c.Arg(4), c.Arg(7), c.Arg(8), c.Arg(5), 65536, is32, true)
 		c.Regs[cpu.RegEAX] = 0
 	case 86: // CreateVertexDeclaration(this, pVertexElements, ppDecl)
+		pElem := c.Arg(1)
 		pp := c.Arg(2)
-		if pp != 0 {
-			c.Write32(pp, s.allocCOMObject(c, s.vtVertexDecl, 16))
+		decl := s.allocCOMObject(c, s.vtVertexDecl, 16)
+		if pElem != 0 {
+			vd := &VertexDecl{}
+			for i := uint32(0); i < 16 && pElem+i*8+8 <= uint32(len(c.Mem)); i++ {
+				stream := c.Read16(pElem + i*8 + 0)
+				if stream == 0xFF || stream > 15 {
+					break
+				}
+				off := c.Read16(pElem + i*8 + 2)
+				elType := c.Mem[pElem+i*8+4]
+				usage := c.Mem[pElem+i*8+6]
+				usageIdx := c.Mem[pElem+i*8+7]
+				switch usage {
+				case 0: // D3DDECLUSAGE_POSITION
+					if usageIdx == 0 {
+						vd.HasPos, vd.PosOffset, vd.PosType = true, off, elType
+					}
+				case 1: // D3DDECLUSAGE_BLENDWEIGHT
+					if usageIdx == 0 {
+						vd.HasBlendWeight, vd.BlendWOffset, vd.BlendWType = true, off, elType
+					}
+				case 2: // D3DDECLUSAGE_BLENDINDICES
+					if usageIdx == 0 {
+						vd.HasBlendIndices, vd.BlendIOffset, vd.BlendIType = true, off, elType
+					}
+				case 3: // D3DDECLUSAGE_NORMAL
+					if usageIdx == 0 {
+						vd.HasNormal, vd.NormalOffset, vd.NormalType = true, off, elType
+					}
+				case 5: // D3DDECLUSAGE_TEXCOORD
+					if usageIdx == 0 {
+						vd.HasTex0, vd.Tex0Offset, vd.Tex0Type = true, off, elType
+					} else if usageIdx == 1 {
+						vd.HasTex1, vd.Tex1Offset, vd.Tex1Type = true, off, elType
+					}
+				case 10: // D3DDECLUSAGE_COLOR
+					if usageIdx == 0 {
+						vd.HasColor0, vd.Color0Offset, vd.Color0Type = true, off, elType
+					}
+				}
+			}
+			s.VertexDecls[decl] = vd
 		}
+		if pp != 0 {
+			c.Write32(pp, decl)
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 87: // SetVertexDeclaration(this, pDecl)
+		s.CurrentVertexDecl = c.Arg(1)
 		c.Regs[cpu.RegEAX] = 0
 	case 91: // CreateVertexShader(this, pFunction, ppShader)
 		pp := c.Arg(2)
@@ -741,6 +885,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		startReg := int(c.Arg(1))
 		pData := c.Arg(2)
 		vecCount := int(c.Arg(3))
+		if startReg == 16 {
+			s.NumSkinMatrices = 0
+		}
 		if pData != 0 {
 			for i := 0; i < vecCount && startReg+i < 256; i++ {
 				for j := 0; j < 4; j++ {
@@ -834,11 +981,21 @@ func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, surf)
 		}
 	case 19: // LockRect(this, Level, pLockedRect, pRect, Flags)
+		lvl := c.Arg(1)
 		pLock := c.Arg(2)
 		res := s.Resources[thisPtr]
 		if pLock != 0 && res != nil {
+			var buf uint32
+			if lvl == 0 {
+				buf = s.guestBuf(c, res)
+			} else {
+				if s.mipScratchBuf == 0 {
+					s.mipScratchBuf = c.Malloc(1024 * 1024)
+				}
+				buf = s.mipScratchBuf
+			}
 			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, s.guestBuf(c, res))
+			c.Write32(pLock+4, buf)
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
