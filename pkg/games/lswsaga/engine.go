@@ -36,6 +36,8 @@ func Install(c *cpu.CPU, d3d *d3d9.Subsystem, prof *profile.Profile) {
 		c.Mem[0x00079088+i] = 0x90
 	}
 
+	d3d.InputScript = inputScript
+
 	registerLifted(c)
 }
 
