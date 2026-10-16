@@ -40,10 +40,18 @@ func loadBoundaryAddrs(path string) []uint32 {
 	return out
 }
 
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
-	binPath := "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga"
-	dataRoot := "/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData"
-	saveRoot := "/workspace/Lego Star Wars Saga/SaveData"
+	binPath := envOrDefault("LSW_BIN_PATH", "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga")
+	dataRoot := envOrDefault("LSW_DATA_ROOT", "/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData")
+	saveRoot := envOrDefault("LSW_SAVE_ROOT", "/workspace/Lego Star Wars Saga/SaveData")
+	boundaryPath := envOrDefault("LSW_BOUNDARY_JSON", "/workspace/lego_star_wars_193_boundary_catalog.json")
 
 	img, err := macho32.LoadImage(binPath)
 	if err != nil {
@@ -61,7 +69,7 @@ func main() {
 
 	crt.RegisterCRT(vm, img)
 	w32 := win32.NewWin32Env(vm, dataRoot, saveRoot)
-	boundaryAddrs := loadBoundaryAddrs("/workspace/lego_star_wars_193_boundary_catalog.json")
+	boundaryAddrs := loadBoundaryAddrs(boundaryPath)
 	w32.RegisterBoundaryThunks(vm, boundaryAddrs)
 	d3d := d3d9.NewSubsystem(vm)
 	d3d.RegisterIndirectXThunks(vm)

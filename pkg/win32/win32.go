@@ -264,46 +264,12 @@ func (env *Win32Env) thunkInitializeCriticalSection(c *cpu.CPU) {
 
 func (env *Win32Env) thunkSetEvent(c *cpu.CPU) {
 	hEvent := c.Arg(0)
-	c.Ret()
 	if ev, ok := env.sched.events[hEvent]; ok {
 		ev.signaled = true
 	}
-
-	// Check if this is NuEngine's 'BGWorkToDo' event (stored at 0x02c3d45c)
-	bgEvent := c.Read32(0x02c3d45c)
-	if hEvent != 0 && hEvent == bgEvent {
-		poolPtr := c.Read32(0x02c3d440)
-		for poolPtr != 0 {
-			jobPtr, err := c.CallGuestNested(0x0007c870, poolPtr, 0)
-			if err != nil || jobPtr == 0 {
-				break
-			}
-			c.Write32(0x02c3d43c, jobPtr)
-			c.Write32(jobPtr+8, c.Read32(jobPtr+8)|1)
-
-			savedTid := env.CurrentThreadId
-			bgTid := c.Read32(0x02b5c70c)
-			if bgTid != 0 {
-				env.CurrentThreadId = bgTid
-			}
-			fn1 := c.Read32(jobPtr)
-			fn2 := c.Read32(jobPtr + 4)
-			if env.TraceLog {
-				fmt.Printf("[BGWorker] Executing async job 0x%08x (fn1=0x%08x, fn2=0x%08x)...\n", jobPtr, fn1, fn2)
-			}
-			if fn1 != 0 {
-				_, _ = c.CallGuestNested(fn1, jobPtr)
-			}
-			if fn2 != 0 {
-				_, _ = c.CallGuestNested(fn2, jobPtr)
-			}
-			env.CurrentThreadId = savedTid
-
-			_, _ = c.CallGuestNested(0x0007c7b0, jobPtr)
-			c.Write32(0x02c3d43c, 0)
-		}
-	}
 	c.Regs[cpu.RegEAX] = 1
+	c.Ret()
+	env.yield(c)
 }
 
 func (env *Win32Env) thunkCloseHandle(c *cpu.CPU) {

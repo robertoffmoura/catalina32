@@ -660,23 +660,120 @@ func (s *Subsystem) startDisplayServer() {
 <head>
   <title>LEGO Star Wars: The Complete Saga (64-Bit Recompiled Engine)</title>
   <style>
-    body { background: #0d1117; color: #e6edf3; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
-    h1 { font-size: 20px; margin-bottom: 8px; }
-    .hud { font-family: monospace; font-size: 14px; color: #58a6ff; margin-bottom: 12px; }
-    canvas, img { border: 2px solid #30363d; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); width: 1280px; height: 720px; background: #000; }
+    body { background: #0d1117; color: #e6edf3; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 16px; }
+    h1 { font-size: 18px; margin: 0 0 6px 0; }
+    .hud { font-family: monospace; font-size: 13px; color: #58a6ff; margin-bottom: 10px; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 10px; }
+    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; font-family: monospace; font-size: 12px; cursor: pointer; }
+    button:hover { background: #30363d; border-color: #58a6ff; }
+    button:active { background: #1f6feb; color: #fff; }
+    canvas, img { border: 2px solid #30363d; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); max-width: 100%%; width: 1120px; height: auto; aspect-ratio: 16/9; background: #000; }
+    .hint { font-size: 12px; color: #8b949e; margin-top: 8px; font-family: monospace; }
   </style>
 </head>
 <body>
   <h1>LEGO Star Wars: The Complete Saga — Native 64-Bit Host Runtime</h1>
   <div class="hud" id="hud">Frame: %d | DrawCalls: %d | Triangles: %d</div>
+  <div class="controls">
+    <button onclick="tapKey(0x1C)">Enter / Start</button>
+    <button onclick="tapKey(0x3C)">F2 (P2 Start)</button>
+    <button onclick="tapKey(0x01)">Esc (Pause)</button>
+    <button onclick="tapKey(0xC8)">&#9650; Up (W)</button>
+    <button onclick="tapKey(0xD0)">&#9660; Down (S)</button>
+    <button onclick="tapKey(0xCB)">&#9664; Left (A)</button>
+    <button onclick="tapKey(0xCD)">&#9654; Right (D)</button>
+    <button onclick="tapKey(0x16)">U (Jump)</button>
+    <button onclick="tapKey(0x23)">H (Attack)</button>
+    <button onclick="tapKey(0x24)">J (Special)</button>
+    <button onclick="tapKey(0x25)">K (Switch)</button>
+    <button onclick="cycleAutoKeys()" id="autokeys-btn">AutoKeys: %s</button>
+  </div>
   <img id="screen" src="/latest.png" />
+  <div class="hint">Keyboard focus active: Arrow keys / WASD / Enter / Space / Esc / F2 / U H J K are forwarded directly to DirectInput8.</div>
   <script>
-    setInterval(() => {
+    const keyMap = {
+      'Enter': 0x1C, 'Escape': 0x01, 'Space': 0x39, 'F2': 0x3C,
+      'ArrowUp': 0xC8, 'ArrowDown': 0xD0, 'ArrowLeft': 0xCB, 'ArrowRight': 0xCD,
+      'KeyW': 0x11, 'KeyS': 0x1F, 'KeyA': 0x1E, 'KeyD': 0x20,
+      'KeyU': 0x16, 'KeyH': 0x23, 'KeyJ': 0x24, 'KeyK': 0x25
+    };
+    let autoMode = %q;
+    function tapKey(dik) {
+      fetch('/key?dik=' + dik + '&action=tap', {method: 'POST'});
+    }
+    function cycleAutoKeys() {
+      const order = ['boot', 'off', 'loop'];
+      autoMode = order[(order.indexOf(autoMode) + 1) %% order.length];
+      fetch('/autokeys?mode=' + autoMode, {method: 'POST'});
+    }
+    window.addEventListener('keydown', (e) => {
+      if (keyMap[e.code] !== undefined) {
+        e.preventDefault();
+        fetch('/key?dik=' + keyMap[e.code] + '&action=down', {method: 'POST'});
+      }
+    });
+    window.addEventListener('keyup', (e) => {
+      if (keyMap[e.code] !== undefined) {
+        e.preventDefault();
+        fetch('/key?dik=' + keyMap[e.code] + '&action=up', {method: 'POST'});
+      }
+    });
+    setInterval(async () => {
       document.getElementById('screen').src = '/latest.png?t=' + Date.now();
+      try {
+        const res = await fetch('/status.json');
+        const st = await res.json();
+        document.getElementById('hud').textContent =
+          'Frame: ' + st.frame + ' | DrawCalls: ' + st.drawCalls +
+          ' | Triangles: ' + st.triangles + ' | Steps: ' + (st.steps / 1e6).toFixed(1) + 'M';
+        autoMode = st.autoKeys;
+        document.getElementById('autokeys-btn').textContent = 'AutoKeys: ' + st.autoKeys;
+      } catch (e) {}
     }, 250);
   </script>
 </body>
-</html>`, s.FrameCount, s.DrawCallCount, s.TriangleCount)
+</html>`, s.FrameCount, s.DrawCallCount, s.TriangleCount, s.AutoKeysMode, s.AutoKeysMode)
+	})
+	mux.HandleFunc("/status.json", func(w http.ResponseWriter, r *http.Request) {
+		steps := uint64(0)
+		if s.VM != nil {
+			steps = s.VM.Steps
+		}
+		s.KeyMu.Lock()
+		ak := s.AutoKeysMode
+		s.KeyMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprintf(w, `{"frame":%d,"drawCalls":%d,"triangles":%d,"clears":%d,"steps":%d,"autoKeys":%q}`,
+			s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, steps, ak)
+	})
+	mux.HandleFunc("/key", func(w http.ResponseWriter, r *http.Request) {
+		dik, err := strconv.ParseUint(r.URL.Query().Get("dik"), 0, 8)
+		if err != nil {
+			http.Error(w, "bad dik", http.StatusBadRequest)
+			return
+		}
+		action := r.URL.Query().Get("action")
+		s.KeyMu.Lock()
+		switch action {
+		case "down":
+			s.KeyHoldUntil[dik] = s.FrameCount + 60
+		case "up":
+			s.KeyHoldUntil[dik] = 0
+		default: // "tap"
+			s.KeyHoldUntil[dik] = s.FrameCount + 10
+		}
+		s.KeyMu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/autokeys", func(w http.ResponseWriter, r *http.Request) {
+		mode := r.URL.Query().Get("mode")
+		if mode == "boot" || mode == "off" || mode == "loop" {
+			s.KeyMu.Lock()
+			s.AutoKeysMode = mode
+			s.KeyMu.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/latest.png", func(w http.ResponseWriter, r *http.Request) {
 		s.FrameMu.Lock()
@@ -691,10 +788,15 @@ func (s *Subsystem) startDisplayServer() {
 		_, _ = w.Write(data)
 	})
 
-	for _, addr := range []string{"127.0.0.1:8080", "127.0.0.1:0"} {
+	addrs := []string{"127.0.0.1:8080", "127.0.0.1:0"}
+	if p := os.Getenv("LSW_PORT"); p != "" {
+		addrs = []string{"127.0.0.1:" + p, "127.0.0.1:0"}
+	}
+	for _, addr := range addrs {
 		ln, err := net.Listen("tcp", addr)
 		if err == nil {
 			s.DisplayURL = "http://" + ln.Addr().String()
+			fmt.Printf("[Display] Live viewer listening at %s\n", s.DisplayURL)
 			go func() {
 				_ = http.Serve(ln, mux)
 			}()

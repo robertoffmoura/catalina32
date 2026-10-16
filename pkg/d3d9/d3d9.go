@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"os"
 	"sync"
 
 	"lsw64/pkg/cpu"
@@ -25,7 +26,8 @@ type BufferDesc struct {
 }
 
 type Subsystem struct {
-	rendering bool // true while the frame being drawn will be rasterized/exported
+	VM             *cpu.CPU
+	rendering      bool // true while the frame being drawn will be rasterized/exported
 	nextVTableAddr uint32
 	nextTrampAddr  uint32
 
@@ -54,6 +56,8 @@ type Subsystem struct {
 	defaultBackBuf  uint32
 	defaultDepthBuf uint32
 	defaultSwapChn  uint32
+	sharedAudioBuf  uint32
+	dupDSBuffer     uint32
 
 	Resources      map[uint32]*BufferDesc
 	RenderStates   map[uint32]uint32
@@ -74,6 +78,10 @@ type Subsystem struct {
 	FrameMu        sync.Mutex
 	LatestPNG      []byte
 
+	KeyMu        sync.Mutex
+	KeyHoldUntil [256]uint64
+	AutoKeysMode string
+
 	FrameCount     uint64
 	DrawCallCount  uint64
 	TriangleCount  uint64
@@ -83,11 +91,17 @@ type Subsystem struct {
 }
 
 func NewSubsystem(c *cpu.CPU) *Subsystem {
+	autoKeys := os.Getenv("LSW_AUTO_KEYS")
+	if autoKeys == "" {
+		autoKeys = "boot"
+	}
 	s := &Subsystem{
+		VM:             c,
 		nextVTableAddr: VTableArenaBase,
 		nextTrampAddr:  TrampArenaBase,
 		Resources:      make(map[uint32]*BufferDesc),
 		RenderStates:   make(map[uint32]uint32),
+		AutoKeysMode:   autoKeys,
 		TraceLog:       true,
 	}
 
@@ -115,7 +129,11 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 	s.defaultBackBuf = s.allocSurface(c, 1280, 720, 22)
 	s.defaultDepthBuf = s.allocSurface(c, 1280, 720, 75)
 	s.defaultSwapChn = s.allocCOMObject(c, s.vtSwapChain9, 32)
-	s.initRasterizer("/workspace/lsw64/frames")
+	framesDir := os.Getenv("LSW_FRAMES_DIR")
+	if framesDir == "" {
+		framesDir = "/workspace/lsw64/frames"
+	}
+	s.initRasterizer(framesDir)
 
 	return s
 }
@@ -1097,20 +1115,6 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 var diSeen = map[[2]uint32]bool{}
 
 func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
-	if winSlot == 11 { // SetDataFormat(this, lpdf)
-		lpdf := c.Arg(1)
-		fmt.Printf("[DInput8] SetDataFormat dev=0x%08x dwSize=%d objSize=%d flags=0x%x dataSize=%d numObjs=%d rgodf=0x%08x\n",
-			c.Arg(0), c.Read32(lpdf), c.Read32(lpdf+4), c.Read32(lpdf+8), c.Read32(lpdf+12), c.Read32(lpdf+16), c.Read32(lpdf+20))
-		n := c.Read32(lpdf + 16)
-		rg := c.Read32(lpdf + 20)
-		if n > 64 {
-			n = 64
-		}
-		for i := uint32(0); i < n; i++ {
-			e := rg + i*16
-			fmt.Printf("    obj[%2d] pguid=0x%08x ofs=%d type=0x%08x flags=0x%x\n", i, c.Read32(e), c.Read32(e+4), c.Read32(e+8), c.Read32(e+12))
-		}
-	}
 	switch winSlot {
 	case 9: // GetDeviceState(this, cbData, lpvData)
 		cbData := c.Arg(1)
@@ -1121,13 +1125,35 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 		}
 		if lpvData != 0 && cbData > 0 && cbData <= 4096 {
 			clear(c.Mem[lpvData : lpvData+cbData])
-			// Keyboard state (256 bytes, DIK-indexed): scripted Enter (DIK_RETURN=0x1C) and F2 (0x3C) taps, 6 frames each, alternating every 60 frames after frame 200.
-			if cbData == 256 && s.FrameCount >= 200 {
-				switch ph := (s.FrameCount - 200) % 120; {
-				case ph < 6:
-					c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
-				case ph >= 60 && ph < 66:
-					c.Mem[lpvData+0x3C] = 0x80 // DIK_F2
+			if cbData == 256 {
+				s.KeyMu.Lock()
+				mode := s.AutoKeysMode
+				for dik := 0; dik < 256; dik++ {
+					if s.KeyHoldUntil[dik] > 0 && s.FrameCount <= s.KeyHoldUntil[dik] {
+						c.Mem[lpvData+uint32(dik)] = 0x80
+					}
+				}
+				s.KeyMu.Unlock()
+
+				f := s.FrameCount
+				switch mode {
+				case "boot":
+					// Auto-advance past initial device selection & F2 prompt, then stop so we don't spam Pause Menu.
+					switch {
+					case (f >= 200 && f < 208) || (f >= 255 && f < 263) || (f >= 365 && f < 373):
+						c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
+					case f >= 315 && f < 323:
+						c.Mem[lpvData+0x3C] = 0x80 // DIK_F2
+					}
+				case "loop":
+					if f >= 200 {
+						switch ph := (f - 200) % 120; {
+						case ph < 6:
+							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN
+						case ph >= 60 && ph < 66:
+							c.Mem[lpvData+0x3C] = 0x80 // DIK_F2
+						}
+					}
 				}
 			}
 		}
@@ -1171,8 +1197,7 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 			}
 		}
 		sb := s.allocCOMObject(c, s.vtDSBuffer8, 32)
-		dataPtr := c.Malloc(bufBytes)
-		s.Resources[sb] = &BufferDesc{DataPtr: dataPtr, Length: bufBytes}
+		s.Resources[sb] = &BufferDesc{Length: bufBytes}
 		if ppBuf != 0 {
 			c.Write32(ppBuf, sb)
 		}
@@ -1184,10 +1209,16 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 5: // DuplicateSoundBuffer(this, pDSBufferOriginal, ppDSBufferDuplicate)
+		pOrig := c.Arg(1)
 		ppDup := c.Arg(2)
-		sb := s.allocCOMObject(c, s.vtDSBuffer8, 32)
-		dataPtr := c.Malloc(65536)
-		s.Resources[sb] = &BufferDesc{DataPtr: dataPtr, Length: 65536}
+		sb := pOrig
+		if sb == 0 {
+			if s.dupDSBuffer == 0 {
+				s.dupDSBuffer = s.allocCOMObject(c, s.vtDSBuffer8, 32)
+				s.Resources[s.dupDSBuffer] = &BufferDesc{Length: 65536}
+			}
+			sb = s.dupDSBuffer
+		}
 		if ppDup != 0 {
 			c.Write32(ppDup, sb)
 		}
@@ -1233,7 +1264,7 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 				dwBytes = res.Length
 			}
 			if ppv1 != 0 {
-				c.Write32(ppv1, res.DataPtr)
+				c.Write32(ppv1, s.guestBuf(c, res))
 			}
 			if pdw1 != 0 {
 				c.Write32(pdw1, dwBytes)
