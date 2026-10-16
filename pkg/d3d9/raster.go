@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"lsw64/pkg/cpu"
+	"catalina32/pkg/cpu"
 )
 
 const (
@@ -56,15 +56,15 @@ type queuedTri struct {
 const nearW = 0.05
 
 // renderEvery: only every Nth presented frame is rasterized/exported (rendering is pure overhead for guest execution).
-// Override with LSW_RENDER_EVERY (1 = every frame, e.g. for a live display).
+// Override with C32_RENDER_EVERY (1 = every frame, e.g. for a live display).
 var renderEvery = func() int {
-	if v, err := strconv.Atoi(os.Getenv("LSW_RENDER_EVERY")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(os.Getenv("C32_RENDER_EVERY")); err == nil && v > 0 {
 		return v
 	}
 	return 30
 }()
 
-var liveMode = os.Getenv("LSW_LIVE") == "1"
+var liveMode = os.Getenv("C32_LIVE") == "1"
 var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
 
 func (s *Subsystem) wantRender(frame uint64) bool {
@@ -89,7 +89,7 @@ func (s *Subsystem) initRasterizer(framesDir string) {
 	if s.FramesDir != "" {
 		_ = os.MkdirAll(s.FramesDir, 0755)
 	}
-	if shmPath := os.Getenv("LSW_SHM_FILE"); shmPath != "" {
+	if shmPath := os.Getenv("C32_SHM_FILE"); shmPath != "" {
 		if f, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE, 0666); err == nil {
 			_ = f.Truncate(ShmTotalSize)
 			var modeByte [1]byte
@@ -1501,7 +1501,7 @@ func (s *Subsystem) startDisplayServer() {
 	})
 
 	addrs := []string{"127.0.0.1:8080", "127.0.0.1:0"}
-	if p := os.Getenv("LSW_PORT"); p != "" {
+	if p := os.Getenv("C32_PORT"); p != "" {
 		addrs = []string{"127.0.0.1:" + p, "127.0.0.1:0"}
 	}
 	for _, addr := range addrs {

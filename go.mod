@@ -1,3 +1,3 @@
-module lsw64
+module catalina32
 
 go 1.22

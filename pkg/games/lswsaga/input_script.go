@@ -1,8 +1,8 @@
 package lswsaga
 
-import "lsw64/pkg/d3d9"
+import "catalina32/pkg/d3d9"
 
-// inputScript drives unattended LSW_AUTO_KEYS runs through this game's menus and levels:
+// inputScript drives unattended C32_AUTO_KEYS runs through this game's menus and levels:
 //
 //	boot     Title -> Main Menu -> New Game -> Save Slot 1 -> Mos Eisley Cantina
 //	episode1 boot, then walk into Episode I Chapter 1 (Negotiations)

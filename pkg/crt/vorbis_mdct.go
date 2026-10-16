@@ -6,7 +6,7 @@ import (
 	"math"
 	"os"
 
-	"lsw64/pkg/cpu"
+	"catalina32/pkg/cpu"
 )
 
 // Native port of libvorbis mdct.c (mdct_backward + butterflies + bitreverse), the inverse MDCT
@@ -42,7 +42,7 @@ type mdctState struct {
 	seenN         map[int]bool
 }
 
-var mdct = &mdctState{tables: map[uint32]*mdctTables{}, seenN: map[int]bool{}, verify: os.Getenv("LSW_VERIFY_MDCT") == "1"}
+var mdct = &mdctState{tables: map[uint32]*mdctTables{}, seenN: map[int]bool{}, verify: os.Getenv("C32_VERIFY_MDCT") == "1"}
 
 func guestF32s(c *cpu.CPU, addr uint32, dst []float32) {
 	m := c.Mem[addr : addr+uint32(len(dst))*4]

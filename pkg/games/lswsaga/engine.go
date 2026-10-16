@@ -1,9 +1,9 @@
 package lswsaga
 
 import (
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/d3d9"
-	"lsw64/pkg/profile"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/d3d9"
+	"catalina32/pkg/profile"
 )
 
 // NuEngine data used by the hooks below.

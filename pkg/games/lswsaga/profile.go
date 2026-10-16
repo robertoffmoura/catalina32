@@ -1,6 +1,6 @@
 package lswsaga
 
-import "lsw64/pkg/profile"
+import "catalina32/pkg/profile"
 
 // Profile describes LEGO Star Wars: The Complete Saga, Feral Interactive i386 Mac release.
 // Addresses were identified by reverse engineering the stripped executable; see PROGRESS.md.

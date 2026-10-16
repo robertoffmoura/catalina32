@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/profile"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/profile"
 )
 
 const (
@@ -138,7 +138,7 @@ type Subsystem struct {
 	KeyHoldUntil      [256]uint64
 	AutoKeysMode      string
 	// InputScript, when set by the game profile, presses scripted keys (DIK-indexed, 0x80 = down)
-	// for the LSW_AUTO_KEYS mode in effect; used for unattended test runs.
+	// for the C32_AUTO_KEYS mode in effect; used for unattended test runs.
 	InputScript func(s *Subsystem, mode string, keys []byte)
 	CubeTexCount      uint64
 	TitleFirstFrame   uint64
@@ -156,7 +156,7 @@ type Subsystem struct {
 }
 
 func NewSubsystem(c *cpu.CPU) *Subsystem {
-	autoKeys := os.Getenv("LSW_AUTO_KEYS")
+	autoKeys := os.Getenv("C32_AUTO_KEYS")
 	if autoKeys == "" {
 		autoKeys = "boot"
 	}
@@ -167,7 +167,7 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		Resources:      make(map[uint32]*BufferDesc),
 		VertexDecls:    make(map[uint32]*VertexDecl),
 		AutoKeysMode:   autoKeys,
-		TraceLog:       os.Getenv("LSW_LIVE") != "1",
+		TraceLog:       os.Getenv("C32_LIVE") != "1",
 	}
 
 	s.vtD3D9 = s.buildVTable(c, "IDirect3D9", 32, s.handleIDirect3D9)
@@ -196,9 +196,9 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 	s.defaultDepthBuf = s.allocSurface(c, 1280, 720, 75)
 	s.defaultSwapChn = s.allocCOMObject(c, s.vtSwapChain9, 32)
 	s.dummy3DObj = s.allocCOMObject(c, s.vtDS3DBuffer, 32)
-	framesDir := os.Getenv("LSW_FRAMES_DIR")
+	framesDir := os.Getenv("C32_FRAMES_DIR")
 	if framesDir == "" {
-		framesDir = "/workspace/lsw64/frames"
+		framesDir = "frames"
 	}
 	s.initRasterizer(framesDir)
 
@@ -467,7 +467,7 @@ func (s *Subsystem) handleIDirect3D9(c *cpu.CPU, winSlot int) {
 		if pIdent != 0 {
 			clear(c.Mem[pIdent : pIdent+1100])
 			c.WriteCString(pIdent+0x000, "IndirectX")
-			c.WriteCString(pIdent+0x200, "NVIDIA GeForce GTX (lsw64)")
+			c.WriteCString(pIdent+0x200, "NVIDIA GeForce GTX 1080 Ti")
 			c.WriteCString(pIdent+0x400, "\\\\.\\DISPLAY1")
 			c.Write32(pIdent+0x428, 0x10DE) // VendorId (NVIDIA)
 			c.Write32(pIdent+0x42C, 0x0640) // DeviceId

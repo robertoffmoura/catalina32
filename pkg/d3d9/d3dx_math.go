@@ -1,6 +1,6 @@
 package d3d9
 
-import "lsw64/pkg/cpu"
+import "catalina32/pkg/cpu"
 
 // thunkD3DXMatrixMultiply implements D3DXMATRIX* D3DXMatrixMultiply(D3DXMATRIX *pOut, const D3DXMATRIX *pM1, const D3DXMATRIX *pM2).
 func thunkD3DXMatrixMultiply(c *cpu.CPU) {

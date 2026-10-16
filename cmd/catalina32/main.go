@@ -1,18 +1,19 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"runtime/pprof"
 	"sort"
 	"strconv"
 
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/crt"
-	"lsw64/pkg/d3d9"
-	"lsw64/pkg/games"
-	"lsw64/pkg/macho32"
-	"lsw64/pkg/win32"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/crt"
+	"catalina32/pkg/d3d9"
+	"catalina32/pkg/games"
+	"catalina32/pkg/macho32"
+	"catalina32/pkg/win32"
 )
 
 func envOrDefault(key, def string) string {
@@ -23,16 +24,21 @@ func envOrDefault(key, def string) string {
 }
 
 func main() {
-	binPath := envOrDefault("LSW_BIN_PATH", "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga")
-	dataRoot := envOrDefault("LSW_DATA_ROOT", "/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData")
-	saveRoot := envOrDefault("LSW_SAVE_ROOT", "/workspace/Lego Star Wars Saga/SaveData")
+	gameFlag := flag.String("game", "", "path to the game's i386 Mach-O executable (default: $C32_BIN_PATH)")
+	flag.Parse()
+	binPath := envOrDefault("C32_BIN_PATH", "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga")
+	if *gameFlag != "" {
+		binPath = *gameFlag
+	}
+	dataRoot := envOrDefault("C32_DATA_ROOT", "/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData")
+	saveRoot := envOrDefault("C32_SAVE_ROOT", "/workspace/Lego Star Wars Saga/SaveData")
 
 	img, err := macho32.LoadImage(binPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load Mach-O image: %v\n", err)
 		os.Exit(1)
 	}
-	game, err := games.Detect(img.Raw, os.Getenv("LSW_PROFILE"))
+	game, err := games.Detect(img.Raw, os.Getenv("C32_PROFILE"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -44,7 +50,7 @@ func main() {
 			modInits = append(modInits, fn)
 		}
 	}
-	fmt.Printf("[lsw64] Loaded 32-bit Mach-O (%d segments, %d sections, %d symbols, %d FDEs, %d game static initializers) -> %s\n",
+	fmt.Printf("[catalina32] Loaded 32-bit Mach-O (%d segments, %d sections, %d symbols, %d FDEs, %d game static initializers) -> %s\n",
 		len(img.Segments), len(img.Sections), len(img.Symbols), len(img.FDEs), len(modInits), prof.Name)
 
 	vm := cpu.NewCPU()
@@ -55,7 +61,7 @@ func main() {
 
 	prof.Attach(img, vm.Mem)
 	for _, sec := range img.Sections {
-		if sec.SegName == "__TEXT" && sec.SectName == "__text" && os.Getenv("LSW_NO_DCACHE") == "" {
+		if sec.SegName == "__TEXT" && sec.SectName == "__text" && os.Getenv("C32_NO_DCACHE") == "" {
 			vm.SetCodeRange(sec.Addr, sec.Addr+sec.Size-16) // leave room so decoding never runs off the end
 		}
 	}
@@ -71,10 +77,10 @@ func main() {
 	d3d := d3d9.NewSubsystem(vm)
 	d3d.RegisterIndirectXThunks(vm, prof)
 	game.Install(vm, d3d, prof)
-	fmt.Printf("[lsw64] %s\n", prof.Report())
+	fmt.Printf("[catalina32] %s\n", prof.Report())
 
 	// 1. Execute all 18 NuEngine static initializers
-	fmt.Printf("[lsw64] Running %d game C++ static initializers (__mod_init_func)...\n", len(modInits))
+	fmt.Printf("[catalina32] Running %d game C++ static initializers (__mod_init_func)...\n", len(modInits))
 	for i, fnAddr := range modInits {
 		_, err := vm.CallGuest(fnAddr)
 		if err != nil {
@@ -82,30 +88,30 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	fmt.Printf("[lsw64] All %d game C++ static initializers completed (%d instructions).\n", len(modInits), vm.Steps)
+	fmt.Printf("[catalina32] All %d game C++ static initializers completed (%d instructions).\n", len(modInits), vm.Steps)
 
 	// 2. Call the entry point: WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1)
-	fmt.Printf("[lsw64] Launching %s(0x00001000, 0, 0x%08x, 1) @ 0x%08x...\n", prof.EntryPoint, w32.CmdLineAddr, entry)
+	fmt.Printf("[catalina32] Launching %s(0x00001000, 0, 0x%08x, 1) @ 0x%08x...\n", prof.EntryPoint, w32.CmdLineAddr, entry)
 	vm.MaxSteps = 1_100_000_000
-	vm.TraceCalls = os.Getenv("LSW_TRACE_CALLS") == "1"
-	if v := os.Getenv("LSW_GUEST_PROF"); v != "" { // value = first step to sample from
+	vm.TraceCalls = os.Getenv("C32_TRACE_CALLS") == "1"
+	if v := os.Getenv("C32_GUEST_PROF"); v != "" { // value = first step to sample from
 		from, _ := strconv.ParseUint(v, 10, 64)
 		vm.TraceCalls = true
 		vm.ProfEvery, vm.ProfFrom = 997, from
 		vm.ProfSelf, vm.ProfIncl = map[uint32]uint64{}, map[uint32]uint64{}
 	}
-	if pf := os.Getenv("LSW_CPUPROF"); pf != "" {
+	if pf := os.Getenv("C32_CPUPROF"); pf != "" {
 		if f, err := os.Create(pf); err == nil {
 			_ = pprof.StartCPUProfile(f)
 			defer pprof.StopCPUProfile()
 		}
 	}
-	if v := os.Getenv("LSW_MAX_STEPS"); v != "" {
+	if v := os.Getenv("C32_MAX_STEPS"); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 			vm.MaxSteps = n
 		}
 	}
-	if os.Getenv("LSW_WATCH_KEYS") != "" {
+	if os.Getenv("C32_WATCH_KEYS") != "" {
 		seen := map[uint32]bool{}
 		vm.WatchLo, vm.WatchHi = 0x02C317E8, 0x02C319EA
 		vm.WatchFn = func(c *cpu.CPU, addr uint32, size int, write bool) {
@@ -121,7 +127,7 @@ func main() {
 	pprof.StopCPUProfile()
 	dumpGuestProfile(vm)
 	if err != nil {
-		fmt.Printf("[lsw64] WinMain stopped: %v\n  State: %s\n", err, vm.DumpState())
+		fmt.Printf("[catalina32] WinMain stopped: %v\n  State: %s\n", err, vm.DumpState())
 		fmt.Printf("  CallStack depth=%d:\n", len(vm.CallStack))
 		start := 0
 		if len(vm.CallStack) > 12 {
@@ -146,7 +152,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	fmt.Printf("[lsw64] WinMain returned EAX=0x%08x after %d instructions!\n", ret, vm.Steps)
+	fmt.Printf("[catalina32] WinMain returned EAX=0x%08x after %d instructions!\n", ret, vm.Steps)
 }
 
 // dumpGuestProfile prints the guest functions that consumed the most sampled x86 steps.

@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"sort"
 
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/macho32"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/macho32"
 )
 
 type Profile struct {

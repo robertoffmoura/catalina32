@@ -3,7 +3,7 @@ package win32
 import (
 	"fmt"
 
-	"lsw64/pkg/cpu"
+	"catalina32/pkg/cpu"
 )
 
 // Green-thread scheduler.

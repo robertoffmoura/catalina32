@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 
-	"lsw64/pkg/cpu"
+	"catalina32/pkg/cpu"
 )
 
 // registerLifted registers statically lifted 64-bit Go translations of hot NuEngine inner-loop

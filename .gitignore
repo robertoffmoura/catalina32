@@ -3,3 +3,5 @@ scratch/
 bin/
 *.png
 *.log
+/catalina32
+.DS_Store

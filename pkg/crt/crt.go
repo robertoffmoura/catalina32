@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/macho32"
-	"lsw64/pkg/profile"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/macho32"
+	"catalina32/pkg/profile"
 )
 
 const (

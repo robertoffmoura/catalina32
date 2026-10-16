@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"strings"
 
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/d3d9"
-	"lsw64/pkg/games/lswsaga"
-	"lsw64/pkg/profile"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/d3d9"
+	"catalina32/pkg/games/lswsaga"
+	"catalina32/pkg/profile"
 )
 
 // Game couples a profile with the game-specific hooks it installs.
@@ -43,5 +43,5 @@ func Detect(exe []byte, force string) (Game, error) {
 			return g, nil
 		}
 	}
-	return Game{}, fmt.Errorf("no profile for executable sha256 %s (set LSW_PROFILE to force one)", h)
+	return Game{}, fmt.Errorf("no profile for executable sha256 %s (set C32_PROFILE to force one)", h)
 }

@@ -7,7 +7,7 @@ import (
 	"os"
 	"strconv"
 
-	"lsw64/pkg/macho32"
+	"catalina32/pkg/macho32"
 )
 
 var reg32 = [8]string{"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"}

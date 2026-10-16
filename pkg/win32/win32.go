@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"lsw64/pkg/cpu"
-	"lsw64/pkg/profile"
+	"catalina32/pkg/cpu"
+	"catalina32/pkg/profile"
 )
 
 const (
@@ -50,8 +50,8 @@ func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
 	_ = os.MkdirAll(saveRoot, 0755)
 	cmdAddr := c.Malloc(256)
 	c.WriteCString(cmdAddr, "")
-	ak := os.Getenv("LSW_AUTO_KEYS")
-	liveClock := (os.Getenv("LSW_SHM_FILE") != "" || os.Getenv("LSW_LIVE") == "1") && (ak == "" || ak == "off")
+	ak := os.Getenv("C32_AUTO_KEYS")
+	liveClock := (os.Getenv("C32_SHM_FILE") != "" || os.Getenv("C32_LIVE") == "1") && (ak == "" || ak == "off")
 	return &Win32Env{
 		DataRoot:        dataRoot,
 		SaveRoot:        saveRoot,
@@ -63,7 +63,7 @@ func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
 		ModulePath:      "C:\\LEGOStarWarsSaga\\LEGOStarWarsSaga.exe",
 		CurrentThreadId: 1,
 		PerfCounter:     1000000,
-		TraceLog:        os.Getenv("LSW_LIVE") != "1",
+		TraceLog:        os.Getenv("C32_LIVE") != "1",
 		LiveClock:       liveClock,
 	}
 }
