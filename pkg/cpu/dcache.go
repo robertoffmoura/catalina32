@@ -69,6 +69,23 @@ const (
 	dCallInd   // FF /2
 	dJmpInd    // FF /4
 	dPushRM32  // FF /6
+
+	// Register-operand variants chosen at decode time (the generic kinds above handle memory forms).
+	dMovLoad32R  // 8B r32, r32
+	dMovStore32R // 89 r32, r32
+	dAluRMR32R   // 01..39 r32, r32
+	dAluRRM32R   // 03..3B r32, r32
+	dGrp1RM32R   // 81 / 83 r32, imm
+
+	// Fused compare + Jcc pairs (blocks only). The compare sets flags exactly as on its own; the
+	// pair counts as two steps. target/cond/len2 describe the Jcc.
+	dCmpRMRJcc  // 39 + Jcc
+	dCmpRRMJcc  // 3B + Jcc
+	dCmpRMIJcc  // 81/83 /7 + Jcc
+	dCmpEAXJcc  // 3D + Jcc
+	dTestRMRJcc // 85 + Jcc
+	dTestRMIJcc // F6 /0 + Jcc
+	dCmpRMI8Jcc // 80 /7 + Jcc
 )
 
 type dInst struct {
@@ -84,6 +101,11 @@ type dInst struct {
 	base  int8 // -1: none
 	index int8 // -1: none
 	scale uint8
+
+	// Fused Jcc (dCmp*Jcc / dTest*Jcc).
+	cond   uint8
+	len2   uint8
+	target uint32
 }
 
 func newDCache() []dInst {
@@ -105,6 +127,7 @@ const (
 
 type dBlock struct {
 	tag   uint32
+	steps int // guest instructions in the block (a fused pair counts as two)
 	insts []dInst
 }
 
@@ -128,9 +151,32 @@ func endsBlock(kind uint8) bool {
 	return false
 }
 
+// fusedJcc returns the fused kind for compare-like instruction d followed by a Jcc, or dSlow.
+func fusedJcc(d *dInst) uint8 {
+	switch {
+	case (d.kind == dAluRMR32 || d.kind == dAluRMR32R) && d.aux == 7:
+		return dCmpRMRJcc
+	case (d.kind == dAluRRM32 || d.kind == dAluRRM32R) && d.aux == 7:
+		return dCmpRRMJcc
+	case (d.kind == dGrp1RM32 || d.kind == dGrp1RM32R) && d.aux == 7:
+		return dCmpRMIJcc
+	case d.kind == dAluEAXImm && d.aux == 7:
+		return dCmpEAXJcc
+	case d.kind == dTestRMR32:
+		return dTestRMRJcc
+	case d.kind == dTestRMI8:
+		return dTestRMIJcc
+	case d.kind == dGrp1RM8 && d.aux == 7:
+		return dCmpRMI8Jcc
+	}
+	return dSlow
+}
+
 func (c *CPU) buildBlock(b *dBlock, eip uint32) {
 	b.tag = eip
+	b.steps = 0
 	b.insts = b.insts[:0]
+	defer func() { b.steps += len(b.insts) }()
 	span := c.CodeHi - c.CodeLo
 	for len(b.insts) < blockMax && eip-c.CodeLo < span && c.icept[eip>>6]&(1<<(eip&63)) == 0 {
 		d := &c.dcache[eip&dcacheMask]
@@ -139,6 +185,14 @@ func (c *CPU) buildBlock(b *dBlock, eip uint32) {
 		}
 		if d.kind == dSlow {
 			return
+		}
+		if n := len(b.insts); d.kind == dJcc && n > 0 {
+			if fk := fusedJcc(&b.insts[n-1]); fk != dSlow {
+				p := &b.insts[n-1]
+				p.kind, p.cond, p.len2, p.target = fk, d.aux, d.len, d.imm
+				b.steps++ // the Jcc folded into p
+				return
+			}
 		}
 		b.insts = append(b.insts, *d)
 		if endsBlock(d.kind) {
@@ -213,6 +267,7 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	m := c.Mem
 	d.tag = eip
 	d.kind = dSlow
+	d.isMem = false
 	p := eip
 	if q := p; m[q] == 0x66 || m[q] == 0x2E || m[q] == 0x0F {
 		for m[q] == 0x66 || m[q] == 0x2E {
@@ -234,6 +289,20 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	set := func(kind uint8, end uint32) {
 		d.kind = kind
 		d.len = uint8(end - eip)
+		if !d.isMem {
+			switch kind {
+			case dMovLoad32:
+				d.kind = dMovLoad32R
+			case dMovStore32:
+				d.kind = dMovStore32R
+			case dAluRMR32:
+				d.kind = dAluRMR32R
+			case dAluRRM32:
+				d.kind = dAluRRM32R
+			case dGrp1RM32:
+				d.kind = dGrp1RM32R
+			}
+		}
 	}
 
 	if pfx != 0 {
@@ -681,6 +750,61 @@ func (c *CPU) execBlock(insts []dInst) {
 				b = float64(c.getXMMF32(int(d.rm), 0))
 			}
 			c.fpuCompareEFlags(a, b)
+		case dMovLoad32R:
+			c.Regs[d.reg] = c.Regs[d.rm]
+		case dMovStore32R:
+			c.Regs[d.rm] = c.Regs[d.reg]
+		case dAluRMR32R:
+			if res, wb := c.aluOp32(int(d.aux), c.Regs[d.rm], c.Regs[d.reg]); wb {
+				c.Regs[d.rm] = res
+			}
+		case dAluRRM32R:
+			if res, wb := c.aluOp32(int(d.aux), c.Regs[d.reg], c.Regs[d.rm]); wb {
+				c.Regs[d.reg] = res
+			}
+		case dGrp1RM32R:
+			if res, wb := c.aluOp32(int(d.aux), c.Regs[d.rm], d.imm); wb {
+				c.Regs[d.rm] = res
+			}
+		case dCmpRMRJcc, dCmpRRMJcc, dCmpRMIJcc, dCmpEAXJcc:
+			var a, b uint32
+			switch d.kind {
+			case dCmpRMRJcc:
+				a, b = c.rm32(d), c.Regs[d.reg]
+			case dCmpRRMJcc:
+				a, b = c.Regs[d.reg], c.rm32(d)
+			case dCmpRMIJcc:
+				a, b = c.rm32(d), d.imm
+			default:
+				a, b = c.Regs[RegEAX], d.imm
+			}
+			c.UpdateFlagsSub32(a, b, a-b) // = aluOp32(CMP)
+			if c.Halted {
+				return
+			}
+			c.Steps++
+			c.EIP += uint32(d.len2)
+			if c.EvalCond(d.cond) {
+				c.EIP = d.target
+			}
+		case dTestRMRJcc, dTestRMIJcc, dCmpRMI8Jcc:
+			switch d.kind {
+			case dTestRMRJcc:
+				c.UpdateFlagsLogic32(c.rm32(d) & c.Regs[d.reg])
+			case dTestRMIJcc:
+				c.UpdateFlagsLogic8(c.rm8(d) & uint8(d.imm))
+			default:
+				a, b := c.rm8(d), uint8(d.imm)
+				c.UpdateFlagsSub8(a, b, a-b) // = aluOp8(CMP)
+			}
+			if c.Halted {
+				return
+			}
+			c.Steps++
+			c.EIP += uint32(d.len2)
+			if c.EvalCond(d.cond) {
+				c.EIP = d.target
+			}
 		case dNop:
 		case dMovRImm32:
 			c.Regs[d.reg] = d.imm

@@ -1954,14 +1954,10 @@ func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 		if b.tag != eip {
 			c.buildBlock(b, eip)
 		}
-		insts := b.insts
-		if len(insts) == 0 {
-			return
+		if len(b.insts) == 0 || uint64(b.steps) > limit-c.Steps {
+			return // uncached instruction, or the block would cross the next event: single-step
 		}
-		if rem := limit - c.Steps; uint64(len(insts)) > rem {
-			insts = insts[:rem]
-		}
-		c.execBlock(insts)
+		c.execBlock(b.insts)
 	}
 }
 
