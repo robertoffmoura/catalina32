@@ -82,7 +82,7 @@ func main() {
 	vm.MaxSteps = 1_200_000_000
 	if os.Getenv("LSW_WATCH_KEYS") != "" {
 		seen := map[uint32]bool{}
-		vm.WatchLo, vm.WatchHi = 0x02C31DE8, 0x02C31DE9
+		vm.WatchLo, vm.WatchHi = 0x02C317E8, 0x02C319EA
 		vm.WatchFn = func(c *cpu.CPU, addr uint32, size int, write bool) {
 			if seen[c.EIP] {
 				return

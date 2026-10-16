@@ -222,6 +222,33 @@ func (s *Subsystem) allocTexture(c *cpu.CPU, width, height, format uint32) uint3
 	return obj
 }
 
+// allocTextureLazy creates a texture object whose pixels live host-side; no guest memory is reserved until
+// the game locks it (see guestBuf). Loading hundreds of 1024x1024 textures would otherwise exhaust the guest heap.
+func (s *Subsystem) allocTextureLazy(c *cpu.CPU, width, height, format uint32) uint32 {
+	if width == 0 {
+		width = 64
+	}
+	if height == 0 {
+		height = 64
+	}
+	obj := s.allocCOMObject(c, s.vtTexture9, 32)
+	pitch := width * 4
+	bufSize := pitch * height
+	if bufSize > 4*1024*1024 {
+		bufSize = 4 * 1024 * 1024
+	}
+	s.Resources[obj] = &BufferDesc{Length: bufSize, Format: format, Width: width, Height: height, Pitch: pitch}
+	return obj
+}
+
+// guestBuf returns the resource's guest-memory backing store, allocating it on first use.
+func (s *Subsystem) guestBuf(c *cpu.CPU, res *BufferDesc) uint32 {
+	if res.DataPtr == 0 && res.Length > 0 {
+		res.DataPtr = c.Malloc(res.Length)
+	}
+	return res.DataPtr
+}
+
 func (s *Subsystem) RegisterIndirectXThunks(c *cpu.CPU) {
 	c.RegisterIntercept(0x006479f0, "Direct3DCreate9", s.thunkDirect3DCreate9)
 	c.RegisterIntercept(0x00648650, "D3DPERF_BeginEvent", s.thunkReturnZero)
@@ -787,7 +814,7 @@ func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
 		res := s.Resources[thisPtr]
 		if pLock != 0 && res != nil {
 			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, res.DataPtr)
+			c.Write32(pLock+4, s.guestBuf(c, res))
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -813,7 +840,7 @@ func (s *Subsystem) handleIDirect3DCubeTexture9(c *cpu.CPU, winSlot int) {
 		res := s.Resources[thisPtr]
 		if pLock != 0 && res != nil {
 			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, res.DataPtr)
+			c.Write32(pLock+4, s.guestBuf(c, res))
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -833,7 +860,7 @@ func (s *Subsystem) handleIDirect3DVolumeTexture9(c *cpu.CPU, winSlot int) {
 		if pLock != 0 && res != nil {
 			c.Write32(pLock+0, res.Pitch)
 			c.Write32(pLock+4, res.Pitch*res.Height)
-			c.Write32(pLock+8, res.DataPtr)
+			c.Write32(pLock+8, s.guestBuf(c, res))
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -850,7 +877,7 @@ func (s *Subsystem) handleIDirect3DSurface9(c *cpu.CPU, winSlot int) {
 		res := s.Resources[thisPtr]
 		if pLock != 0 && res != nil {
 			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, res.DataPtr)
+			c.Write32(pLock+4, s.guestBuf(c, res))
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -965,7 +992,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 		c.Write32(pSrcInfo+16, fmtCode)
 	}
 	if ppTex != 0 {
-		tex := s.allocTexture(c, w, h, fmtCode)
+		tex := s.allocTextureLazy(c, w, h, fmtCode)
 		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
 			res.Pixels = pixels
 		}
@@ -982,7 +1009,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileInMemory(c *cpu.CPU) {
 	ppTex := c.Arg(3)
 	w, h, fmtCode, pixels := s.decodeDDSInMemory(c, pSrc, srcSize)
 	if ppTex != 0 {
-		tex := s.allocTexture(c, w, h, fmtCode)
+		tex := s.allocTextureLazy(c, w, h, fmtCode)
 		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
 			res.Pixels = pixels
 		}
@@ -1050,7 +1077,7 @@ func (s *Subsystem) thunkDirectInput8Create(c *cpu.CPU) {
 func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 	switch winSlot {
 	case 3: // CreateDevice(this, rguid, lplpDirectInputDevice, pUnkOuter)
-		fmt.Printf("[DInput8] CreateDevice guid.Data1=0x%08x Data2=0x%04x (6F1D2B61=keyboard 6F1D2B60=mouse)\n", c.Read32(c.Arg(1)), c.Read16(c.Arg(1)+4))
+		fmt.Printf("[DInput8] CreateDevice guid.Data1=0x%08x Data2=0x%04x (6F1D2B61=keyboard 6F1D2B60=mouse) retEIP=0x%08x\n", c.Read32(c.Arg(1)), c.Read16(c.Arg(1)+4), c.Read32(c.Regs[cpu.RegESP]))
 		ppDev := c.Arg(2)
 		dev := s.allocCOMObject(c, s.vtDIDevice8, 16)
 		if ppDev != 0 {
@@ -1058,12 +1085,33 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 4: // EnumDevices(this, dwDevType, lpCallback, pvRef, dwFlags)
+		devClass := c.Arg(1)
+		cb := c.Arg(2)
+		pvRef := c.Arg(3)
+		// DI8DEVCLASS_ALL=0, DI8DEVCLASS_KEYBOARD=3: report one keyboard (GUID_SysKeyboard). Game controllers: none.
+		if cb != 0 && (devClass == 0 || devClass == 3) {
+			inst := c.Malloc(580) // sizeof(DIDEVICEINSTANCEA) for DX8
+			clear(c.Mem[inst : inst+580])
+			c.Write32(inst+0, 580)
+			kb := []byte{0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}
+			copy(c.Mem[inst+4:], kb)  // guidInstance
+			copy(c.Mem[inst+20:], kb) // guidProduct
+			c.Write32(inst+36, 0x00000413) // DI8DEVTYPE_KEYBOARD | (DI8DEVTYPEKEYBOARD_PCENH << 8)
+			c.WriteCString(inst+40, "Keyboard")
+			c.WriteCString(inst+300, "Keyboard")
+			if s.TraceLog {
+				fmt.Printf("[DInput8] EnumDevices(class=%d) -> reporting keyboard to callback 0x%08x\n", devClass, cb)
+			}
+			_, _ = c.CallGuestNested(cb, inst, pvRef)
+		}
 		c.Regs[cpu.RegEAX] = 0
 	default:
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
 }
+
+var diSeen = map[[2]uint32]bool{}
 
 func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 	if winSlot == 11 { // SetDataFormat(this, lpdf)
@@ -1084,8 +1132,16 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 	case 9: // GetDeviceState(this, cbData, lpvData)
 		cbData := c.Arg(1)
 		lpvData := c.Arg(2)
+		if k := [2]uint32{c.Arg(0), cbData}; !diSeen[k] {
+			diSeen[k] = true
+			fmt.Printf("[DInput8] GetDeviceState dev=0x%08x cbData=%d buf=0x%08x frame=%d\n", k[0], k[1], lpvData, s.FrameCount)
+		}
 		if lpvData != 0 && cbData > 0 && cbData <= 4096 {
 			clear(c.Mem[lpvData : lpvData+cbData])
+			// Keyboard state (256 bytes, DIK-indexed): scripted Enter taps (DIK_RETURN=0x1C) for 6 frames every 60 frames after frame 200.
+			if cbData == 256 && s.FrameCount >= 200 && (s.FrameCount-200)%60 < 6 {
+				c.Mem[lpvData+0x1C] = 0x80
+			}
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 10: // GetDeviceData(this, cbObjectData, rgdod, pdwInOut, dwFlags)
