@@ -23,7 +23,8 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
 | Keyboard input reaching the game | DONE (DirectInput keyboard via `EnumDevices`; browser `/key` forwarding + `LSW_AUTO_KEYS=boot`) |
 | Get past "Press a key..." -> Main Menu -> New Game -> Save Slot 1 | DONE (automatic relative to `TitleFirstFrame` and `CantinaFirstFrame`) |
 | Mos Eisley Cantina (`LEVELS\MAP`, `qui_moscant1.ogg`) 3D scene + HUD rendering | DONE (`frames/cantina_latest.png`, `frames/frame_2510.png` — ~20s boot-to-Cantina) |
-| Audio | STUBBED (DirectSound8 shims with lazy buffer reuse) |
+| Audio | DONE — DirectSound8 buffer mixing -> shm PCM ring -> macOS `AudioQueue` |
+| Story level entry (Episode I Ch.1 *Negotiations*) | DONE — `LSW_AUTO_KEYS=episode1`; in-level gameplay renders + music |
 | Speed | ~150M guest steps (~20s wall time) from cold boot to playable 3D Mos Eisley Cantina |
 | Universal macOS .app packaging & `/workspace/run_on_mac.sh` | DONE (`bin/lsw64-darwin-arm64`, `bin/lsw64-darwin-amd64`, `dist/LEGO Star Wars Saga 64-Bit.app`) |
 
@@ -84,3 +85,25 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
     4. **Incremental Scanline Rasterizer (`rasterizeTriangle`)**: Steps barycentric coordinates (`w0 += dw0dx`, `w1 += dw1dx`) incrementally across scanlines, performs early Z-rejection before color/UV math, and uses power-of-two bitmasks (`wMask`, `hMask`) instead of per-pixel `math.Floor` and `%`.
     5. **Dirty Framebuffer Tracking (`s.fbDirty`)**: Skips redundant `clearFramebuffer`/`clearZBuffer` loops and empty-frame exports during loading screens when `s.FrameDrawCalls == 0`.
     6. **Green-Thread Quantum Reset (`SetPreemptInterval`)**: Updated `switchTo` (`pkg/win32/threads.go`) to advance `c.nextPreempt = c.Steps + interval` (`400,000` steps for background `.GSC` loader threads), cutting Title Screen boot time to `4.5s` (`Frame #139`, `68 FPS` menu) and Mos Eisley Cantina load time to `19.5s` (`Frame #490`, `14–22+ FPS` in Cantina).
+
+## Generalization Architecture (Open-Source 32-Bit Feral / IndirectX Mac Game Runner)
+To ensure this runtime can be open-sourced on GitHub as a general runner for 32-bit Feral Interactive (`MacDoze` + `IndirectX`) and Traveller's Tales (`NuEngine`) macOS games (*LEGO Star Wars*, *LEGO Indiana Jones*, *LEGO Batman*, *LEGO Harry Potter*, *LEGO Lord of the Rings*, *BioShock*, *Borderlands*, etc.), all future work must adhere to these separation-of-concerns rules:
+1. **Strict 3-Layer Separation**:
+   - **Layer 1 (`pkg/macho32`, `pkg/cpu`, `pkg/crt`)**: Pure 32-bit `i386` Mach-O loader, CPU/FPU/SSE2 emulator, and `libSystem.B.dylib` (`libc`/`libm`/`pthread`) shims — zero game-specific or Win32-specific assumptions.
+   - **Layer 2 (`pkg/win32`, `pkg/d3d9`)**: Generic Feral `MacDoze` (Win32 Kernel32/User32/Advapi32, cooperative green threads, VFS) and `IndirectX` (`IDirect3D9`, `IDirect3DDevice9`, `D3DX9`, `IDirectInput8A`, `IDirectSound8`, `Bink`) COM interfaces.
+   - **Layer 3 (Per-Binary / Engine Profile)**: All binary-specific addresses (`WinMain`, `NuEngineSplitAddr`, boundary function catalog, and optional lifted hot functions in `pkg/lifted`) should be driven by a binary profile or symbol/signature scanner rather than scattered across `pkg/cpu` or `pkg/win32`.
+2. **Prefer Standard D3D9 / DirectSound8 / Win32 Interfaces Over Internal Engine Hooks**:
+   - Whenever implementing a missing feature (audio, shaders, input, rendering), implement the standard `IDirect3DDevice9` / `IDirectSoundBuffer8` / `D3DXCompileShader` / `ID3DXConstantTable` interface rather than adding new hardcoded NuEngine internal address hooks.
+
+## Remaining Roadmap Toward Full Objective
+1. ~~Real Audio Output~~ — DONE: `IDirectSoundBuffer8` circular `Lock`/`Play`/`GetStatus`/`DuplicateSoundBuffer` + `mixAudioFrame` -> shm PCM ring -> `AudioQueue` in `LSWWindow` (`AudioSamples` grows continuously in-level).
+2. ~~Story Level Entry~~ — DONE: `LSW_AUTO_KEYS=episode1` walks Cantina -> Episode I room -> Chapter 1 door -> `Story` -> opening crawl -> playable *Negotiations* (`ep1_1_action.ogg`, studs collected, Force hint HUD). Next: play deeper (Force objects, combat, droids) and fix what breaks.
+3. **Opening-crawl projection bug**: crawl text lines near the camera render as huge text at the *top* of the screen plus streaks — crawl probably uses a different VS constant layout / projection than c0..c3 + c16..c18. Investigate the crawl's `SetVertexShaderConstantF` calls.
+4. **General D3D9 Shader / Multi-Core & Hardware-Accelerated Rendering**:
+   - Parallelize scanline band rasterization across host CPU cores (and/or offload triangles to Metal/OpenGL in `LSWWindow`) and support general `D3DXCompileShader` constant tables (`ID3DXConstantTable`).
+
+## Session log (latest first)
+- **Episode I entry + rasterizer clipping**:
+  - Default keyboard layout (table at VA `0x008e985c`, DIK codes): P1 block = `A D W S` (left/right/up/down), then `LCtrl`, `Space`, `K`, `J`, `U`, `H`, `Enter` (U = jump, Enter = pause/start, on-screen prompts show J = Back/Force, U = Select); P2 block = arrow keys + `[ ] \\ ' P ;` + `Backspace`. `LSW_AUTO_KEYS=episode1` now uses `W`/`D`/`A` + `U` (was wrongly pressing arrow keys = Player 2).
+  - Removed `defaultInputScript` from `thunkPeekMessageA`: it injected `WM_KEYDOWN VK_RETURN` every 120 peeks unconditionally, which (a) auto-confirmed menus (the "main menu skips straight to New Game" bug) and (b) paused gameplay. Scripted window-message input now only happens if `env.InputScript` is set explicitly.
+  - Rasterizer: 3D vertices keep clip-space `cx..cw`; `rasterizeTriangle` clips against `w = nearW (0.05)` (Sutherland–Hodgman) and fans the result into `rasterizeScreenTriangle`. Removed per-vertex `cw<=0.08 / cw>1000 / |ndc|>4` rejection and the ">660px 3D triangle" hack — fixes the black wedge over the Cantina floor near the camera. Texture UVs are now perspective-correct (u/w, v/w, 1/w).

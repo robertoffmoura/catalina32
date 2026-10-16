@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	ScreenWidth   = 1280
-	ScreenHeight  = 720
-	ShmHeaderSize = 288
-	ShmTotalSize  = ShmHeaderSize + ScreenWidth*ScreenHeight*4
+	ScreenWidth    = 1280
+	ScreenHeight   = 720
+	ShmHeaderSize  = 288
+	ShmAudioOffset = ShmHeaderSize + ScreenWidth*ScreenHeight*4
+	ShmAudioFrames = 16384
+	ShmTotalSize   = ShmAudioOffset + 8 + ShmAudioFrames*4
 )
 
 type screenVertex struct {
@@ -29,7 +31,15 @@ type screenVertex struct {
 	r, g, b, a uint8
 	u, v       float32
 	valid      bool
+	// Clip-space position (only meaningful when clip == true, i.e. a vertex transformed by the
+	// world/viewProj constants). Used to clip triangles against the near plane before projection.
+	cx, cy, cz, cw float32
+	clip           bool
+	invW           float32 // 1/w for perspective-correct texturing (1 for pre-transformed / 2D vertices)
 }
+
+// nearW is the minimum clip-space w accepted before perspective divide. Triangles crossing it are clipped.
+const nearW = 0.05
 
 // renderEvery: only every Nth presented frame is rasterized/exported (rendering is pure overhead for guest execution).
 // Override with LSW_RENDER_EVERY (1 = every frame, e.g. for a live display).
@@ -517,16 +527,14 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		cy := vp1[0]*wx + vp1[1]*wy + vp1[2]*wz + vp1[3]
 		cz := vp2[0]*wx + vp2[1]*wy + vp2[2]*wz + vp2[3]
 		cw := vp3[0]*wx + vp3[1]*wy + vp3[2]*wz + vp3[3]
-		if cw <= 0.08 || cw > 1000.0 {
+		if cw != cw || cx != cx || cy != cy || cz != cz { // NaN
 			return screenVertex{}
 		}
-		ndcX, ndcY, ndcZ := cx/cw, cy/cw, cz/cw
-		if ndcX < -4.0 || ndcX > 4.0 || ndcY < -4.0 || ndcY > 4.0 {
-			return screenVertex{}
+		sv := screenVertex{r: r, g: g, b: b, a: a, u: u, v: v, valid: true, cx: cx, cy: cy, cz: cz, cw: cw, clip: true}
+		if cw > nearW {
+			projectClip(&sv)
 		}
-		sx := (ndcX + 1.0) * 0.5 * float32(ScreenWidth)
-		sy := (1.0 - ndcY) * 0.5 * float32(ScreenHeight)
-		return screenVertex{sx: sx, sy: sy, sz: ndcZ, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
+		return sv
 	}
 
 	// Fallback perspective/orthographic projection into screen center
@@ -536,13 +544,81 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	}
 	sx := float32(ScreenWidth)*0.5 + x*scale
 	sy := float32(ScreenHeight)*0.5 - y*scale
-	return screenVertex{sx: sx, sy: sy, sz: 0.5, r: r, g: g, b: b, a: a, u: u, v: v, valid: true}
+	return screenVertex{sx: sx, sy: sy, sz: 0.5, r: r, g: g, b: b, a: a, u: u, v: v, valid: true, invW: 1}
 }
 
+// projectClip performs the perspective divide + viewport transform for a clip-space vertex with w > nearW.
+func projectClip(sv *screenVertex) {
+	iw := 1.0 / sv.cw
+	sv.sx = (sv.cx*iw + 1.0) * 0.5 * float32(ScreenWidth)
+	sv.sy = (1.0 - sv.cy*iw) * 0.5 * float32(ScreenHeight)
+	sv.sz = sv.cz * iw
+	sv.invW = iw
+}
+
+func lerpU8(a, b uint8, t float32) uint8 {
+	return uint8(float32(a) + (float32(b)-float32(a))*t + 0.5)
+}
+
+// lerpClip interpolates two clip-space vertices (all attributes are linear in clip space).
+func lerpClip(a, b *screenVertex, t float32) screenVertex {
+	return screenVertex{
+		cx: a.cx + (b.cx-a.cx)*t, cy: a.cy + (b.cy-a.cy)*t, cz: a.cz + (b.cz-a.cz)*t, cw: a.cw + (b.cw-a.cw)*t,
+		r: lerpU8(a.r, b.r, t), g: lerpU8(a.g, b.g, t), b: lerpU8(a.b, b.b, t), a: lerpU8(a.a, b.a, t),
+		u: a.u + (b.u-a.u)*t, v: a.v + (b.v-a.v)*t,
+		valid: true, clip: true,
+	}
+}
+
+// rasterizeTriangle clips 3D triangles against the w = nearW plane (Sutherland–Hodgman, one plane) and
+// rasterizes the resulting polygon as a fan. Triangles fully in front of the plane go straight through.
 func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes *BufferDesc) {
 	if !v0.valid || !v1.valid || !v2.valid {
 		return
 	}
+	if !(v0.clip && v1.clip && v2.clip) || (v0.cw > nearW && v1.cw > nearW && v2.cw > nearW) {
+		if !v0.clip && v0.invW == 0 {
+			v0.invW = 1
+		}
+		if !v1.clip && v1.invW == 0 {
+			v1.invW = 1
+		}
+		if !v2.clip && v2.invW == 0 {
+			v2.invW = 1
+		}
+		s.rasterizeScreenTriangle(c, v0, v1, v2, texRes)
+		return
+	}
+	if v0.cw <= nearW && v1.cw <= nearW && v2.cw <= nearW {
+		return // entirely behind the near plane
+	}
+	in := [3]*screenVertex{&v0, &v1, &v2}
+	var out [4]screenVertex
+	n := 0
+	for i := 0; i < 3; i++ {
+		a, b := in[i], in[(i+1)%3]
+		da, db := a.cw-nearW, b.cw-nearW
+		if da > 0 {
+			out[n] = *a
+			n++
+		}
+		if (da > 0) != (db > 0) {
+			out[n] = lerpClip(a, b, da/(da-db))
+			n++
+		}
+	}
+	for i := 0; i < n; i++ {
+		if out[i].cw <= 0 {
+			out[i].cw = nearW
+		}
+		projectClip(&out[i])
+	}
+	for i := 1; i+1 < n; i++ {
+		s.rasterizeScreenTriangle(c, out[0], out[i], out[i+1], texRes)
+	}
+}
+
+func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes *BufferDesc) {
 	minXf, maxXf := v0.sx, v0.sx
 	if v1.sx < minXf {
 		minXf = v1.sx
@@ -574,9 +650,6 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 		return
 	}
 	is3D := v0.sz > 0.001 || v1.sz > 0.001 || v2.sz > 0.001
-	if is3D && (maxY-minY) > 660 && (maxX-minX) > 660 {
-		return
-	}
 	if minX < 0 {
 		minX = 0
 	}
@@ -626,6 +699,10 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 	}
 
 	v0r, v1r, v2r := float32(v0.r), float32(v1.r), float32(v2.r)
+	perspTex := sampleTex && v0.invW > 0 && v1.invW > 0 && v2.invW > 0 &&
+		(v0.invW != v1.invW || v1.invW != v2.invW)
+	u0w, u1w, u2w := v0.u*v0.invW, v1.u*v1.invW, v2.u*v2.invW
+	t0w, t1w, t2w := v0.v*v0.invW, v1.v*v1.invW, v2.v*v2.invW
 	v0g, v1g, v2g := float32(v0.g), float32(v1.g), float32(v2.g)
 	v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
 	v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
@@ -651,8 +728,15 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 					skip := false
 
 					if sampleTex {
-						tu := w0*v0.u + w1*v1.u + w2*v2.u
-						tv := w0*v0.v + w1*v1.v + w2*v2.v
+						var tu, tv float32
+						if perspTex {
+							iw := w0*v0.invW + w1*v1.invW + w2*v2.invW
+							tu = (w0*u0w + w1*u1w + w2*u2w) / iw
+							tv = (w0*t0w + w1*t1w + w2*t2w) / iw
+						} else {
+							tu = w0*v0.u + w1*v1.u + w2*v2.u
+							tv = w0*v0.v + w1*v1.v + w2*v2.v
+						}
 						var tx, ty uint32
 						if isPow2 {
 							ui := int32(tu * texWf)
@@ -893,6 +977,126 @@ func (s *Subsystem) exportFramePNG() {
 			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", s.FrameCount))
 			_ = os.WriteFile(framePath, pngBytes, 0644)
 		}
+	}
+}
+
+func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
+	const outFrames = 1024
+	var mixL [outFrames]int32
+	var mixR [outFrames]int32
+	anyPlaying := false
+	memLen := uint32(len(c.Mem))
+
+	for _, ab := range s.AudioBuffers {
+		if ab == nil || !ab.Playing || ab.Length == 0 {
+			continue
+		}
+		ch := uint32(ab.Channels)
+		if ch == 0 || ch > 2 {
+			ch = 2
+		}
+		bps := uint32(ab.BitsPerSample / 8)
+		if bps == 0 || bps > 2 {
+			bps = 2
+		}
+		frameBytes := ch * bps
+		freq := ab.Frequency
+		if freq < 4000 || freq > 96000 {
+			freq = ab.SampleRate
+		}
+		if freq < 4000 || freq > 96000 {
+			freq = 44100
+		}
+
+		if s.ShmFile != nil && ab.DataPtr != 0 && ab.DataPtr+ab.Length <= memLen && ab.Volume > -5000 {
+			gain := float32(1.0)
+			if ab.Volume < 0 {
+				gain = float32(math.Pow(10.0, float64(ab.Volume)/2000.0))
+			}
+			for i := 0; i < outFrames; i++ {
+				srcIdx := uint32(uint64(i) * uint64(freq) / 44100)
+				off := ab.PlayCursor + srcIdx*frameBytes
+				if off+frameBytes > ab.Length {
+					if ab.Looping {
+						off %= ab.Length
+						off -= off % frameBytes
+					} else {
+						break
+					}
+				}
+				p := ab.DataPtr + off
+				if p+frameBytes > memLen {
+					break
+				}
+				var l, r int16
+				if bps == 2 {
+					l = int16(binary.LittleEndian.Uint16(c.Mem[p : p+2]))
+					if ch == 2 {
+						r = int16(binary.LittleEndian.Uint16(c.Mem[p+2 : p+4]))
+					} else {
+						r = l
+					}
+				} else {
+					l = (int16(c.Mem[p]) - 128) << 8
+					if ch == 2 {
+						r = (int16(c.Mem[p+1]) - 128) << 8
+					} else {
+						r = l
+					}
+				}
+				if l != 0 || r != 0 {
+					anyPlaying = true
+				}
+				mixL[i] += int32(float32(l) * gain)
+				mixR[i] += int32(float32(r) * gain)
+			}
+		}
+
+		advFrames := uint32(uint64(outFrames) * uint64(freq) / 44100)
+		advBytes := advFrames * frameBytes
+		if ab.PlayCursor+advBytes >= ab.Length {
+			if ab.Looping {
+				ab.PlayCursor = (ab.PlayCursor + advBytes) % ab.Length
+				ab.PlayCursor -= ab.PlayCursor % frameBytes
+			} else {
+				ab.PlayCursor = 0
+				ab.Playing = false
+			}
+		} else {
+			ab.PlayCursor += advBytes
+		}
+	}
+
+	if s.ShmFile != nil && anyPlaying {
+		var pcm [outFrames * 4]byte
+		for i := 0; i < outFrames; i++ {
+			l, r := mixL[i], mixR[i]
+			if l > 32767 {
+				l = 32767
+			} else if l < -32768 {
+				l = -32768
+			}
+			if r > 32767 {
+				r = 32767
+			} else if r < -32768 {
+				r = -32768
+			}
+			binary.LittleEndian.PutUint16(pcm[i*4:i*4+2], uint16(int16(l)))
+			binary.LittleEndian.PutUint16(pcm[i*4+2:i*4+4], uint16(int16(r)))
+		}
+		ringPos := s.AudioWriteSamples % ShmAudioFrames
+		firstFrames := uint64(outFrames)
+		if ringPos+firstFrames > ShmAudioFrames {
+			firstFrames = ShmAudioFrames - ringPos
+		}
+		_, _ = s.ShmFile.WriteAt(pcm[:firstFrames*4], int64(ShmAudioOffset+8+ringPos*4))
+		if firstFrames < outFrames {
+			_, _ = s.ShmFile.WriteAt(pcm[firstFrames*4:], int64(ShmAudioOffset+8))
+		}
+		s.AudioWriteSamples += outFrames
+		var idxBuf [8]byte
+		binary.LittleEndian.PutUint64(idxBuf[:], s.AudioWriteSamples)
+		_, _ = s.ShmFile.WriteAt(idxBuf[:], int64(ShmAudioOffset))
 	}
 }
 

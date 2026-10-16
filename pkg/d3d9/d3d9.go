@@ -16,13 +16,21 @@ const (
 )
 
 type BufferDesc struct {
-	DataPtr uint32
-	Length  uint32
-	Format  uint32
-	Width   uint32
-	Height  uint32
-	Pitch   uint32
-	Pixels  []uint32
+	DataPtr       uint32
+	Length        uint32
+	Format        uint32
+	Width         uint32
+	Height        uint32
+	Pitch         uint32
+	Pixels        []uint32
+	Channels      uint16
+	SampleRate    uint32
+	BitsPerSample uint16
+	Playing       bool
+	Looping       bool
+	PlayCursor    uint32
+	Volume        int32
+	Frequency     uint32
 }
 
 type VertexDecl struct {
@@ -101,16 +109,18 @@ type Subsystem struct {
 	NumSkinMatrices   uint32
 	SkinLogCount      int
 
-	Framebuffer    *image.RGBA
-	ZBuffer        []float32
-	FramesDir      string
-	DisplayURL     string
-	FrameDrawCalls uint64
-	DIPCount       uint64
-	FrameMu        sync.Mutex
-	LatestPNG      []byte
-	LatestRGBA     []byte
-	ShmFile        *os.File
+	Framebuffer       *image.RGBA
+	ZBuffer           []float32
+	FramesDir         string
+	DisplayURL        string
+	FrameDrawCalls    uint64
+	DIPCount          uint64
+	FrameMu           sync.Mutex
+	LatestPNG         []byte
+	LatestRGBA        []byte
+	ShmFile           *os.File
+	AudioBuffers      []*BufferDesc
+	AudioWriteSamples uint64
 
 	KeyMu             sync.Mutex
 	KeyHoldUntil      [256]uint64
@@ -638,10 +648,11 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if s.rendering && (s.FrameDrawCalls > 0 || s.FrameCount == 1) {
 			s.exportFramePNG()
 		}
+		s.mixAudioFrame(c)
 		s.rendering = s.wantRender(s.FrameCount + 1)
 		if s.TraceLog && (s.FrameCount <= 10 || s.FrameCount%30 == 0) {
-			fmt.Printf("[D3D9] Present() Frame #%d completed (DrawCalls=%d, Triangles=%d, Clears=%d, LastClearColor=0x%08x)\n",
-				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.LastClearColor)
+			fmt.Printf("[D3D9] Present() Frame #%d completed (DrawCalls=%d, Triangles=%d, Clears=%d, AudioSamples=%d)\n",
+				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.AudioWriteSamples)
 		}
 		s.FrameDrawCalls = 0
 		c.Regs[cpu.RegEAX] = 0
@@ -1400,7 +1411,7 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 
 				f := s.FrameCount
 				switch mode {
-				case "boot":
+				case "boot", "episode1":
 					// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
 					if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
 						df := (f - s.TitleFirstFrame) % 50
@@ -1412,6 +1423,22 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 						cf := f - s.CantinaFirstFrame
 						if (cf >= 10 && cf < 16) || (cf >= 40 && cf < 46) {
 							c.Mem[lpvData+0x1C] = 0x80 // DIK_RETURN (select Save Slot 1 -> start Cantina gameplay)
+						}
+						if mode == "episode1" && cf >= 55 {
+							switch {
+							case cf < 100: // Cantina: walk north
+								c.Mem[lpvData+0x11] = 0x80 // DIK_W (Player 1 Up)
+							case cf < 150: // Clear the pillar, line up with the Episode I archway
+								c.Mem[lpvData+0x11] = 0x80
+								c.Mem[lpvData+0x20] = 0x80 // DIK_D (Player 1 Right)
+							case cf < 215: // Inside the Episode I room: walk left toward the Chapter 1 door
+								c.Mem[lpvData+0x1E] = 0x80 // DIK_A (Player 1 Left)
+							default: // Walk into the Chapter 1 (Negotiations) door
+								c.Mem[lpvData+0x11] = 0x80
+							}
+							if cf >= 300 && (cf%40) < 6 {
+								c.Mem[lpvData+0x16] = 0x80 // Tap DIK_U (Player 1 Jump / Confirm in chapter menu)
+							}
 						}
 					}
 				case "loop":
@@ -1459,14 +1486,40 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 		pDesc := c.Arg(1)
 		ppBuf := c.Arg(2)
 		bufBytes := uint32(65536)
-		if pDesc != 0 {
+		channels := uint16(2)
+		sampleRate := uint32(44100)
+		bits := uint16(16)
+		if pDesc != 0 && pDesc+16 <= uint32(len(c.Mem)) {
 			sz := c.Read32(pDesc + 8)
 			if sz > 0 && sz <= 16*1024*1024 {
 				bufBytes = sz
 			}
+			if pDesc+20 <= uint32(len(c.Mem)) {
+				lpwfx := c.Read32(pDesc + 16)
+				if lpwfx != 0 && lpwfx+16 <= uint32(len(c.Mem)) {
+					if ch := c.Read16(lpwfx + 2); ch >= 1 && ch <= 2 {
+						channels = ch
+					}
+					if sr := c.Read32(lpwfx + 4); sr >= 8000 && sr <= 96000 {
+						sampleRate = sr
+					}
+					if bps := c.Read16(lpwfx + 14); bps == 8 || bps == 16 {
+						bits = bps
+					}
+				}
+			}
 		}
 		sb := s.allocCOMObject(c, s.vtDSBuffer8, 32)
-		s.Resources[sb] = &BufferDesc{Length: bufBytes}
+		bd := &BufferDesc{
+			Length:        bufBytes,
+			Channels:      channels,
+			SampleRate:    sampleRate,
+			BitsPerSample: bits,
+			Frequency:     sampleRate,
+			Volume:        0,
+		}
+		s.Resources[sb] = bd
+		s.AudioBuffers = append(s.AudioBuffers, bd)
 		if ppBuf != 0 {
 			c.Write32(ppBuf, sb)
 		}
@@ -1480,14 +1533,29 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 	case 5: // DuplicateSoundBuffer(this, pDSBufferOriginal, ppDSBufferDuplicate)
 		pOrig := c.Arg(1)
 		ppDup := c.Arg(2)
-		sb := pOrig
-		if sb == 0 {
-			if s.dupDSBuffer == 0 {
-				s.dupDSBuffer = s.allocCOMObject(c, s.vtDSBuffer8, 32)
-				s.Resources[s.dupDSBuffer] = &BufferDesc{Length: 65536}
+		sb := s.allocCOMObject(c, s.vtDSBuffer8, 32)
+		var bd *BufferDesc
+		if orig := s.Resources[pOrig]; orig != nil {
+			bd = &BufferDesc{
+				DataPtr:       orig.DataPtr,
+				Length:        orig.Length,
+				Channels:      orig.Channels,
+				SampleRate:    orig.SampleRate,
+				BitsPerSample: orig.BitsPerSample,
+				Frequency:     orig.Frequency,
+				Volume:        orig.Volume,
 			}
-			sb = s.dupDSBuffer
+		} else {
+			bd = &BufferDesc{
+				Length:        65536,
+				Channels:      2,
+				SampleRate:    44100,
+				BitsPerSample: 16,
+				Frequency:     44100,
+			}
 		}
+		s.Resources[sb] = bd
+		s.AudioBuffers = append(s.AudioBuffers, bd)
 		if ppDup != 0 {
 			c.Write32(ppDup, sb)
 		}
@@ -1506,44 +1574,148 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 		pPlay := c.Arg(1)
 		pWrite := c.Arg(2)
 		pos := uint32(0)
+		writePos := uint32(4096)
 		if res != nil && res.Length > 0 {
-			pos = uint32((c.Steps / 100) % uint64(res.Length))
+			pos = res.PlayCursor % res.Length
+			writePos = (pos + 4096) % res.Length
 		}
 		if pPlay != 0 {
 			c.Write32(pPlay, pos)
 		}
 		if pWrite != 0 {
-			c.Write32(pWrite, (pos+4096)%65536)
+			c.Write32(pWrite, writePos)
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 6: // GetVolume(this, plVolume)
+		pVol := c.Arg(1)
+		if pVol != 0 {
+			vol := int32(0)
+			if res != nil {
+				vol = res.Volume
+			}
+			c.Write32(pVol, uint32(vol))
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 8: // GetFrequency(this, pdwFrequency)
+		pFreq := c.Arg(1)
+		if pFreq != 0 {
+			freq := uint32(44100)
+			if res != nil && res.Frequency > 0 {
+				freq = res.Frequency
+			}
+			c.Write32(pFreq, freq)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 9: // GetStatus(this, pdwStatus)
 		pStatus := c.Arg(1)
 		if pStatus != 0 {
-			c.Write32(pStatus, 0)
+			status := uint32(0)
+			if res != nil && res.Playing {
+				status |= 0x1 // DSBSTATUS_PLAYING
+				if res.Looping {
+					status |= 0x4 // DSBSTATUS_LOOPING
+				}
+			}
+			c.Write32(pStatus, status)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 11: // Lock(this, dwOffset, dwBytes, ppvAudioPtr1, pdwAudioBytes1, ppvAudioPtr2, pdwAudioBytes2, dwFlags)
+		dwOffset := c.Arg(1)
 		dwBytes := c.Arg(2)
 		ppv1 := c.Arg(3)
 		pdw1 := c.Arg(4)
 		ppv2 := c.Arg(5)
 		pdw2 := c.Arg(6)
-		if res != nil {
+		dwFlags := c.Arg(7)
+		if res != nil && res.Length > 0 {
+			base := s.guestBuf(c, res)
+			if (dwFlags & 0x2) != 0 { // DSBLOCK_ENTIREBUFFER
+				dwBytes = res.Length
+			}
+			if (dwFlags & 0x1) != 0 { // DSBLOCK_FROMWRITECURSOR
+				dwOffset = (res.PlayCursor + 4096) % res.Length
+			} else {
+				dwOffset %= res.Length
+			}
 			if dwBytes == 0 || dwBytes > res.Length {
 				dwBytes = res.Length
 			}
+			bytes1 := dwBytes
+			bytes2 := uint32(0)
+			if dwOffset+dwBytes > res.Length {
+				bytes1 = res.Length - dwOffset
+				bytes2 = (dwOffset + dwBytes) - res.Length
+			}
 			if ppv1 != 0 {
-				c.Write32(ppv1, s.guestBuf(c, res))
+				c.Write32(ppv1, base+dwOffset)
 			}
 			if pdw1 != 0 {
-				c.Write32(pdw1, dwBytes)
+				c.Write32(pdw1, bytes1)
+			}
+			if ppv2 != 0 {
+				if bytes2 > 0 {
+					c.Write32(ppv2, base)
+				} else {
+					c.Write32(ppv2, 0)
+				}
+			}
+			if pdw2 != 0 {
+				c.Write32(pdw2, bytes2)
+			}
+		} else {
+			if ppv1 != 0 {
+				c.Write32(ppv1, 0)
+			}
+			if pdw1 != 0 {
+				c.Write32(pdw1, 0)
+			}
+			if ppv2 != 0 {
+				c.Write32(ppv2, 0)
+			}
+			if pdw2 != 0 {
+				c.Write32(pdw2, 0)
 			}
 		}
-		if ppv2 != 0 {
-			c.Write32(ppv2, 0)
+		c.Regs[cpu.RegEAX] = 0
+	case 12: // Play(this, dwReserved1, dwPriority, dwFlags)
+		if res != nil {
+			res.Playing = true
+			res.Looping = (c.Arg(3) & 0x1) != 0
 		}
-		if pdw2 != 0 {
-			c.Write32(pdw2, 0)
+		c.Regs[cpu.RegEAX] = 0
+	case 13: // SetCurrentPosition(this, dwNewPosition)
+		if res != nil && res.Length > 0 {
+			res.PlayCursor = c.Arg(1) % res.Length
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 14: // SetFormat(this, pcfxFormat)
+		lpwfx := c.Arg(1)
+		if res != nil && lpwfx != 0 && lpwfx+16 <= uint32(len(c.Mem)) {
+			if ch := c.Read16(lpwfx + 2); ch >= 1 && ch <= 2 {
+				res.Channels = ch
+			}
+			if sr := c.Read32(lpwfx + 4); sr >= 8000 && sr <= 96000 {
+				res.SampleRate = sr
+				res.Frequency = sr
+			}
+			if bps := c.Read16(lpwfx + 14); bps == 8 || bps == 16 {
+				res.BitsPerSample = bps
+			}
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 15: // SetVolume(this, lVolume)
+		if res != nil {
+			res.Volume = int32(c.Arg(1))
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 17: // SetFrequency(this, dwFrequency)
+		if res != nil {
+			res.Frequency = c.Arg(1)
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 18: // Stop(this)
+		if res != nil {
+			res.Playing = false
 		}
 		c.Regs[cpu.RegEAX] = 0
 	default:

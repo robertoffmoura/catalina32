@@ -750,12 +750,8 @@ func (env *Win32Env) thunkRegisterClassExA(c *cpu.CPU) {
 // thunkPeekMessageA delivers scripted/host input as window messages straight to the game's WndProc.
 func (env *Win32Env) thunkPeekMessageA(c *cpu.CPU) {
 	env.peekCount++
-	if env.WndProc != 0 {
-		script := env.InputScript
-		if script == nil {
-			script = defaultInputScript
-		}
-		if msg, wp, lp, ok := script(env.peekCount); ok {
+	if env.WndProc != 0 && env.InputScript != nil {
+		if msg, wp, lp, ok := env.InputScript(env.peekCount); ok {
 			if env.TraceLog {
 				fmt.Printf("[Win32] inject msg=0x%x wParam=0x%x lParam=0x%08x (peek #%d)\n", msg, wp, lp, env.peekCount)
 			}
@@ -764,19 +760,4 @@ func (env *Win32Env) thunkPeekMessageA(c *cpu.CPU) {
 	}
 	c.Regs[cpu.RegEAX] = 0 // no message left in the queue
 	c.Ret()
-}
-
-// defaultInputScript taps Enter (scancode 0x1C) periodically so menus can be driven without a real keyboard.
-func defaultInputScript(n uint64) (msg, wParam, lParam uint32, ok bool) {
-	const period = 120
-	if n < 200 {
-		return 0, 0, 0, false
-	}
-	switch (n - 200) % period {
-	case 100:
-		return 0x100, 0x0D, 0x1C << 16, true // WM_KEYDOWN VK_RETURN
-	case 106:
-		return 0x101, 0x0D, 0xC0000000 | 0x1C<<16, true // WM_KEYUP VK_RETURN
-	}
-	return 0, 0, 0, false
 }
