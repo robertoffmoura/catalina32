@@ -5,3 +5,4 @@ bin/
 *.log
 /catalina32
 .DS_Store
+/pkg/games/lswsaga/aot_gen.go

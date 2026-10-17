@@ -264,6 +264,7 @@ func le32(m []byte, p uint32) uint32 {
 
 // decodeCached decodes the instruction at eip into d (d.kind = dSlow if the form is not cached).
 func (c *CPU) decodeCached(d *dInst, eip uint32) {
+	c.dcacheUsed = true
 	m := c.Mem
 	d.tag = eip
 	d.kind = dSlow

@@ -518,12 +518,19 @@ func (c *CPU) Step() {
 
 	// Check if current EIP is intercepted by a host thunk or lifted function
 	if c.EIP >= ArenaSize || c.icept[c.EIP>>6]&(1<<(c.EIP&63)) != 0 {
-		if thunk, ok := c.Intercepts[c.EIP]; ok {
-			c.Steps++
-			thunk(c)
-			return
+		e := &c.thunkCache[c.EIP&uint32(len(c.thunkCache)-1)]
+		if e.fn == nil || e.eip != c.EIP {
+			fn, ok := c.Intercepts[c.EIP]
+			if !ok {
+				goto decode
+			}
+			e.eip, e.fn = c.EIP, fn
 		}
+		c.Steps++
+		e.fn(c)
+		return
 	}
+decode:
 
 	if c.EIP >= c.CodeLo && c.EIP < c.CodeHi {
 		d := &c.dcache[c.EIP&dcacheMask]
@@ -536,7 +543,19 @@ func (c *CPU) Step() {
 			return
 		}
 	}
+	c.stepFull()
+}
 
+// StepRaw executes the instruction at EIP with the full decoder, ignoring intercepts and the
+// decoded-instruction cache (used by ahead-of-time compiled code for instructions it does not
+// translate).
+func (c *CPU) StepRaw() {
+	if !c.Halted {
+		c.stepFull()
+	}
+}
+
+func (c *CPU) stepFull() {
 	startEIP := c.EIP
 	c.Steps++
 

@@ -79,7 +79,11 @@ type CPU struct {
 	FreeBlocks map[uint32][]uint32 // size class -> free list
 
 	// Intercept table (stubs, MacDoze, IndirectX, COM vtables, Lifted functions)
-	Intercepts   map[uint32]ThunkFunc
+	Intercepts map[uint32]ThunkFunc
+	thunkCache [1024]struct {
+		eip uint32
+		fn  ThunkFunc
+	} // direct-mapped cache in front of Intercepts (cleared when intercepts change)
 	icept        []uint64 // bitmap over guest addresses: fast pre-check before the Intercepts map lookup
 	InterceptTag map[uint32]string
 
@@ -98,6 +102,7 @@ type CPU struct {
 	blocks           []dBlock
 	CodeLo, CodeHi   uint32
 	CodeCacheFlushes uint64
+	dcacheUsed       bool // something was decoded; only then do intercept changes need a flush
 	// Stores with addr-CodeHi <= writeSpan are in bounds and above guest code (the inlined fast path).
 	writeSpan uint32
 
@@ -152,13 +157,17 @@ func NewCPU() *CPU {
 
 func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 	c.Intercepts[addr] = fn
+	c.thunkCache = [len(c.thunkCache)]struct {
+		eip uint32
+		fn  ThunkFunc
+	}{}
 	if c.icept == nil {
 		c.icept = make([]uint64, ArenaSize/64)
 	}
 	if addr < ArenaSize {
 		c.icept[addr>>6] |= 1 << (addr & 63)
 	}
-	if addr >= c.CodeLo && addr < c.CodeHi && c.blocks != nil {
+	if addr >= c.CodeLo && addr < c.CodeHi && c.dcacheUsed {
 		c.FlushCodeCache() // blocks are built assuming no intercept inside them
 	}
 	c.InterceptTag[addr] = name
@@ -175,7 +184,7 @@ func (c *CPU) SetInterceptEnabled(addr uint32, on bool) {
 	} else {
 		c.icept[addr>>6] &^= 1 << (addr & 63)
 	}
-	if addr >= c.CodeLo && addr < c.CodeHi && c.blocks != nil {
+	if addr >= c.CodeLo && addr < c.CodeHi && c.dcacheUsed {
 		c.FlushCodeCache()
 	}
 }
