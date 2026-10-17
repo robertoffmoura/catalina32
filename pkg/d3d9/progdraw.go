@@ -565,7 +565,7 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, 
 			if o.zTest && o.zWrite {
 				zbuf[idx] = z
 			}
-			if ids != nil {
+			if ids != nil && !o.tex[0].fromRT {
 				ids[idx] = d.id
 			}
 		}

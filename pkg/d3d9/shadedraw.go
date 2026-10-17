@@ -31,6 +31,8 @@ type drawCmd struct {
 	primCount      uint32
 	tri            triState
 	verts          []screenVertex // shaded vertices by relative index
+	colors         [][4]float32   // unclamped shader colour per vertex
+	over           bool           // some colour exceeds 1: rasterize with the 2x rule (see expandDraws)
 	need           []bool
 }
 
@@ -107,6 +109,7 @@ func (s *Subsystem) queueRealDraw(c *cpu.CPU, primType, primCount uint32, order 
 		cmd.order[k] = i - minI
 	}
 	cmd.verts = make([]screenVertex, n)
+	cmd.colors = make([][4]float32, n)
 	cmd.need = make([]bool, n)
 	for _, i := range cmd.order {
 		cmd.need[i] = true
@@ -206,20 +209,26 @@ func (w *shadeWorker) shade(cmd *drawCmd) {
 			}
 		}
 		vst.Run()
-		cmd.verts[i] = finishVertex(vs, ps, vst, pst, pos)
+		cmd.verts[i], cmd.colors[i] = finishVertex(vs, ps, vst, pst, pos)
+		for _, c := range cmd.colors[i] {
+			if c > 1.001 {
+				cmd.over = true
+			}
+		}
 	}
 }
 
 // finishVertex turns the vertex shader outputs (and the per-vertex pixel shader result) into a
 // clip-space screen vertex.
-func finishVertex(vs, ps *compiledShader, vst, pst *hlsl.State, pos *hlsl.Varying) screenVertex {
+func finishVertex(vs, ps *compiledShader, vst, pst *hlsl.State, pos *hlsl.Varying) (screenVertex, [4]float32) {
+	raw := [4]float32{1, 1, 1, 1}
 	if pos == nil || pos.Components < 4 {
-		return screenVertex{}
+		return screenVertex{}, raw
 	}
 	p := vst.M[pos.Offset : pos.Offset+4]
 	sv := screenVertex{cx: p[0], cy: p[1], cz: p[2], cw: p[3], clip: true, valid: true, r: 255, g: 255, b: 255, a: 255}
 	if sv.cx != sv.cx || sv.cy != sv.cy || sv.cz != sv.cz || sv.cw != sv.cw {
-		return screenVertex{}
+		return screenVertex{}, raw
 	}
 	var color []float32
 	if ps != nil {
@@ -245,12 +254,13 @@ func finishVertex(vs, ps *compiledShader, vst, pst *hlsl.State, pos *hlsl.Varyin
 		}
 	}
 	if color != nil {
+		copy(raw[:], color)
 		sv.r, sv.g, sv.b, sv.a = clampByte(color[0]), clampByte(color[1]), clampByte(color[2]), clampByte(color[3])
 	}
 	if sv.cw > nearW {
 		projectClip(&sv)
 	}
-	return sv
+	return sv, raw
 }
 
 // expandDraws shades every recorded draw in ops (in parallel) and returns the operation list
@@ -295,6 +305,15 @@ func (s *Subsystem) expandDraws(ops []queuedTri) []queuedTri {
 			continue
 		}
 		v, o := cmd.verts, cmd.order
+		if cmd.over {
+			// The pixel shader's output exceeds 1 before the texture multiply (e.g. the engine's
+			// 2 x vertex colour): keep half the colour and double after texturing, per pixel.
+			for i := range v {
+				c := cmd.colors[i]
+				v[i].r, v[i].g, v[i].b, v[i].a = clampByte(c[0]/2), clampByte(c[1]/2), clampByte(c[2]/2), clampByte(c[3]/2)
+			}
+			cmd.tri.x2 = true
+		}
 		switch cmd.primType {
 		case 4: // TRIANGLELIST
 			for k := 0; k+2 < len(o); k += 3 {

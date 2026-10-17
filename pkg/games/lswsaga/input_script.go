@@ -19,6 +19,7 @@ var attackKey = func() int {
 //
 //	boot     Title -> Main Menu -> New Game -> Save Slot 1 -> Mos Eisley Cantina
 //	episode1 boot, then walk into Episode I Chapter 1 (Negotiations)
+//	explore  episode1, then walk around the first room of the level (Force objects, studs)
 //	outside  boot, then walk out of the Cantina into the Mos Eisley courtyard
 //	cantina  boot, then attack in place in the Cantina (lightsaber; breaks furniture into studs)
 //	loop     periodic Enter/F2 taps
@@ -27,7 +28,7 @@ var attackKey = func() int {
 func inputScript(s *d3d9.Subsystem, mode string, keys []byte) {
 	f := s.FrameCount
 	switch mode {
-	case "boot", "episode1", "outside", "cantina":
+	case "boot", "episode1", "explore", "outside", "cantina":
 		// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
 		if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
 			df := (f - s.TitleFirstFrame) % 50
@@ -40,7 +41,7 @@ func inputScript(s *d3d9.Subsystem, mode string, keys []byte) {
 			if (cf >= 10 && cf < 16) || (cf >= 40 && cf < 46) {
 				keys[0x1C] = 0x80 // DIK_RETURN
 			}
-			if mode == "episode1" && cf >= 55 {
+			if (mode == "episode1" || mode == "explore") && cf >= 55 && cf < 800 {
 				switch {
 				case cf < 100: // Cantina: walk north
 					keys[0x11] = 0x80 // DIK_W (Player 1 Up)
@@ -54,6 +55,20 @@ func inputScript(s *d3d9.Subsystem, mode string, keys []byte) {
 				}
 				if cf >= 300 && (cf%40) < 6 {
 					keys[0x16] = 0x80 // Tap DIK_U (Player 1 Jump / Confirm in chapter menu)
+				}
+			}
+			if mode == "explore" && cf >= 800 {
+				// Level: walk left, up, right, down in widening legs.
+				leg := (cf - 800) / 45
+				switch leg % 4 {
+				case 0:
+					keys[0x1E] = 0x80 // A
+				case 1:
+					keys[0x11] = 0x80 // W
+				case 2:
+					keys[0x20] = 0x80 // D
+				case 3:
+					keys[0x1F] = 0x80 // S
 				}
 			}
 			if mode == "cantina" && cf >= 55 && (cf-55)%12 < 6 {

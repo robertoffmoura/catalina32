@@ -57,13 +57,14 @@ type screenVertex struct {
 type texSnap struct {
 	Pixels                []uint32
 	Width, Height, Format uint32
+	fromRT                bool // a render target's colour buffer
 }
 
 func snapTex(res *BufferDesc) texSnap {
 	if res == nil {
 		return texSnap{}
 	}
-	return texSnap{Pixels: res.Pixels, Width: res.Width, Height: res.Height, Format: res.Format}
+	return texSnap{Pixels: res.Pixels, Width: res.Width, Height: res.Height, Format: res.Format, fromRT: res.IsRT}
 }
 
 // queuedTri is one render operation: a screen-space triangle, or (clearOp) a framebuffer/Z clear.
@@ -104,6 +105,10 @@ var renderEvery = func() int {
 }()
 
 var liveMode = os.Getenv("C32_LIVE") == "1"
+
+// exportAllFrames: with an explicit C32_RENDER_EVERY, every rendered frame is written (not only
+// busy scenes), for frame-by-frame inspection.
+var exportAllFrames = os.Getenv("C32_RENDER_EVERY") != ""
 var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
 
 func (s *Subsystem) wantRender(frame uint64) bool {
@@ -948,7 +953,7 @@ func (s *Subsystem) drawSegment(ops []queuedTri, ids []int32) {
 	}
 	target := s.Framebuffer.Pix
 	if s.drawPix != nil {
-		target, ids = s.drawPix, nil
+		target = s.drawPix
 	}
 	const numBands = 8
 	const bandH = ScreenHeight / numBands
@@ -1183,7 +1188,7 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, pix []byte, band
 								zbuf[zIdx] = z
 							}
 							off := zIdx * 4
-							if ids != nil {
+							if ids != nil && !qt.tex0.fromRT {
 								ids[zIdx] = qt.id
 							}
 							if qt.additive {
@@ -1445,7 +1450,7 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
 		_ = os.WriteFile(latestPath, pngBytes, 0644)
-		if fi.cubeTexCount >= 8 && fi.frameDrawCalls > 50 {
+		if fi.cubeTexCount >= 8 && (fi.frameDrawCalls > 50 || exportAllFrames) {
 			cantinaPath := filepath.Join(s.FramesDir, "cantina_latest.png")
 			_ = os.WriteFile(cantinaPath, pngBytes, 0644)
 			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))

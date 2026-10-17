@@ -10,7 +10,7 @@ import (
 	"catalina32/pkg/hlsl"
 )
 
-// Real shader pipeline (C32_REAL_SHADERS=1).
+// Real shader pipeline (the default; C32_REAL_SHADERS=0 selects the heuristic renderer).
 //
 // D3DXCompileShader compiles the game's HLSL with pkg/hlsl and returns a real ID3DXConstantTable,
 // so the game discovers constant registers and sampler units through the standard D3DX API and
@@ -19,8 +19,9 @@ import (
 // that colour by the per-pixel sample of the shader's first texture lookup (Gouraud-style: exact
 // for shaders whose output is linear in that texture, approximate otherwise).
 
-// RealShadersEnabled reports whether C32_REAL_SHADERS=1 is set.
-func RealShadersEnabled() bool { return os.Getenv("C32_REAL_SHADERS") == "1" }
+// RealShadersEnabled reports whether the game's HLSL shaders run (default); C32_REAL_SHADERS=0
+// selects the heuristic renderer instead.
+func RealShadersEnabled() bool { return os.Getenv("C32_REAL_SHADERS") != "0" }
 
 type compiledShader struct {
 	prog    *hlsl.Program

@@ -15,7 +15,8 @@ import (
 // Draw inspection (C32_DRAW_LOG=900,1200): for each listed frame (numbers as in "Frame #N" and
 // frame_NNNN.png), every draw call is printed with its pipeline state, the frame is always
 // rendered, and after rasterization each draw's visible footprint (pixels it wrote last, and
-// their bounding box) is printed. Used to find which draw produced a wrong-looking region.
+// their bounding box) is printed. Footprints include draws into screen-sized render targets
+// (the scene buffer a post-process pass composites) and skip draws that sample a render target. Used to find which draw produced a wrong-looking region.
 
 var drawLogFrames = func() map[uint64]bool {
 	m := map[uint64]bool{}
