@@ -80,8 +80,13 @@ func main() {
 		}
 		size, ok := img.FDEs[uint32(a)]
 		if !ok {
-			fmt.Fprintf(os.Stderr, "0x%08x: no FDE (unknown size), skipped\n", a)
-			continue
+			// No unwind info (e.g. statically linked C libraries): find the body by following
+			// control flow, bounded by the next known function start.
+			if size = flowExtent(mem, uint32(a), nextFuncStart(img, uint32(a))); size == 0 {
+				fmt.Fprintf(os.Stderr, "0x%08x: no FDE and no decodable body, skipped\n", a)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "0x%08x: no FDE, %d bytes by control flow\n", a, size)
 		}
 		name := fmt.Sprintf("aot_%08x", a)
 		entries, native, total := genFunc(&b, name, mem, uint32(a), uint32(a)+size)
@@ -225,6 +230,61 @@ func gotoPC(t uint32, internal bool, ind string) string {
 		return fmt.Sprintf("%sgoto L%08x\n", ind, t)
 	}
 	return fmt.Sprintf("%sc.EIP = 0x%08x\n%sreturn\n", ind, t, ind)
+}
+
+// nextFuncStart returns the first FDE or symbol address above a (or a+64K if there is none closer).
+func nextFuncStart(img *macho32.Image, a uint32) uint32 {
+	limit := a + 0x10000
+	for f := range img.FDEs {
+		if f > a && f < limit {
+			limit = f
+		}
+	}
+	for f := range img.SymbolsByAddr {
+		if f > a && f < limit {
+			limit = f
+		}
+	}
+	return limit
+}
+
+// flowExtent returns the size of the code reachable from start through fall-through and direct
+// branches/jumps (calls fall through; returns and indirect jumps end a path), staying below limit.
+// Compiled blocks are exact entry points on their own, so an imprecise extent only changes how
+// much is compiled, never what executes.
+func flowExtent(mem []byte, start, limit uint32) uint32 {
+	seen := map[uint32]bool{}
+	work := []uint32{start}
+	end := start
+	for len(work) > 0 {
+		pc := work[len(work)-1]
+		work = work[:len(work)-1]
+		for pc >= start && pc < limit && !seen[pc] {
+			seen[pc] = true
+			in, err := x86asm.Decode(mem[pc:pc+16], 32)
+			if err != nil || in.Len == 0 {
+				break
+			}
+			it := &inst{pc: pc, in: in, next: pc + uint32(in.Len)}
+			end = max(end, it.next)
+			switch classify(&in) {
+			case kBranch:
+				work = append(work, relTarget(it))
+			case kJmp:
+				work = append(work, relTarget(it))
+				pc = 0 // path ends
+				continue
+			case kRet:
+				pc = 0
+				continue
+			}
+			if in.Op == x86asm.JMP || in.Op == x86asm.HLT || in.Op == x86asm.UD2 { // indirect jump
+				break
+			}
+			pc = it.next
+		}
+	}
+	return end - start
 }
 
 func relTarget(it *inst) uint32 {
