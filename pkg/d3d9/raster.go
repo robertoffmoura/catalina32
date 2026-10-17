@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"catalina32/pkg/cpu"
+	"catalina32/pkg/d3dsm"
 )
 
 const (
@@ -70,7 +71,9 @@ type queuedTri struct {
 	v0, v1, v2   screenVertex
 	tex0, tex1   texSnap
 	clearOp      bool
-	draw         *drawCmd // real-shader draw, expanded into triangles on the render goroutine
+	draw         *drawCmd  // real-shader draw, expanded into triangles on the render goroutine
+	pdraw        *progDraw // bytecode-shader draw, expanded into prog triangles on the render goroutine
+	prog         *progTri  // bytecode-shader triangle (rasterized with its pixel shader)
 	clearFlags   uint32
 	clearColor   uint32
 	minX, maxX   int
@@ -78,6 +81,7 @@ type queuedTri struct {
 	invArea      float32
 	alphaEnabled bool
 	additive     bool
+	id           int32 // draw call within the frame (C32_DRAW_LOG)
 }
 
 // nearW is the minimum clip-space w accepted before perspective divide. Triangles crossing it are clipped.
@@ -96,6 +100,9 @@ var liveMode = os.Getenv("C32_LIVE") == "1"
 var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
 
 func (s *Subsystem) wantRender(frame uint64) bool {
+	if drawLogFrames[frame] {
+		return true
+	}
 	if s.ShmFile != nil && s.FrameDrawCalls > 0 && s.FrameDrawCalls < 80 {
 		return true
 	}
@@ -705,12 +712,13 @@ func primVertexCount(primType, primCount uint32) int {
 type triState struct {
 	tex0, tex1      texSnap
 	alpha, additive bool
+	id              int32
 }
 
 func (s *Subsystem) curTriState(texRes, texRes1 *BufferDesc) triState {
 	return triState{tex0: snapTex(texRes), tex1: snapTex(texRes1),
 		alpha:    s.RenderStates[27] != 0 || s.RenderStates[15] != 0,
-		additive: s.RenderStates[27] != 0 && s.RenderStates[20] == 2}
+		additive: s.RenderStates[27] != 0 && s.RenderStates[20] == 2, id: s.drawSeq}
 }
 
 func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes, texRes1 *BufferDesc) {
@@ -836,6 +844,7 @@ func emitScreenTriangle(dst *[]queuedTri, v0, v1, v2 screenVertex, st *triState)
 		invArea:      1.0 / area,
 		alphaEnabled: st.alpha,
 		additive:     st.additive,
+		id:           st.id,
 	})
 }
 
@@ -866,9 +875,19 @@ func (s *Subsystem) submitFrame() {
 	ops := s.frameTris
 	s.frameTris = s.spareTris[:0]
 	s.renderWG.Add(1)
+	var ids []int32
+	if drawLogFrames[info.frame] {
+		ids = make([]int32, ScreenWidth*ScreenHeight)
+		for i := range ids {
+			ids[i] = -1
+		}
+	}
 	go func() {
 		defer s.renderWG.Done()
-		s.drawOps(s.expandDraws(ops))
+		s.drawOps(s.expandProg(s.expandDraws(ops)), ids)
+		if ids != nil {
+			reportDrawFootprints(info.frame, ids)
+		}
 		s.exportFrame(info)
 		s.spareTris = ops
 	}()
@@ -913,7 +932,7 @@ func (s *Subsystem) WaitRender() {
 	s.renderWG.Wait()
 }
 
-func (s *Subsystem) drawOps(ops []queuedTri) {
+func (s *Subsystem) drawOps(ops []queuedTri, ids []int32) {
 	if len(ops) == 0 || s.Framebuffer == nil {
 		return
 	}
@@ -929,15 +948,16 @@ func (s *Subsystem) drawOps(ops []queuedTri) {
 		}
 		go func(yLo, yHi int) {
 			defer wg.Done()
-			s.rasterizeBand(ops, yLo, yHi)
+			s.rasterizeBand(ops, ids, yLo, yHi)
 		}(bMinY, bMaxY)
 	}
 	wg.Wait()
 }
 
-func (s *Subsystem) rasterizeBand(ops []queuedTri, bandMinY, bandMaxY int) {
+func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, bandMinY, bandMaxY int) {
 	pix := s.Framebuffer.Pix
 	zbuf := s.ZBuffer
+	var pm d3dsm.Machine
 	for i := range ops {
 		qt := &ops[i]
 		if qt.clearOp {
@@ -954,6 +974,10 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, bandMinY, bandMaxY int) {
 		yEnd := qt.maxY
 		if yEnd > bandMaxY {
 			yEnd = bandMaxY
+		}
+		if qt.prog != nil {
+			s.rasterizeProg(qt, &pm, ids, yStart, yEnd)
+			continue
 		}
 
 		v0, v1, v2 := qt.v0, qt.v1, qt.v2
@@ -1143,6 +1167,9 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, bandMinY, bandMaxY int) {
 								zbuf[zIdx] = z
 							}
 							off := zIdx * 4
+							if ids != nil {
+								ids[zIdx] = qt.id
+							}
 							if qt.additive {
 								af := uint16(a)
 								rAdd := uint16(pix[off+0]) + (uint16(r)*af)/255
@@ -1188,6 +1215,9 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 	if pVerts == 0 || stride < 12 || primCount == 0 || !s.rendering {
 		return
 	}
+	if s.drawLogging() {
+		defer s.logEmitted(c, len(s.frameTris), pVerts, stride, isUP)
+	}
 	s.fbDirty = true
 	if primCount > 32768 {
 		primCount = 32768
@@ -1199,7 +1229,7 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 	if s.BoundTextures[1] != 0 {
 		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
 	}
-	if s.realShading() {
+	if s.progShading() || s.realShading() {
 		base0, first := pVerts, uint32(0)
 		if !isUP && stride != 0 {
 			if res := s.Resources[s.StreamSources[0]]; res != nil && pVerts >= res.DataPtr+s.StreamOffsets[0] {
@@ -1211,7 +1241,11 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		for k := range order {
 			order[k] = first + uint32(k)
 		}
-		s.queueRealDraw(c, primType, primCount, order, base0, stride, isUP, s.realTexture(c))
+		if s.progShading() {
+			s.queueProgDraw(c, primType, order, base0, stride, isUP)
+		} else {
+			s.queueRealDraw(c, primType, primCount, order, base0, stride, isUP, s.realTexture(c))
+		}
 		return
 	}
 	if isUP {
@@ -1255,6 +1289,9 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	if !s.rendering {
 		return // frame will not be exported: skip software rasterization entirely
 	}
+	if s.drawLogging() {
+		defer s.logEmitted(c, len(s.frameTris), pVerts, stride, isUP)
+	}
 	s.fbDirty = true
 	if primCount > 32768 {
 		primCount = 32768
@@ -1280,12 +1317,16 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		return uint32(int32(c.Read16(pIdx+pos*2)) + baseV)
 	}
 
-	if s.realShading() {
+	if s.progShading() || s.realShading() {
 		order := make([]uint32, primVertexCount(primType, primCount))
 		for k := range order {
 			order[k] = readIdx(uint32(k))
 		}
-		s.queueRealDraw(c, primType, primCount, order, pVerts, stride, isUP, s.realTexture(c))
+		if s.progShading() {
+			s.queueProgDraw(c, primType, order, pVerts, stride, isUP)
+		} else {
+			s.queueRealDraw(c, primType, primCount, order, pVerts, stride, isUP, s.realTexture(c))
+		}
 		return
 	}
 	if isUP {

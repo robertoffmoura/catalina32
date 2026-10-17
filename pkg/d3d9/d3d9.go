@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"catalina32/pkg/cpu"
+	"catalina32/pkg/d3dsm"
 	"catalina32/pkg/profile"
 )
 
@@ -113,6 +114,7 @@ type Subsystem struct {
 	CurrentVD         *VertexDecl
 	CurrentMaterial   uint32
 	RenderStates      [256]uint32
+	rsSet             [256]bool // render states the game has set (others take the D3D default)
 	BoundTextures     [16]uint32
 	StreamSources     [16]uint32
 	StreamOffsets     [16]uint32
@@ -155,8 +157,18 @@ type Subsystem struct {
 	shaderObjs          map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
 	constTables         map[uint32]*compiledShader
 	curVS, curPS        *compiledShader
-	shadeWorkers        []*shadeWorker // render goroutine only
-	expanded            []queuedTri    // render goroutine only
+	curVSObj, curPSObj  uint32 // bound shader objects (as the game sees them)
+	drawSeq             int32  // draw calls so far in the frame being recorded
+	dumpedTex           map[uint32]bool
+	shadeWorkers        []*shadeWorker            // render goroutine only
+	expanded            []queuedTri               // render goroutine only
+	expandedProg        []queuedTri               // render goroutine only
+	progObjs            map[uint32]*d3dsm.Program // shader objects created from bytecode
+	stubBlobs           map[uint32]bool           // placeholder bytecode returned by D3DXCompileShader (not executable)
+	curVSProg           *d3dsm.Program
+	curPSProg           *d3dsm.Program
+	samplerStates       [16][14]uint32
+	sampSet             [16][14]bool
 	shaderErrors        int
 	loggedConstTableSet bool // emulator time blocked on the previous frame's drawing
 
@@ -218,6 +230,8 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 	s.shaderCache = map[string]*compiledShader{}
 	s.shaderBlobs = map[uint32]*compiledShader{}
 	s.shaderObjs = map[uint32]*compiledShader{}
+	s.progObjs = map[uint32]*d3dsm.Program{}
+	s.stubBlobs = map[uint32]bool{}
 	s.constTables = map[uint32]*compiledShader{}
 	s.vtDInput8 = s.buildVTable(c, "IDirectInput8A", 20, s.handleIDirectInput8)
 	s.vtDIDevice8 = s.buildVTable(c, "IDirectInputDevice8A", 40, s.handleIDirectInputDevice8)
@@ -622,6 +636,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.AudioWriteSamples, c.Steps)
 		}
 		s.FrameDrawCalls = 0
+		s.drawSeq = 0
 		c.Regs[cpu.RegEAX] = 0
 		c.Ret()
 		if c.Preempt != nil {
@@ -763,6 +778,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 	case 57: // SetRenderState
 		if rs := c.Arg(1); rs < 256 {
 			s.RenderStates[rs] = c.Arg(2)
+			s.rsSet[rs] = true
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 58: // GetRenderState
@@ -787,6 +803,12 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, s.allocCOMObject(c, s.vtStateBlock, 16))
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 69: // SetSamplerState(this, Sampler, Type, Value)
+		if st, ty := c.Arg(1), c.Arg(2); st < 16 && ty < 14 {
+			s.samplerStates[st][ty] = c.Arg(3)
+			s.sampSet[st][ty] = true
+		}
+		c.Regs[cpu.RegEAX] = 0
 	case 65: // SetTexture(this, Stage, pTexture)
 		stage := c.Arg(1)
 		if stage < 16 {
@@ -801,6 +823,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 81: // DrawPrimitive(this, PrimitiveType, StartVertex, PrimitiveCount)
+		s.drawSeq++
+		if vbRes := s.Resources[s.StreamSources[0]]; vbRes != nil {
+			s.logDraw(c, "DP", c.Arg(1), c.Arg(3), vbRes.DataPtr+s.StreamOffsets[0]+c.Arg(2)*s.StreamStrides[0], s.StreamStrides[0])
+		}
 		s.DrawCallCount++
 		s.FrameDrawCalls++
 		s.TriangleCount += uint64(c.Arg(3))
@@ -814,6 +840,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 82: // DrawIndexedPrimitive(this, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount)
+		s.drawSeq++
+		if vbRes := s.Resources[s.StreamSources[0]]; vbRes != nil {
+			s.logDraw(c, "DIP", c.Arg(1), c.Arg(6), vbRes.DataPtr+s.StreamOffsets[0]+uint32(int32(c.Arg(2))+int32(c.Arg(3)))*s.StreamStrides[0], s.StreamStrides[0])
+		}
 		s.DrawCallCount++
 		s.FrameDrawCalls++
 		s.DIPCount++
@@ -841,12 +871,16 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 83: // DrawPrimitiveUP(this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride)
+		s.drawSeq++
+		s.logDraw(c, "DPUP", c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4))
 		s.DrawCallCount++
 		s.FrameDrawCalls++
 		s.TriangleCount += uint64(c.Arg(2))
 		s.rasterizePrimitiveBatch(c, c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4), true)
 		c.Regs[cpu.RegEAX] = 0
 	case 84: // DrawIndexedPrimitiveUP(this, PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride)
+		s.drawSeq++
+		s.logDraw(c, "DIPUP", c.Arg(1), c.Arg(4), c.Arg(7)+c.Arg(2)*c.Arg(8), c.Arg(8))
 		s.DrawCallCount++
 		s.FrameDrawCalls++
 		s.TriangleCount += uint64(c.Arg(4))
@@ -917,11 +951,15 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			if cs := s.shaderBlobs[c.Arg(1)]; cs != nil {
 				s.shaderObjs[obj] = cs
 			}
+			s.logShaderCreate(c, "vs", obj, c.Arg(1))
+			s.createProg(c, obj, c.Arg(1))
 			c.Write32(pp, obj)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 92: // SetVertexShader(this, pShader)
 		s.curVS = s.shaderObjs[c.Arg(1)]
+		s.curVSObj = c.Arg(1)
+		s.curVSProg = s.progObjs[c.Arg(1)]
 		c.Regs[cpu.RegEAX] = 0
 	case 94: // SetVertexShaderConstantF(this, StartRegister, pConstantData, Vector4fCount)
 		startReg := int(c.Arg(1))
@@ -956,11 +994,15 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			if cs := s.shaderBlobs[c.Arg(1)]; cs != nil {
 				s.shaderObjs[obj] = cs
 			}
+			s.logShaderCreate(c, "ps", obj, c.Arg(1))
+			s.createProg(c, obj, c.Arg(1))
 			c.Write32(pp, obj)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 107: // SetPixelShader(this, pShader)
 		s.curPS = s.shaderObjs[c.Arg(1)]
+		s.curPSObj = c.Arg(1)
+		s.curPSProg = s.progObjs[c.Arg(1)]
 		c.Regs[cpu.RegEAX] = 0
 	case 109: // SetPixelShaderConstantF
 		startReg := int(c.Arg(1))
@@ -1290,7 +1332,9 @@ func (s *Subsystem) thunkD3DXCompileShader(c *cpu.CPU) {
 		return
 	}
 	if ppShader != 0 {
-		c.Write32(ppShader, s.allocD3DXBuffer(c, 64))
+		buf := s.allocD3DXBuffer(c, 64)
+		s.stubBlobs[s.Resources[buf].DataPtr] = true
+		c.Write32(ppShader, buf)
 	}
 	if ppErr != 0 {
 		c.Write32(ppErr, 0)

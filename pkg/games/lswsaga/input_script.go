@@ -1,19 +1,33 @@
 package lswsaga
 
-import "catalina32/pkg/d3d9"
+import (
+	"os"
+	"strconv"
+
+	"catalina32/pkg/d3d9"
+)
+
+// attackKey is the DirectInput key code the cantina route presses (C32_ATTACK_KEY, hex).
+var attackKey = func() int {
+	if v, err := strconv.ParseUint(os.Getenv("C32_ATTACK_KEY"), 16, 8); err == nil {
+		return int(v)
+	}
+	return 0x23 // DIK_H (default layout: attack)
+}()
 
 // inputScript drives unattended C32_AUTO_KEYS runs through this game's menus and levels:
 //
 //	boot     Title -> Main Menu -> New Game -> Save Slot 1 -> Mos Eisley Cantina
 //	episode1 boot, then walk into Episode I Chapter 1 (Negotiations)
 //	outside  boot, then walk out of the Cantina into the Mos Eisley courtyard
+//	cantina  boot, then attack in place in the Cantina (lightsaber; breaks furniture into studs)
 //	loop     periodic Enter/F2 taps
 //
 // Keys use the default layout: P1 = W/A/S/D, U = jump/confirm, Enter = start.
 func inputScript(s *d3d9.Subsystem, mode string, keys []byte) {
 	f := s.FrameCount
 	switch mode {
-	case "boot", "episode1", "outside":
+	case "boot", "episode1", "outside", "cantina":
 		// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
 		if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
 			df := (f - s.TitleFirstFrame) % 50
@@ -41,6 +55,9 @@ func inputScript(s *d3d9.Subsystem, mode string, keys []byte) {
 				if cf >= 300 && (cf%40) < 6 {
 					keys[0x16] = 0x80 // Tap DIK_U (Player 1 Jump / Confirm in chapter menu)
 				}
+			}
+			if mode == "cantina" && cf >= 55 && (cf-55)%12 < 6 {
+				keys[attackKey] = 0x80
 			}
 			if mode == "outside" && cf >= 55 {
 				// Walk south around the bottom of the bar counter, left past the barista, then north through the exit to the right of the band.
