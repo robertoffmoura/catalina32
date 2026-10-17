@@ -144,6 +144,7 @@ type Subsystem struct {
 	padLast           [ShmPads][12]byte
 	padSeen           [ShmPads]bool
 	padWaited         bool
+	padViewer         bool // the viewer's ready marker was seen
 	padPacket         [ShmPads]uint32
 
 	// Real shader pipeline (shaders.go)
@@ -1723,8 +1724,9 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 // readPad returns the controller record the viewer wrote for user (0..3): the 12-byte
 // XINPUT_GAMEPAD (wButtons, bLeftTrigger, bRightTrigger, sThumbLX/LY/RX/RY) and whether the
 // pad counts as connected. Games typically enumerate controllers once at startup, so the first
-// query waits (up to 3 s) for the viewer to finish its controller scan, and a pad that was
-// reported once stays connected (reading neutral if it drops out, e.g. Bluetooth sleep).
+// query waits (up to 3 s) for the viewer's controller scan; with a viewer the first
+// ShmHotplugPads slots always report connected (neutral when empty) so pads can be plugged in
+// later, and any pad reported once stays connected (neutral if it drops, e.g. Bluetooth sleep).
 func (s *Subsystem) readPad(user uint32) ([12]byte, bool) {
 	var pad [12]byte
 	if s.ShmFile == nil || user >= ShmPads {
@@ -1739,9 +1741,17 @@ func (s *Subsystem) readPad(user uint32) ([12]byte, bool) {
 			}
 		}
 	}
+	if !s.padViewer {
+		if _, err := s.ShmFile.ReadAt(hdr[:], ShmPadOffset); err == nil && binary.LittleEndian.Uint32(hdr[:]) == ShmPadReady {
+			s.padViewer = true
+		}
+	}
+	// With a viewer present, the first ShmHotplugPads slots always exist (idle when empty), so
+	// controllers connected after the game's one-time enumeration still reach it.
+	always := s.padViewer && user < ShmHotplugPads
 	var rec [ShmPadSize]byte
 	if _, err := s.ShmFile.ReadAt(rec[:], int64(ShmPadOffset+4+user*ShmPadSize)); err != nil || rec[0] == 0 {
-		return pad, s.padSeen[user]
+		return pad, s.padSeen[user] || always
 	}
 	s.padSeen[user] = true
 	copy(pad[:], rec[4:16])

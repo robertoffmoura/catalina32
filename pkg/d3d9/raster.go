@@ -31,8 +31,10 @@ const (
 	ShmPadOffset = ShmAudioOffset + 8 + ShmAudioFrames*4
 	ShmPadReady  = 0x50323343 // "C32P" little-endian
 	ShmPads      = 4
-	ShmPadSize   = 16
-	ShmTotalSize = ShmPadOffset + 4 + ShmPads*ShmPadSize
+	// ShmHotplugPads slots are announced to the game even when empty (players 1 and 2).
+	ShmHotplugPads = 2
+	ShmPadSize     = 16
+	ShmTotalSize   = ShmPadOffset + 4 + ShmPads*ShmPadSize
 )
 
 type screenVertex struct {
