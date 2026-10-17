@@ -25,7 +25,14 @@ const (
 	ShmHeaderSize  = 288
 	ShmAudioOffset = ShmHeaderSize + ScreenWidth*ScreenHeight*4
 	ShmAudioFrames = 16384
-	ShmTotalSize   = ShmAudioOffset + 8 + ShmAudioFrames*4
+	// Game controllers written by the viewer: a u32 ready marker ("C32P" once its controller scan
+	// is done), then ShmPads records of ShmPadSize bytes each:
+	// u32 connected, u16 XInput buttons, u8 left trigger, u8 right trigger, s16 LX, LY, RX, RY.
+	ShmPadOffset = ShmAudioOffset + 8 + ShmAudioFrames*4
+	ShmPadReady  = 0x50323343 // "C32P" little-endian
+	ShmPads      = 4
+	ShmPadSize   = 16
+	ShmTotalSize = ShmPadOffset + 4 + ShmPads*ShmPadSize
 )
 
 type screenVertex struct {
@@ -110,6 +117,7 @@ func (s *Subsystem) initRasterizer(framesDir string) {
 	if shmPath := os.Getenv("C32_SHM_FILE"); shmPath != "" {
 		if f, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE, 0666); err == nil {
 			_ = f.Truncate(ShmTotalSize)
+			_, _ = f.WriteAt(make([]byte, 4+ShmPads*ShmPadSize), ShmPadOffset) // no stale controllers
 			var modeByte [1]byte
 			switch s.AutoKeysMode {
 			case "off":

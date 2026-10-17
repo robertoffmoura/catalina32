@@ -1,6 +1,7 @@
 package d3d9
 
 import (
+	"encoding/binary"
 	"fmt"
 	"image"
 	"math"
@@ -140,6 +141,10 @@ type Subsystem struct {
 	fpsFrame, fpsStep uint64
 	renderWait        time.Duration
 	shaderDumps       int
+	padLast           [ShmPads][12]byte
+	padSeen           [ShmPads]bool
+	padWaited         bool
+	padPacket         [ShmPads]uint32
 
 	// Real shader pipeline (shaders.go)
 	RealShaders         bool
@@ -1326,8 +1331,9 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 		devClass := c.Arg(1)
 		cb := c.Arg(2)
 		pvRef := c.Arg(3)
-		// DI8DEVCLASS_ALL=0, DI8DEVCLASS_KEYBOARD=3: report one keyboard (GUID_SysKeyboard). Game controllers: none.
-		if cb != 0 && (devClass == 0 || devClass == 3) {
+		// DI8DEVCLASS_ALL=0, DI8DEVCLASS_KEYBOARD=3 (or DI8DEVTYPE_KEYBOARD=0x13): one keyboard.
+		cont := uint32(1)
+		if cb != 0 && (devClass == 0 || devClass == 3 || devClass == 0x13) {
 			inst := c.Malloc(580) // sizeof(DIDEVICEINSTANCEA) for DX8
 			clear(c.Mem[inst : inst+580])
 			c.Write32(inst+0, 580)
@@ -1340,7 +1346,26 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 			if s.TraceLog {
 				fmt.Printf("[DInput8] EnumDevices(class=%d) -> reporting keyboard to callback 0x%08x\n", devClass, cb)
 			}
-			_, _ = c.CallGuestNested(cb, inst, pvRef)
+			cont, _ = c.CallGuestNested(cb, inst, pvRef)
+		}
+		// DI8DEVCLASS_GAMECTRL=4 (or DI8DEVTYPE_JOYSTICK/GAMEPAD): every connected controller,
+		// identified as an Xbox 360 pad so XInput-aware games read it through XInputGetState.
+		for user := uint32(0); cb != 0 && cont != 0 && user < ShmPads && (devClass == 0 || devClass == 4 || devClass == 0x14 || devClass == 0x15); user++ {
+			if _, ok := s.readPad(user); !ok {
+				continue
+			}
+			inst := c.Malloc(580)
+			clear(c.Mem[inst : inst+580])
+			c.Write32(inst+0, 580)
+			// guidInstance: unique per controller; guidProduct: {VID/PID-0000-0000-0000-"PIDVID"}
+			copy(c.Mem[inst+4:], []byte{0x00, 0x00, 0x32, 0xC3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(user)})
+			c.Write32(inst+20, 0x028E045E) // VID 0x045E, PID 0x028E (Xbox 360 Controller)
+			copy(c.Mem[inst+30:], []byte("PIDVID"))
+			c.Write32(inst+36, 0x00010215) // DI8DEVTYPE_GAMEPAD | DI8DEVTYPEGAMEPAD_STANDARD<<8 | DIDEVTYPE_HID
+			c.WriteCString(inst+40, fmt.Sprintf("Controller %d", user+1))
+			c.WriteCString(inst+300, "Controller (XBOX 360 For Windows)")
+			fmt.Printf("[DInput8] EnumDevices(class=%d) -> controller %d\n", devClass, user+1)
+			cont, _ = c.CallGuestNested(cb, inst, pvRef)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	default:
@@ -1695,13 +1720,77 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 	c.Ret()
 }
 
+// readPad returns the controller record the viewer wrote for user (0..3): the 12-byte
+// XINPUT_GAMEPAD (wButtons, bLeftTrigger, bRightTrigger, sThumbLX/LY/RX/RY) and whether the
+// pad counts as connected. Games typically enumerate controllers once at startup, so the first
+// query waits (up to 3 s) for the viewer to finish its controller scan, and a pad that was
+// reported once stays connected (reading neutral if it drops out, e.g. Bluetooth sleep).
+func (s *Subsystem) readPad(user uint32) ([12]byte, bool) {
+	var pad [12]byte
+	if s.ShmFile == nil || user >= ShmPads {
+		return pad, false
+	}
+	var hdr [4]byte
+	if !s.padWaited {
+		s.padWaited = true
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := s.ShmFile.ReadAt(hdr[:], ShmPadOffset); err == nil && binary.LittleEndian.Uint32(hdr[:]) == ShmPadReady {
+				break
+			}
+		}
+	}
+	var rec [ShmPadSize]byte
+	if _, err := s.ShmFile.ReadAt(rec[:], int64(ShmPadOffset+4+user*ShmPadSize)); err != nil || rec[0] == 0 {
+		return pad, s.padSeen[user]
+	}
+	s.padSeen[user] = true
+	copy(pad[:], rec[4:16])
+	return pad, true
+}
+
+const errDeviceNotConnected = 0x48F
+
+// XInputGetState(dwUserIndex, pState): XINPUT_STATE { DWORD dwPacketNumber; XINPUT_GAMEPAD Gamepad; }
 func (s *Subsystem) thunkXInputGetState(c *cpu.CPU) {
-	c.Regs[cpu.RegEAX] = 0x48F // ERROR_DEVICE_NOT_CONNECTED
+	user, p := c.Arg(0), c.Arg(1)
+	pad, ok := s.readPad(user)
+	if !ok {
+		c.Regs[cpu.RegEAX] = errDeviceNotConnected
+		c.Ret()
+		return
+	}
+	if pad != s.padLast[user] { // the packet number changes whenever the state changes
+		s.padLast[user] = pad
+		s.padPacket[user]++
+	}
+	if p != 0 {
+		c.Write32(p, s.padPacket[user])
+		copy(c.Mem[p+4:p+16], pad[:])
+	}
+	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
 }
 
+// XInputGetCapabilities(dwUserIndex, dwFlags, pCapabilities): XINPUT_CAPABILITIES { BYTE Type;
+// BYTE SubType; WORD Flags; XINPUT_GAMEPAD Gamepad; XINPUT_VIBRATION Vibration; }
 func (s *Subsystem) thunkXInputGetCapabilities(c *cpu.CPU) {
-	c.Regs[cpu.RegEAX] = 0x48F // ERROR_DEVICE_NOT_CONNECTED
+	user, p := c.Arg(0), c.Arg(2)
+	if _, ok := s.readPad(user); !ok {
+		c.Regs[cpu.RegEAX] = errDeviceNotConnected
+		c.Ret()
+		return
+	}
+	if p != 0 {
+		clear(c.Mem[p : p+20])
+		c.Mem[p] = 1           // XINPUT_DEVTYPE_GAMEPAD
+		c.Mem[p+1] = 1         // XINPUT_DEVSUBTYPE_GAMEPAD
+		c.Write16(p+4, 0xF3FF) // every button
+		c.Mem[p+6], c.Mem[p+7] = 0xFF, 0xFF
+		for i := uint32(0); i < 4; i++ {
+			c.Write16(p+8+2*i, 0xFFC0) // thumbstick resolution
+		}
+	}
+	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
 }
 
