@@ -154,7 +154,8 @@ type Subsystem struct {
 	shaderObjs          map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
 	constTables         map[uint32]*compiledShader
 	curVS, curPS        *compiledShader
-	shaderConstsDirty   bool
+	shadeWorkers        []*shadeWorker // render goroutine only
+	expanded            []queuedTri    // render goroutine only
 	shaderErrors        int
 	loggedConstTableSet bool // emulator time blocked on the previous frame's drawing
 
@@ -920,7 +921,6 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 92: // SetVertexShader(this, pShader)
 		s.curVS = s.shaderObjs[c.Arg(1)]
-		s.shaderConstsDirty = true
 		c.Regs[cpu.RegEAX] = 0
 	case 94: // SetVertexShaderConstantF(this, StartRegister, pConstantData, Vector4fCount)
 		startReg := int(c.Arg(1))
@@ -929,7 +929,6 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if startReg == 16 {
 			s.NumSkinMatrices = 0
 		}
-		s.shaderConstsDirty = true
 		if pData != 0 {
 			for i := 0; i < vecCount && startReg+i < 256; i++ {
 				for j := 0; j < 4; j++ {
@@ -961,10 +960,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 107: // SetPixelShader(this, pShader)
 		s.curPS = s.shaderObjs[c.Arg(1)]
-		s.shaderConstsDirty = true
 		c.Regs[cpu.RegEAX] = 0
 	case 109: // SetPixelShaderConstantF
-		s.shaderConstsDirty = true
 		startReg := int(c.Arg(1))
 		pData := c.Arg(2)
 		vecCount := int(c.Arg(3))

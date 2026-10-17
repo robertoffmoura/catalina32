@@ -67,6 +67,20 @@ func (c *compiler) userCall(e *CallExpr, cands []*FuncDecl) *cval {
 		failf(e.Line, "no matching overload for %s with %d arguments", e.Name, len(args))
 	}
 	cf := c.function(best)
+	if c.cur != nil && cf.impure {
+		c.cur.impure = true
+	}
+	if len(best.Params) == 0 && best.Ret.Base != BVoid && !cf.impure {
+		// Depends only on uniforms and literals: evaluate once per constant load.
+		if !cf.memo {
+			cf.memo = true
+			c.prog.pre = append(c.prog.pre, cf.body)
+		}
+		size, tmp, retOff := best.Ret.Size(), c.temp(best.Ret), cf.retOff
+		return &cval{t: best.Ret, off: tmp, eval: func(m []float32) {
+			copy(m[tmp:tmp+size], m[retOff:retOff+size])
+		}}
+	}
 	type inArg struct {
 		v    *cval
 		off  int
@@ -402,6 +416,9 @@ func (c *compiler) intrinsic(e *CallExpr) *cval {
 		smp, coord := args[0], args[1]
 		if smp.t.Base != BSampler {
 			failf(e.Line, "%s: first argument must be a sampler", e.Name)
+		}
+		if c.cur != nil {
+			c.cur.impure = true
 		}
 		if k := smp.konst; k != nil {
 			seen := false

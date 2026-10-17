@@ -18,6 +18,7 @@ type Program struct {
 	run    func(m []float32)
 	retOff int
 	inits  []func(m []float32) // static/global initialisers, run once per State
+	pre    []func(m []float32) // uniform-only function bodies, run after each constant load
 	consts []*Constant
 	// Sampler, if set, performs texture lookups (otherwise they return white). It is shared by
 	// all States of the program, so it must not be set while States run concurrently.
@@ -131,6 +132,8 @@ type cfunc struct {
 	retOff   int
 	body     func(m []float32)
 	locals   []map[string]*local
+	impure   bool // reads/writes non-uniform globals, samples textures, or calls impure code
+	memo     bool // pure, parameterless: body runs once per constant load (Program.pre)
 }
 
 type local struct {
@@ -468,6 +471,9 @@ func (c *compiler) lookup(name string, line int) *cval {
 		v := &cval{t: g.decl.Type, eval: noop, off: g.off, konst: g.constant}
 		if g.constant == nil {
 			v.lv = &lvalue{base: g.off}
+			if c.cur != nil {
+				c.cur.impure = true
+			}
 		}
 		return v
 	}

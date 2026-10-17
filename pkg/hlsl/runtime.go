@@ -66,6 +66,9 @@ func (s *State) LoadConstants(regs [][4]float32) {
 			m[ld.dst] = 0
 		}
 	}
+	for _, f := range s.P.pre {
+		f(m)
+	}
 }
 
 // Run executes the entry point with the inputs currently stored in the input slots.

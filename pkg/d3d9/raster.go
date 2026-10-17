@@ -70,6 +70,7 @@ type queuedTri struct {
 	v0, v1, v2   screenVertex
 	tex0, tex1   texSnap
 	clearOp      bool
+	draw         *drawCmd // real-shader draw, expanded into triangles on the render goroutine
 	clearFlags   uint32
 	clearColor   uint32
 	minX, maxX   int
@@ -415,9 +416,6 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	if vp+12 > uint32(len(c.Mem)) {
 		return screenVertex{}
 	}
-	if s.realShading() {
-		return s.shadeVertex(c, vp, stride, isUP)
-	}
 	x := c.ReadF32(vp + 0)
 	y := c.ReadF32(vp + 4)
 	z := c.ReadF32(vp + 8)
@@ -658,7 +656,37 @@ func lerpClip(a, b *screenVertex, t float32) screenVertex {
 
 // rasterizeTriangle clips 3D triangles against the w = nearW plane (Sutherland–Hodgman, one plane) and
 // rasterizes the resulting polygon as a fan. Triangles fully in front of the plane go straight through.
+// primVertexCount is the number of vertices (indices) a primitive batch consumes.
+func primVertexCount(primType, primCount uint32) int {
+	switch primType {
+	case 4:
+		return int(primCount) * 3
+	case 5, 6:
+		return int(primCount) + 2
+	}
+	return 0
+}
+
+// triState is the per-draw state a triangle captures when queued.
+type triState struct {
+	tex0, tex1      texSnap
+	alpha, additive bool
+}
+
+func (s *Subsystem) curTriState(texRes, texRes1 *BufferDesc) triState {
+	return triState{tex0: snapTex(texRes), tex1: snapTex(texRes1),
+		alpha:    s.RenderStates[27] != 0 || s.RenderStates[15] != 0,
+		additive: s.RenderStates[27] != 0 && s.RenderStates[20] == 2}
+}
+
 func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes, texRes1 *BufferDesc) {
+	st := s.curTriState(texRes, texRes1)
+	emitTriangle(&s.frameTris, v0, v1, v2, &st)
+}
+
+// emitTriangle clips a triangle against the near plane and appends the resulting screen
+// triangles to dst.
+func emitTriangle(dst *[]queuedTri, v0, v1, v2 screenVertex, st *triState) {
 	if !v0.valid || !v1.valid || !v2.valid {
 		return
 	}
@@ -672,7 +700,7 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 		if !v2.clip && v2.invW == 0 {
 			v2.invW = 1
 		}
-		s.rasterizeScreenTriangle(c, v0, v1, v2, texRes, texRes1)
+		emitScreenTriangle(dst, v0, v1, v2, st)
 		return
 	}
 	if v0.cw <= nearW && v1.cw <= nearW && v2.cw <= nearW {
@@ -700,11 +728,11 @@ func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRe
 		projectClip(&out[i])
 	}
 	for i := 1; i+1 < n; i++ {
-		s.rasterizeScreenTriangle(c, out[0], out[i], out[i+1], texRes, texRes1)
+		emitScreenTriangle(dst, out[0], out[i], out[i+1], st)
 	}
 }
 
-func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes, texRes1 *BufferDesc) {
+func emitScreenTriangle(dst *[]queuedTri, v0, v1, v2 screenVertex, st *triState) {
 	minXf, maxXf := v0.sx, v0.sx
 	if v1.sx < minXf {
 		minXf = v1.sx
@@ -749,7 +777,7 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 		maxY = ScreenHeight - 1
 	}
 
-	hasTex := texRes != nil && len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
+	hasTex := len(st.tex0.Pixels) > 0 && st.tex0.Width > 0 && st.tex0.Height > 0
 
 	// Skip fullscreen post-process / fade / pillarbox quads so they don't overwrite the software framebuffer
 	if !hasTex && ((maxX-minX) >= 1100 && (maxY-minY) >= 600 || (!is3D && v0.r < 16 && v0.g < 16 && v0.b < 16 && ((maxX-minX) >= 24 || (maxY-minY) >= 24))) {
@@ -761,19 +789,19 @@ func (s *Subsystem) rasterizeScreenTriangle(c *cpu.CPU, v0, v1, v2 screenVertex,
 		return
 	}
 
-	s.frameTris = append(s.frameTris, queuedTri{
+	*dst = append(*dst, queuedTri{
 		v0:           v0,
 		v1:           v1,
 		v2:           v2,
-		tex0:         snapTex(texRes),
-		tex1:         snapTex(texRes1),
+		tex0:         st.tex0,
+		tex1:         st.tex1,
 		minX:         minX,
 		maxX:         maxX,
 		minY:         minY,
 		maxY:         maxY,
 		invArea:      1.0 / area,
-		alphaEnabled: s.RenderStates[27] != 0 || s.RenderStates[15] != 0,
-		additive:     s.RenderStates[27] != 0 && s.RenderStates[20] == 2,
+		alphaEnabled: st.alpha,
+		additive:     st.additive,
 	})
 }
 
@@ -806,7 +834,7 @@ func (s *Subsystem) submitFrame() {
 	s.renderWG.Add(1)
 	go func() {
 		defer s.renderWG.Done()
-		s.drawOps(ops)
+		s.drawOps(s.expandDraws(ops))
 		s.exportFrame(info)
 		s.spareTris = ops
 	}()
@@ -1138,7 +1166,19 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
 	}
 	if s.realShading() {
-		texRes, texRes1 = s.realTexture(c), nil
+		base0, first := pVerts, uint32(0)
+		if !isUP && stride != 0 {
+			if res := s.Resources[s.StreamSources[0]]; res != nil && pVerts >= res.DataPtr+s.StreamOffsets[0] {
+				base0 = res.DataPtr + s.StreamOffsets[0]
+				first = (pVerts - base0) / stride
+			}
+		}
+		order := make([]uint32, primVertexCount(primType, primCount))
+		for k := range order {
+			order[k] = first + uint32(k)
+		}
+		s.queueRealDraw(c, primType, primCount, order, base0, stride, isUP, s.realTexture(c))
+		return
 	}
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
@@ -1189,9 +1229,6 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	if s.BoundTextures[1] != 0 {
 		texRes1 = s.ensureTextureDecoded(c, s.BoundTextures[1])
 	}
-	if s.realShading() {
-		texRes, texRes1 = s.realTexture(c), nil
-	}
 	readIdx := func(n uint32) uint32 {
 		pos := startIdx + n
 		if is32BitIdx {
@@ -1206,6 +1243,14 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		return uint32(int32(c.Read16(pIdx+pos*2)) + baseV)
 	}
 
+	if s.realShading() {
+		order := make([]uint32, primVertexCount(primType, primCount))
+		for k := range order {
+			order[k] = readIdx(uint32(k))
+		}
+		s.queueRealDraw(c, primType, primCount, order, pVerts, stride, isUP, s.realTexture(c))
+		return
+	}
 	var vCache [256]struct {
 		idx uint32
 		v   screenVertex
