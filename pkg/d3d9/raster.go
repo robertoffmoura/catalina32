@@ -871,7 +871,7 @@ func (s *Subsystem) submitFrame() {
 		defer s.renderWG.Done()
 		s.drawOps(s.expandProg(s.expandDraws(ops)), ids)
 		if ids != nil {
-			reportDrawFootprints(info.frame, ids)
+			reportDrawFootprints(info.frame, ids, s.ZBuffer)
 		}
 		s.exportFrame(info)
 		s.spareTris = ops
@@ -1233,8 +1233,8 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		defer s.logEmitted(c, len(s.frameTris), pVerts, stride, isUP)
 	}
 	s.fbDirty = true
-	if primCount > 32768 {
-		primCount = 32768
+	if primCount > 1<<20 {
+		primCount = 1 << 20
 	}
 	var texRes, texRes1 *BufferDesc
 	if s.BoundTextures[0] != 0 {
@@ -1308,8 +1308,8 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		defer s.logEmitted(c, len(s.frameTris), pVerts, stride, isUP)
 	}
 	s.fbDirty = true
-	if primCount > 32768 {
-		primCount = 32768
+	if primCount > 1<<20 {
+		primCount = 1 << 20
 	}
 	var texRes, texRes1 *BufferDesc
 	if s.BoundTextures[0] != 0 {

@@ -62,10 +62,11 @@ func (s *Subsystem) logDraw(c *cpu.CPU, kind string, primType, primCount, vp, st
 }
 
 // reportDrawFootprints prints, per draw, how many pixels of the final image it wrote and where.
-func reportDrawFootprints(frame uint64, ids []int32) {
+func reportDrawFootprints(frame uint64, ids []int32, zbuf []float32) {
 	type fp struct {
 		n                      int
 		minX, minY, maxX, maxY int
+		minZ, maxZ             float32
 	}
 	m := map[int32]*fp{}
 	for i, id := range ids {
@@ -75,9 +76,10 @@ func reportDrawFootprints(frame uint64, ids []int32) {
 		x, y := i%ScreenWidth, i/ScreenWidth
 		f := m[id]
 		if f == nil {
-			f = &fp{minX: x, minY: y, maxX: x, maxY: y}
+			f = &fp{minX: x, minY: y, maxX: x, maxY: y, minZ: zbuf[i], maxZ: zbuf[i]}
 			m[id] = f
 		}
+		f.minZ, f.maxZ = min(f.minZ, zbuf[i]), max(f.maxZ, zbuf[i])
 		f.n++
 		f.minX, f.minY, f.maxX, f.maxY = min(f.minX, x), min(f.minY, y), max(f.maxX, x), max(f.maxY, y)
 	}
@@ -88,7 +90,7 @@ func reportDrawFootprints(frame uint64, ids []int32) {
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, k := range keys {
 		f := m[k]
-		fmt.Printf("[DRAWPX f%d #%d] %d px in (%d,%d)-(%d,%d)\n", frame, k, f.n, f.minX, f.minY, f.maxX, f.maxY)
+		fmt.Printf("[DRAWPX f%d #%d] %d px in (%d,%d)-(%d,%d) depth %.6g..%.6g\n", frame, k, f.n, f.minX, f.minY, f.maxX, f.maxY, f.minZ, f.maxZ)
 	}
 }
 
