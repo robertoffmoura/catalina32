@@ -165,6 +165,10 @@ func dumpGuestProfile(vm *cpu.CPU) {
 		addr  uint32
 		count uint64
 	}
+	n := 40
+	if v, err := strconv.Atoi(os.Getenv("C32_PROF_TOP")); err == nil && v > 0 {
+		n = v
+	}
 	report := func(title string, m map[uint32]uint64) {
 		var top []kv
 		for k, v := range m {
@@ -172,7 +176,7 @@ func dumpGuestProfile(vm *cpu.CPU) {
 		}
 		sort.Slice(top, func(i, j int) bool { return top[i].count > top[j].count })
 		fmt.Printf("[PROF] %s (%d samples, 1 per %d steps):\n", title, vm.ProfSamples, vm.ProfEvery)
-		for i := 0; i < len(top) && i < 40; i++ {
+		for i := 0; i < len(top) && i < n; i++ {
 			fmt.Printf("[PROF]   0x%08x %6.2f%%  %s\n", top[i].addr, 100*float64(top[i].count)/float64(vm.ProfSamples), vm.InterceptTag[top[i].addr])
 		}
 	}
