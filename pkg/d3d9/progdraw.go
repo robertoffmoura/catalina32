@@ -461,14 +461,12 @@ func blendFactor(f uint32, src, dst d3dsm.Vec, bf [4]float32) d3dsm.Vec {
 }
 
 // rasterizeProg draws one programmable triangle's rows within the band.
-func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, yStart, yEnd int) {
+func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, pix []byte, yStart, yEnd int) {
 	pt := qt.prog
 	d := pt.d
 	o := &d.out
 	v0, v1, v2 := &pt.v[0], &pt.v[1], &pt.v[2]
-	pix := s.Framebuffer.Pix
 	zbuf := s.ZBuffer
-	invArea := qt.invArea
 	m.C = d.psC
 	m.Sample = func(st int, uv d3dsm.Vec) d3dsm.Vec { return sampleTex(o, st&7, uv) }
 	// Perspective-correct varyings: interpolate vary/w and 1/w.
@@ -484,19 +482,20 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, 
 			}
 		}
 	}
-	dw0dx := (v1.sy - v2.sy) * invArea
-	dw1dx := (v2.sy - v0.sy) * invArea
+	te, ok := setupEdges(v0.sx, v0.sy, v1.sx, v1.sy, v2.sx, v2.sy)
+	if !ok {
+		return
+	}
 	for y := yStart; y <= yEnd; y++ {
-		py := float32(y) + 0.5
-		px := float32(qt.minX) + 0.5
-		w0 := ((v1.sx-px)*(v2.sy-py) - (v1.sy-py)*(v2.sx-px)) * invArea
-		w1 := ((v2.sx-px)*(v0.sy-py) - (v2.sy-py)*(v0.sx-px)) * invArea
 		row := y * ScreenWidth
-		for x := qt.minX; x <= qt.maxX; x, w0, w1 = x+1, w0+dw0dx, w1+dw1dx {
-			w2 := 1 - w0 - w1
-			if w0 < 0 || w1 < 0 || w2 < 0 {
+		e, step := te.start(qt.minX, y)
+		for x := qt.minX; x <= qt.maxX; x, e[0], e[1], e[2] = x+1, e[0]+step[0], e[1]+step[1], e[2]+step[2] {
+			if !te.inside(&e) {
 				continue
 			}
+			w0 := float32(e[0]) * te.inv
+			w1 := float32(e[1]) * te.inv
+			w2 := 1 - w0 - w1
 			idx := row + x
 			z := w0*v0.sz + w1*v1.sz + w2*v2.sz
 			if o.zTest && !cmpFunc(o.zFunc, z, zbuf[idx]) {

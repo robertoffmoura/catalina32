@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,7 @@ type BufferDesc struct {
 	Frequency     uint32
 	RefCount      int
 	IsDuplicate   bool
+	IsRT          bool // texture used as a render target: Pixels is its colour buffer
 }
 
 type VertexDecl struct {
@@ -72,7 +74,8 @@ type VertexDecl struct {
 type Subsystem struct {
 	VM             *cpu.CPU
 	rendering      bool // true while the frame being drawn will be rasterized/exported
-	up3D, upFlat3D bool // classification of the current DrawPrimitiveUP-style batch (classifyUPBatch)
+	up3D           bool // the current DrawPrimitiveUP-style batch is in-world 3D (classifyUPBatch)
+	colorX2        bool // current default-renderer batch uses the 2x vertex colour rule (triState.x2)
 	nextVTableAddr uint32
 	nextTrampAddr  uint32
 
@@ -157,8 +160,17 @@ type Subsystem struct {
 	shaderObjs          map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
 	constTables         map[uint32]*compiledShader
 	curVS, curPS        *compiledShader
-	curVSObj, curPSObj  uint32 // bound shader objects (as the game sees them)
-	drawSeq             int32  // draw calls so far in the frame being recorded
+	curVSObj, curPSObj  uint32            // bound shader objects (as the game sees them)
+	drawSeq             int32             // draw calls so far in the frame being recorded
+	curRT               uint32            // render target 0 as set by the game (0: back buffer)
+	origin              map[uint32]string // C32_DRAW_LOG: how each texture/surface was created
+	devCalls            [128]int          // C32_DRAW_LOG: device method calls in the inspected frame
+	renderTargets       map[*BufferDesc]*renderTarget
+	curTargetPix        []byte // emulation side: target of the operations being queued (nil: back buffer)
+	curTargetSkip       bool
+	loggedRTSize        bool
+	drawPix             []byte // render goroutine: current target (nil: back buffer)
+	drawSkip            bool
 	dumpedTex           map[uint32]bool
 	shadeWorkers        []*shadeWorker            // render goroutine only
 	expanded            []queuedTri               // render goroutine only
@@ -231,6 +243,7 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 	s.shaderBlobs = map[uint32]*compiledShader{}
 	s.shaderObjs = map[uint32]*compiledShader{}
 	s.progObjs = map[uint32]*d3dsm.Program{}
+	s.renderTargets = map[*BufferDesc]*renderTarget{}
 	s.stubBlobs = map[uint32]bool{}
 	s.constTables = map[uint32]*compiledShader{}
 	s.vtDInput8 = s.buildVTable(c, "IDirectInput8A", 20, s.handleIDirectInput8)
@@ -573,6 +586,22 @@ func (s *Subsystem) handleIDirect3D9(c *cpu.CPU, winSlot int) {
 }
 
 func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
+	if s.drawLogging() {
+		s.devCalls[winSlot]++
+		if winSlot == 17 {
+			var b strings.Builder
+			for i, n := range s.devCalls {
+				if n > 0 {
+					fmt.Fprintf(&b, " %d:%d", i, n)
+				}
+			}
+			fmt.Printf("[DEVCOUNT f%d]%s Present(%x, %x, %x, %x)\n", s.FrameCount+1, b.String(), c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4))
+			s.devCalls = [128]int{}
+		}
+		if name, ok := loggedDeviceCalls[winSlot]; ok {
+			fmt.Printf("[DEV f%d] %s(%x, %x, %x, %x, %x) after draw #%d\n", s.FrameCount+1, name, c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4), c.Arg(5), s.drawSeq)
+		}
+	}
 	switch winSlot {
 	case 3: // TestCooperativeLevel
 		c.Regs[cpu.RegEAX] = 0
@@ -655,6 +684,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		fmtCode := c.Arg(5)
 		pp := c.Arg(7)
 		tex := s.allocTexture(c, w, h, fmtCode)
+		s.noteOrigin(tex, "CreateTexture(%dx%d fmt %d usage %x pool %d)", w, h, fmtCode, c.Arg(4), c.Arg(6))
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -715,6 +745,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		fmtCode := c.Arg(3)
 		pp := c.Arg(7)
 		surf := s.allocSurface(c, w, h, fmtCode)
+		s.noteOrigin(surf, "CreateRenderTarget(%dx%d fmt %d)", w, h, fmtCode)
 		if pp != 0 {
 			c.Write32(pp, surf)
 		}
@@ -739,7 +770,26 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, surf)
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 34: // StretchRect(this, pSourceSurface, pSourceRect, pDestSurface, pDestRect, Filter)
+		s.stretchRect(c.Arg(1), c.Arg(3))
+		c.Regs[cpu.RegEAX] = 0
 	case 37: // SetRenderTarget(this, RenderTargetIndex, pRenderTarget)
+		if c.Arg(1) == 0 {
+			s.curRT = c.Arg(2)
+			s.setRenderTarget(c.Arg(2))
+		}
+		if s.drawLogging() {
+			desc := ""
+			if r := s.Resources[c.Arg(2)]; r != nil {
+				desc = fmt.Sprintf(" %dx%d f%d %s", r.Width, r.Height, r.Format, s.origin[c.Arg(2)])
+			}
+			ret := c.Read32(c.Regs[cpu.RegESP])
+			var chain []string
+			for bp, i := c.Regs[cpu.RegEBP], 0; bp != 0 && uint64(bp)+8 <= uint64(len(c.Mem)) && i < 5; bp, i = c.Read32(bp), i+1 {
+				chain = append(chain, fmt.Sprintf("%x", c.Read32(bp+4)))
+			}
+			fmt.Printf("[RT f%d] SetRenderTarget(%d, %x%s) after draw #%d (backbuffer=%x) from %x <- %s\n", s.FrameCount+1, c.Arg(1), c.Arg(2), desc, s.drawSeq, s.defaultBackBuf, ret, strings.Join(chain, " <- "))
+		}
 		c.Regs[cpu.RegEAX] = 0
 	case 38: // GetRenderTarget(this, RenderTargetIndex, ppRenderTarget)
 		pp := c.Arg(2)
@@ -811,6 +861,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 65: // SetTexture(this, Stage, pTexture)
 		stage := c.Arg(1)
+		if s.drawLogging() {
+			fmt.Printf("[DEV f%d] SetTexture(%d, %x [%s]) after draw #%d\n", s.FrameCount+1, stage, c.Arg(2), s.origin[c.Arg(2)], s.drawSeq)
+		}
 		if stage < 16 {
 			s.BoundTextures[stage] = c.Arg(2)
 		}
@@ -853,10 +906,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			vbRes := s.Resources[s.StreamSources[0]]
 			ibRes := s.Resources[s.BoundIndices]
 			stride := s.StreamStrides[0]
-			numV := c.Arg(4)
-			// Skip the 5x5 fullscreen post-process grid from 0x0001d900 so it doesn't overwrite the software framebuffer
-			isPostProcessGrid := (numV == 25 && prims == 44 && stride == 28)
-			if vbRes != nil && ibRes != nil && !isPostProcessGrid {
+			if vbRes != nil && ibRes != nil {
 				pVerts := vbRes.DataPtr + s.StreamOffsets[0]
 				is32 := ibRes.Format == 102 // D3DFMT_INDEX32
 				if s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0 {
@@ -1048,6 +1098,9 @@ func (s *Subsystem) fillSurfaceDesc(c *cpu.CPU, obj uint32, pDesc uint32) {
 }
 
 func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
+	if s.drawLogging() && winSlot >= 11 {
+		fmt.Printf("[Texture f%d] %x slot %d (%x, %x, %x)\n", s.FrameCount+1, c.Arg(0), winSlot, c.Arg(1), c.Arg(2), c.Arg(3))
+	}
 	thisPtr := c.Arg(0)
 	switch winSlot {
 	case 13, 14: // GetLevelCount
@@ -1065,6 +1118,7 @@ func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
 			w, h, fmtCode = res.Width, res.Height, res.Format
 		}
 		surf := s.allocSurface(c, w, h, fmtCode)
+		s.noteOrigin(surf, "GetSurfaceLevel(%x [%s], %d)", thisPtr, s.origin[thisPtr], lvl)
 		if lvl == 0 && res != nil {
 			s.Resources[surf] = res
 		}
@@ -1140,6 +1194,9 @@ func (s *Subsystem) handleIDirect3DVolumeTexture9(c *cpu.CPU, winSlot int) {
 }
 
 func (s *Subsystem) handleIDirect3DSurface9(c *cpu.CPU, winSlot int) {
+	if s.drawLogging() && winSlot >= 11 {
+		fmt.Printf("[Surface f%d] %x slot %d (%x, %x, %x)\n", s.FrameCount+1, c.Arg(0), winSlot, c.Arg(1), c.Arg(2), c.Arg(3))
+	}
 	thisPtr := c.Arg(0)
 	switch winSlot {
 	case 12: // GetDesc(this, pDesc)
@@ -1202,6 +1259,9 @@ func (s *Subsystem) handleIDirect3DQuery9(c *cpu.CPU, winSlot int) {
 func (s *Subsystem) handleIDirect3DSwapChain9(c *cpu.CPU, winSlot int) {
 	switch winSlot {
 	case 3: // Present
+		if len(drawLogFrames) > 0 {
+			fmt.Printf("[D3D9] IDirect3DSwapChain9::Present(%x) at frame %d\n", c.Arg(0), s.FrameCount)
+		}
 		s.FrameCount++
 	case 5: // GetBackBuffer(this, iBackBuffer, Type, ppBackBuffer)
 		pp := c.Arg(3)

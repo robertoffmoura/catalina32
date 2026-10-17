@@ -53,9 +53,9 @@ func (s *Subsystem) logDraw(c *cpu.CPU, kind string, primType, primCount, vp, st
 	if vp != 0 && uint64(vp)+16 <= uint64(len(c.Mem)) {
 		v0 = fmt.Sprintf("(%.3g %.3g %.3g | %08x)", c.ReadF32(vp), c.ReadF32(vp+4), c.ReadF32(vp+8), c.Read32(vp+12))
 	}
-	fmt.Printf("[DRAW f%d #%d] %s prim=%d n=%d stride=%d vs=%x ps=%x decl=%x tex0=%s tex1=%s tex2=%s"+
+	fmt.Printf("[DRAW f%d #%d] rt=%x %s prim=%d n=%d stride=%d vs=%x ps=%x decl=%x tex0=%s tex1=%s tex2=%s"+
 		" z=%d/%d/%d blend=%d %d,%d op%d atest=%d ref=%d fn%d cull=%d cw=%x v0=%s\n",
-		s.FrameCount+1, s.drawSeq, kind, primType, primCount, stride, s.curVSObj, s.curPSObj, s.CurrentVertexDecl,
+		s.FrameCount+1, s.drawSeq, s.curRT, kind, primType, primCount, stride, s.curVSObj, s.curPSObj, s.CurrentVertexDecl,
 		tex(0), tex(1), tex(2),
 		rs(rsZEnable), rs(rsZWriteEnable), rs(rsZFunc), rs(rsAlphaBlendEnable), rs(rsSrcBlend), rs(rsDestBlend), rs(rsBlendOp),
 		rs(rsAlphaTestEnable), rs(rsAlphaRef), rs(rsAlphaFunc), rs(rsCullMode), rs(rsColorWriteEnable), v0)
@@ -138,4 +138,20 @@ func (s *Subsystem) logShaderCreate(c *cpu.CPU, kind string, obj, fn uint32) {
 		}
 	}
 	fmt.Printf("[SHADER] %s obj=%x fn=%x version=%08x tokens=%d compiled=%v\n", kind, obj, fn, c.Read32(fn), n, s.shaderBlobs[fn] != nil)
+}
+
+// loggedDeviceCalls are the IDirect3DDevice9 methods printed for inspected frames (surface copies,
+// viewports and render target changes that the rasterizer may need to model).
+var loggedDeviceCalls = map[int]string{30: "UpdateSurface", 31: "UpdateTexture", 32: "GetRenderTargetData",
+	34: "StretchRect", 35: "ColorFill", 39: "SetDepthStencilSurface", 43: "Clear", 47: "SetViewport", 75: "SetScissorRect"}
+
+// noteOrigin records how a texture or surface was created (only with C32_DRAW_LOG).
+func (s *Subsystem) noteOrigin(obj uint32, format string, args ...any) {
+	if len(drawLogFrames) == 0 {
+		return
+	}
+	if s.origin == nil {
+		s.origin = map[uint32]string{}
+	}
+	s.origin[obj] = fmt.Sprintf(format, args...)
 }

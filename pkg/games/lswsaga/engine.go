@@ -22,8 +22,8 @@ func Install(c *cpu.CPU, d3d *d3d9.Subsystem, prof *profile.Profile) {
 
 	d3d.InputScript = inputScript
 
-	// Skip the fullscreen bloom/blur post-processing pass over the software framebuffer.
-	c.RegisterIntercept(0x0001d900, "NuPostProcessRender", returnZero)
+	// NuPostProcessRender (0x0001d900) composites the scene render target onto the back buffer; it
+	// runs unmodified now that render targets are modelled.
 	if d3d.RealShaders {
 		// The engine discovers registers through the real ID3DXConstantTable and uploads its own
 		// constants, textures and skin matrices: none of the material/constant hooks below apply.

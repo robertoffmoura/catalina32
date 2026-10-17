@@ -71,6 +71,12 @@ type queuedTri struct {
 	v0, v1, v2   screenVertex
 	tex0, tex1   texSnap
 	clearOp      bool
+	rtOp         bool   // switch the target of the following operations
+	rtPix        []byte // rtOp: target colour buffer (nil: back buffer)
+	rtSkip       bool   // rtOp: unsupported target, drop the following operations
+	copyOp       bool   // StretchRect: copy copySrc (nil: back buffer) to copyDst
+	copySrc      []byte
+	copyDst      []byte
 	draw         *drawCmd  // real-shader draw, expanded into triangles on the render goroutine
 	pdraw        *progDraw // bytecode-shader draw, expanded into prog triangles on the render goroutine
 	prog         *progTri  // bytecode-shader triangle (rasterized with its pixel shader)
@@ -81,6 +87,7 @@ type queuedTri struct {
 	invArea      float32
 	alphaEnabled bool
 	additive     bool
+	x2           bool
 	id           int32 // draw call within the frame (C32_DRAW_LOG)
 }
 
@@ -161,10 +168,10 @@ func (s *Subsystem) clearFramebuffer(argb uint32) {
 }
 
 // clearRows applies a Clear to framebuffer/Z rows y0..y1.
-func (s *Subsystem) clearRows(argb, flags uint32, y0, y1 int) {
+func (s *Subsystem) clearRows(target []byte, argb, flags uint32, y0, y1 int) {
 	if flags&1 != 0 {
 		r, g, b := uint8(argb>>16), uint8(argb>>8), uint8(argb)
-		pix := s.Framebuffer.Pix[y0*ScreenWidth*4 : (y1+1)*ScreenWidth*4]
+		pix := target[y0*ScreenWidth*4 : (y1+1)*ScreenWidth*4]
 		for i := 0; i < len(pix); i += 4 {
 			pix[i+0], pix[i+1], pix[i+2], pix[i+3] = r, g, b, 0xFF
 		}
@@ -393,8 +400,8 @@ func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32) (
 
 func (s *Subsystem) ensureTextureDecoded(c *cpu.CPU, texObj uint32) *BufferDesc {
 	res := s.Resources[texObj]
-	if res == nil {
-		return nil
+	if res == nil || res.IsRT {
+		return res
 	}
 	if len(res.Pixels) == 0 && res.DataPtr != 0 && res.Length > 0 {
 		end := res.DataPtr + res.Length
@@ -439,20 +446,8 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		r = uint8((col >> 16) & 0xFF)
 		g = uint8((col >> 8) & 0xFF)
 		b = uint8(col & 0xFF)
-		if a == 0 && (r != 0 || g != 0 || b != 0) {
-			a = 255
-		} else if col == 0 {
-			r, g, b, a = 255, 255, 255, 255
-		}
-		// Flat depth-tested text (the intro crawl) uses the engine's 2x vertex colour range (0x80 = 1.0),
-		// like the mesh path below: the crawl's 0x80FF6F00 is opaque yellow.
-		if isUP && s.upFlat3D {
-			r, g, b, a = sat2x(r), sat2x(g), sat2x(b), sat2x(a)
-		}
-		// Boost dark Star Wars intro crawl cyan (0x00324B -> #4BD5EE) for legibility
-		if r == 0 && g >= 0x20 && g <= 0x50 && b >= 0x35 && b <= 0x70 {
-			r, g, b = 0x4B, 0xD5, 0xEE
-		}
+		// The engine's shaders scale vertex colours by COLOR_FACTOR = 2 after texturing (0x80 = 1.0):
+		// the rasterizer applies it per pixel for these draws (triState.x2).
 		u = c.ReadF32(vp + 16)
 		v = c.ReadF32(vp + 20)
 	} else if stride >= 20 && vp+stride <= uint32(len(c.Mem)) {
@@ -644,31 +639,19 @@ func sat2x(v uint8) uint8 { return uint8(min(int(v)*2, 255)) }
 
 // classifyUPBatch decides whether a DrawPrimitiveUP-style batch is in-world 3D rather than a 2D overlay
 // in [-1, 1] coordinates (s.up3D). The decision is per draw: deciding per vertex tears triangles that
-// straddle the boundary (the intro crawl drew both flat and tilted). 3D: depth testing on, any vertex
-// outside the 2D range, or a translated world matrix with an identity Y row (3D Cantina text).
-// s.upFlat3D marks depth-tested batches lying in their local z = 0 plane: text laid out in 3D by the
-// world matrix, e.g. the intro crawl.
+// straddle the boundary (the intro crawl drew both flat and tilted). 3D: depth testing on, or any
+// vertex outside the 2D range. (Vertex shader constants are no evidence: overlays leave the previous
+// 3D draw's world matrix in place.)
 func (s *Subsystem) classifyUPBatch(c *cpu.CPU, vertex func(k int) uint32, n int) {
-	zEnable := s.RenderStates[7] != 0 // D3DRS_ZENABLE
-	w0, w1, w2 := s.VSConstants[16], s.VSConstants[17], s.VSConstants[18]
-	worldText := math.Abs(float64(w1[1]-1.0)) < 0.05 && (math.Abs(float64(w0[3])) > 1.0 || math.Abs(float64(w2[3])) > 1.0)
-	outside, flat := false, true
-	for k := 0; k < n; k++ {
+	s.up3D = s.renderState(rsZEnable) != 0
+	for k := 0; k < n && !s.up3D; k++ {
 		vp := vertex(k)
 		if uint64(vp)+12 > uint64(len(c.Mem)) {
 			continue
 		}
 		x, y, z := c.ReadF32(vp), c.ReadF32(vp+4), c.ReadF32(vp+8)
-		if math.Abs(float64(z)) > 0.01 {
-			outside, flat = true, false
-			break
-		}
-		if math.Abs(float64(x)) > 2.0 || math.Abs(float64(y)) > 2.0 {
-			outside = true
-		}
+		s.up3D = math.Abs(float64(x)) > 2.0 || math.Abs(float64(y)) > 2.0 || math.Abs(float64(z)) > 0.01
 	}
-	s.up3D = zEnable || worldText || outside
-	s.upFlat3D = zEnable && flat && !worldText
 }
 
 // projectClip performs the perspective divide + viewport transform for a clip-space vertex with w > nearW.
@@ -712,13 +695,14 @@ func primVertexCount(primType, primCount uint32) int {
 type triState struct {
 	tex0, tex1      texSnap
 	alpha, additive bool
+	x2              bool // colour = 2 * vertex colour * texture, saturated (stride-24 position/colour/uv vertices)
 	id              int32
 }
 
 func (s *Subsystem) curTriState(texRes, texRes1 *BufferDesc) triState {
 	return triState{tex0: snapTex(texRes), tex1: snapTex(texRes1),
 		alpha:    s.RenderStates[27] != 0 || s.RenderStates[15] != 0,
-		additive: s.RenderStates[27] != 0 && s.RenderStates[20] == 2, id: s.drawSeq}
+		additive: s.RenderStates[27] != 0 && s.RenderStates[20] == 2, x2: s.colorX2, id: s.drawSeq}
 }
 
 func (s *Subsystem) rasterizeTriangle(c *cpu.CPU, v0, v1, v2 screenVertex, texRes, texRes1 *BufferDesc) {
@@ -844,6 +828,7 @@ func emitScreenTriangle(dst *[]queuedTri, v0, v1, v2 screenVertex, st *triState)
 		invArea:      1.0 / area,
 		alphaEnabled: st.alpha,
 		additive:     st.additive,
+		x2:           st.x2,
 		id:           st.id,
 	})
 }
@@ -904,7 +889,7 @@ var syncRender = os.Getenv("C32_SYNC_RENDER") == "1"
 func (s *Subsystem) dropFrameKeepClears() {
 	kept := s.frameTris[:0]
 	for _, op := range s.frameTris {
-		if op.clearOp {
+		if op.clearOp || op.rtOp || op.copyOp {
 			kept = append(kept, op)
 		}
 	}
@@ -936,6 +921,35 @@ func (s *Subsystem) drawOps(ops []queuedTri, ids []int32) {
 	if len(ops) == 0 || s.Framebuffer == nil {
 		return
 	}
+	start := 0
+	for i := range ops {
+		switch {
+		case ops[i].rtOp:
+			s.drawSegment(ops[start:i], ids)
+			s.drawPix, s.drawSkip = ops[i].rtPix, ops[i].rtSkip
+			start = i + 1
+		case ops[i].copyOp:
+			s.drawSegment(ops[start:i], ids)
+			src := ops[i].copySrc
+			if src == nil {
+				src = s.Framebuffer.Pix
+			}
+			copy(ops[i].copyDst, src)
+			start = i + 1
+		}
+	}
+	s.drawSegment(ops[start:], ids)
+}
+
+// drawSegment rasterizes operations into the current target in parallel horizontal bands.
+func (s *Subsystem) drawSegment(ops []queuedTri, ids []int32) {
+	if len(ops) == 0 || s.drawSkip {
+		return
+	}
+	target := s.Framebuffer.Pix
+	if s.drawPix != nil {
+		target, ids = s.drawPix, nil
+	}
 	const numBands = 8
 	const bandH = ScreenHeight / numBands
 	var wg sync.WaitGroup
@@ -948,20 +962,19 @@ func (s *Subsystem) drawOps(ops []queuedTri, ids []int32) {
 		}
 		go func(yLo, yHi int) {
 			defer wg.Done()
-			s.rasterizeBand(ops, ids, yLo, yHi)
+			s.rasterizeBand(ops, ids, target, yLo, yHi)
 		}(bMinY, bMaxY)
 	}
 	wg.Wait()
 }
 
-func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, bandMinY, bandMaxY int) {
-	pix := s.Framebuffer.Pix
+func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, pix []byte, bandMinY, bandMaxY int) {
 	zbuf := s.ZBuffer
 	var pm d3dsm.Machine
 	for i := range ops {
 		qt := &ops[i]
 		if qt.clearOp {
-			s.clearRows(qt.clearColor, qt.clearFlags, bandMinY, bandMaxY)
+			s.clearRows(pix, qt.clearColor, qt.clearFlags, bandMinY, bandMaxY)
 			continue
 		}
 		if qt.maxY < bandMinY || qt.minY > bandMaxY {
@@ -976,21 +989,22 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, bandMinY, bandMa
 			yEnd = bandMaxY
 		}
 		if qt.prog != nil {
-			s.rasterizeProg(qt, &pm, ids, yStart, yEnd)
+			s.rasterizeProg(qt, &pm, ids, pix, yStart, yEnd)
 			continue
 		}
 
 		v0, v1, v2 := qt.v0, qt.v1, qt.v2
 		minX, maxX := qt.minX, qt.maxX
-		invArea := qt.invArea
 		texRes, texRes1 := &qt.tex0, &qt.tex1
 
 		is3D := v0.sz > 0.001 || v1.sz > 0.001 || v2.sz > 0.001
 		hasTex := len(texRes.Pixels) > 0 && texRes.Width > 0 && texRes.Height > 0
 		hasTex1 := len(texRes1.Pixels) > 0 && texRes1.Width > 0 && texRes1.Height > 0
 
-		dw0dx := (v1.sy - v2.sy) * invArea
-		dw1dx := (v2.sy - v0.sy) * invArea
+		te, teOK := setupEdges(v0.sx, v0.sy, v1.sx, v1.sy, v2.sx, v2.sy)
+		if !teOK {
+			continue
+		}
 
 		isGlyphQuad := !hasTex && v0.r == 0x4B && v0.g == 0xD5 && v0.b == 0xEE && (maxX-minX) <= 64 && (qt.maxY-qt.minY) <= 64
 		alphaEnabled := qt.alphaEnabled
@@ -1039,15 +1053,14 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, bandMinY, bandMa
 		v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
 		v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
 
-		pxStart := float32(minX) + 0.5
 		for y := yStart; y <= yEnd; y++ {
-			py := float32(y) + 0.5
 			rowIdx := y * ScreenWidth
-			w0 := ((v1.sx-pxStart)*(v2.sy-py) - (v1.sy-py)*(v2.sx-pxStart)) * invArea
-			w1 := ((v2.sx-pxStart)*(v0.sy-py) - (v2.sy-py)*(v0.sx-pxStart)) * invArea
-			for x := minX; x <= maxX; x++ {
-				w2 := 1.0 - w0 - w1
-				if w0 >= 0 && w1 >= 0 && w2 >= 0 {
+			e, step := te.start(minX, y)
+			for x := minX; x <= maxX; x, e[0], e[1], e[2] = x+1, e[0]+step[0], e[1]+step[1], e[2]+step[2] {
+				if te.inside(&e) {
+					w0 := float32(e[0]) * te.inv
+					w1 := float32(e[1]) * te.inv
+					w2 := 1.0 - w0 - w1
 					z := w0*v0.sz + w1*v1.sz + w2*v2.sz
 					zIdx := rowIdx + x
 					if !is3D || z <= zbuf[zIdx] {
@@ -1162,6 +1175,9 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, bandMinY, bandMa
 								}
 							}
 						}
+						if qt.x2 {
+							r, g, b, a = sat2x(r), sat2x(g), sat2x(b), sat2x(a)
+						}
 						if !skip && a >= 8 {
 							if is3D && a >= 240 && !qt.additive {
 								zbuf[zIdx] = z
@@ -1204,8 +1220,6 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, bandMinY, bandMa
 						}
 					}
 				}
-				w0 += dw0dx
-				w1 += dw1dx
 			}
 		}
 	}
@@ -1251,6 +1265,7 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 	if isUP {
 		s.classifyUPBatch(c, func(k int) uint32 { return pVerts + uint32(k)*stride }, primVertexCount(primType, primCount))
 	}
+	s.colorX2 = stride == 24
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
 		for i := uint32(0); i < primCount; i++ {
@@ -1332,6 +1347,7 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	if isUP {
 		s.classifyUPBatch(c, func(k int) uint32 { return pVerts + readIdx(uint32(k))*stride }, primVertexCount(primType, primCount))
 	}
+	s.colorX2 = stride == 24
 	var vCache [256]struct {
 		idx uint32
 		v   screenVertex
