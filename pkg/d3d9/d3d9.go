@@ -71,6 +71,7 @@ type VertexDecl struct {
 type Subsystem struct {
 	VM             *cpu.CPU
 	rendering      bool // true while the frame being drawn will be rasterized/exported
+	up3D, upFlat3D bool // classification of the current DrawPrimitiveUP-style batch (classifyUPBatch)
 	nextVTableAddr uint32
 	nextTrampAddr  uint32
 

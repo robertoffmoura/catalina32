@@ -437,6 +437,11 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		} else if col == 0 {
 			r, g, b, a = 255, 255, 255, 255
 		}
+		// Flat depth-tested text (the intro crawl) uses the engine's 2x vertex colour range (0x80 = 1.0),
+		// like the mesh path below: the crawl's 0x80FF6F00 is opaque yellow.
+		if isUP && s.upFlat3D {
+			r, g, b, a = sat2x(r), sat2x(g), sat2x(b), sat2x(a)
+		}
 		// Boost dark Star Wars intro crawl cyan (0x00324B -> #4BD5EE) for legibility
 		if r == 0 && g >= 0x20 && g <= 0x50 && b >= 0x35 && b <= 0x70 {
 			r, g, b = 0x4B, 0xD5, 0xEE
@@ -587,10 +592,8 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 		return screenVertex{sx: x, sy: y, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true}
 	}
 
-	// Case 1: DrawPrimitiveUP 2D UI/splash quads ([-1, 1] x [-1, 1]), excluding 3D in-world DrawPrimitiveUP (shadows & 3D Cantina text)
-	is3DUP := isUP && (math.Abs(float64(x)) > 2.0 || math.Abs(float64(y)) > 2.0 || math.Abs(float64(z)) > 0.01 ||
-		(math.Abs(float64(s.VSConstants[17][1]-1.0)) < 0.05 && (math.Abs(float64(s.VSConstants[16][3])) > 1.0 || math.Abs(float64(s.VSConstants[18][3])) > 1.0)))
-	if isUP && !is3DUP {
+	// Case 1: DrawPrimitiveUP 2D UI/splash quads ([-1, 1] x [-1, 1]); in-world UP draws (shadows, 3D text, the intro crawl) are decided per draw by classifyUPBatch
+	if isUP && !s.up3D {
 		sx := (x + 1.0) * 0.5 * float32(ScreenWidth)
 		sy := (1.0 - y) * 0.5 * float32(ScreenHeight)
 		return screenVertex{sx: sx, sy: sy, sz: 0.0, r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true}
@@ -628,6 +631,37 @@ func (s *Subsystem) transformVertex(c *cpu.CPU, vp uint32, stride uint32, isUP b
 	sx := float32(ScreenWidth)*0.5 + x*scale
 	sy := float32(ScreenHeight)*0.5 - y*scale
 	return screenVertex{sx: sx, sy: sy, sz: 0.5, r: r, g: g, b: b, a: a, u: u, v: v, u1: u1, v1: v1, blend1: blend1, valid: true, invW: 1}
+}
+
+func sat2x(v uint8) uint8 { return uint8(min(int(v)*2, 255)) }
+
+// classifyUPBatch decides whether a DrawPrimitiveUP-style batch is in-world 3D rather than a 2D overlay
+// in [-1, 1] coordinates (s.up3D). The decision is per draw: deciding per vertex tears triangles that
+// straddle the boundary (the intro crawl drew both flat and tilted). 3D: depth testing on, any vertex
+// outside the 2D range, or a translated world matrix with an identity Y row (3D Cantina text).
+// s.upFlat3D marks depth-tested batches lying in their local z = 0 plane: text laid out in 3D by the
+// world matrix, e.g. the intro crawl.
+func (s *Subsystem) classifyUPBatch(c *cpu.CPU, vertex func(k int) uint32, n int) {
+	zEnable := s.RenderStates[7] != 0 // D3DRS_ZENABLE
+	w0, w1, w2 := s.VSConstants[16], s.VSConstants[17], s.VSConstants[18]
+	worldText := math.Abs(float64(w1[1]-1.0)) < 0.05 && (math.Abs(float64(w0[3])) > 1.0 || math.Abs(float64(w2[3])) > 1.0)
+	outside, flat := false, true
+	for k := 0; k < n; k++ {
+		vp := vertex(k)
+		if uint64(vp)+12 > uint64(len(c.Mem)) {
+			continue
+		}
+		x, y, z := c.ReadF32(vp), c.ReadF32(vp+4), c.ReadF32(vp+8)
+		if math.Abs(float64(z)) > 0.01 {
+			outside, flat = true, false
+			break
+		}
+		if math.Abs(float64(x)) > 2.0 || math.Abs(float64(y)) > 2.0 {
+			outside = true
+		}
+	}
+	s.up3D = zEnable || worldText || outside
+	s.upFlat3D = zEnable && flat && !worldText
 }
 
 // projectClip performs the perspective divide + viewport transform for a clip-space vertex with w > nearW.
@@ -1180,6 +1214,9 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		s.queueRealDraw(c, primType, primCount, order, base0, stride, isUP, s.realTexture(c))
 		return
 	}
+	if isUP {
+		s.classifyUPBatch(c, func(k int) uint32 { return pVerts + uint32(k)*stride }, primVertexCount(primType, primCount))
+	}
 	switch primType {
 	case 4: // D3DPT_TRIANGLELIST
 		for i := uint32(0); i < primCount; i++ {
@@ -1250,6 +1287,9 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		}
 		s.queueRealDraw(c, primType, primCount, order, pVerts, stride, isUP, s.realTexture(c))
 		return
+	}
+	if isUP {
+		s.classifyUPBatch(c, func(k int) uint32 { return pVerts + readIdx(uint32(k))*stride }, primVertexCount(primType, primCount))
 	}
 	var vCache [256]struct {
 		idx uint32
