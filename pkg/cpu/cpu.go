@@ -673,7 +673,7 @@ func (c *CPU) Realloc(ptr, newSize uint32) uint32 {
 		c.Free(ptr)
 		return 0
 	}
-	oldSize := c.AllocSize[ptr]
+	oldSize, known := c.AllocSize[ptr]
 	if newSize <= oldSize {
 		return ptr
 	}
@@ -681,9 +681,16 @@ func (c *CPU) Realloc(ptr, newSize uint32) uint32 {
 	if newPtr == 0 {
 		return 0
 	}
-	if oldSize > 0 {
-		copy(c.Mem[newPtr:newPtr+oldSize], c.Mem[ptr:ptr+oldSize])
+	if !known {
+		// Not from this heap (static data, or a pointer the game made up): its size is unknown,
+		// so keep as much as fits instead of losing the contents.
+		c.ReportOnce(fmt.Sprintf("realloc:%x", ptr), "[heap] realloc of 0x%08x, which this heap did not allocate: copying %d bytes", ptr, newSize)
+		oldSize = 0
+		if ptr < ArenaSize {
+			oldSize = min(newSize, ArenaSize-ptr)
+		}
 	}
+	copy(c.WBytes(newPtr, oldSize), c.Bytes(ptr, oldSize))
 	c.Free(ptr)
 	return newPtr
 }

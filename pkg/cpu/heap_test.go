@@ -127,3 +127,18 @@ func TestHostCallKeepsCallStack(t *testing.T) {
 		t.Fatalf("call stack after host calls: %+v", c.CallStack)
 	}
 }
+
+func TestReallocUnknownPointerKeepsData(t *testing.T) {
+	c := NewCPU()
+	copy(c.Mem[0x2000:], "static data")
+	p := c.Realloc(0x2000, 64)
+	if got := string(c.Mem[p : p+11]); got != "static data" {
+		t.Fatalf("realloc of a static pointer lost its contents: %q", got)
+	}
+	q := c.Malloc(16)
+	copy(c.Mem[q:], "heap block 16 b.")
+	r := c.Realloc(q, 4096)
+	if got := string(c.Mem[r : r+16]); got != "heap block 16 b." {
+		t.Fatalf("realloc of a heap block: %q", got)
+	}
+}
