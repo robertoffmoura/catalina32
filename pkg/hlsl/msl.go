@@ -652,6 +652,18 @@ func (g *mslGen) conv(x mv, t *Type, line int) string {
 		failf(line, "cannot convert %s to %s", x.t, t)
 	}
 	ts := g.mslType(t, line)
+	if x.t.Base == BBool && t.Base != BBool && x.t.IsVector() && t.Rows == 1 && x.t.Cols >= t.Cols {
+		// bool vectors become 0/1 vectors through select (also well defined where comparisons
+		// produce masks).
+		v := x.code
+		if x.t.Cols > t.Cols {
+			v = "(" + v + ")." + "xyzw"[:t.Cols]
+		}
+		if t.Cols == 1 {
+			return fmt.Sprintf("(%s ? %s(1) : %s(0))", v, ts, ts)
+		}
+		return fmt.Sprintf("select(%s(0), %s(1), %s)", ts, ts, v)
+	}
 	switch {
 	case x.t.IsScalar() && t.IsMatrix():
 		col := g.mslType(vectorType(t.Base, t.Cols), line)

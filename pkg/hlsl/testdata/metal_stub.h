@@ -159,6 +159,11 @@ template <typename V> inline V step(V a, V b) { return vmap2(a, b, [](auto x, au
 template <typename V> inline V fmod(V a, V b) { return vmap2(a, b, [](auto x, auto y) { return std::fmod(float(x), float(y)); }); }
 template <typename V> inline V atan2(V a, V b) { return vmap2(a, b, [](auto x, auto y) { return std::atan2(float(x), float(y)); }); }
 template <typename V> inline V pow(V a, V b) { return vmap2(a, b, [](auto x, auto y) { return std::pow(float(x), float(y)); }); }
+template <typename V, typename B> inline V select(V a, V b, B c) {
+	for (int i = 0; i < vlen<V>; i++) a[i] = c[i] ? b[i] : a[i];
+	return a;
+}
+inline float frexp(float x, int& e) { return std::frexp(x, &e); }
 inline int clamp(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
 inline float3_t cross(float3_t a, float3_t b) {
 	float3_t r;
@@ -201,6 +206,14 @@ template <typename T> struct texturecube {
 		return float4_t{out[0], out[1], out[2], out[3]};
 	}
 	template <typename O> float4_t sample(sampler s, float3_t c, O) const { return sample(s, c); }
+};
+template <typename T> struct texture3d {
+	int unit;
+	template <typename... O> float4_t sample(sampler, float3_t c, O...) const {
+		float in[4] = {c.x, c.y, c.z, 0}, out[4];
+		harness_sample(unit | 0x100, in, 3, out);
+		return float4_t{out[0], out[1], out[2], out[3]};
+	}
 };
 extern bool harness_discarded;
 inline void discard_fragment() { harness_discarded = true; }
