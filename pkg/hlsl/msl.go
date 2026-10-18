@@ -1213,6 +1213,7 @@ inline float4 h_sample_bias(texturecube<float> t, sampler s, float4 c) { return 
 inline float4 h_sample_proj(texture2d<float> t, sampler s, float4 c) { return t.sample(s, c.w != 0 ? c.xy / c.w : c.xy); }
 template <typename T, int N> inline void h_copy(thread T (&d)[N], thread T (&s)[N]) { for (int i = 0; i < N; i++) d[i] = s[i]; }
 template <typename T> inline void h_copy(thread T& d, thread T& s) { d = s; }
+// end of prelude
 `
 
 // ---------------------------------------------------------------------------------------------
@@ -1228,8 +1229,8 @@ func (m *MSLModule) VertexMSL(attrs []msl.AttrClass) string {
 	b.WriteString("struct VIn {\n")
 	for i := range m.Inputs {
 		ty := "float4"
-		if i < len(attrs) && attrs[i] == msl.AttrInt {
-			ty = "int4"
+		if i < len(attrs) {
+			ty = msl.AttrType(attrs[i])
 		}
 		fmt.Fprintf(&b, "\t%s a%d [[attribute(%d)]];\n", ty, i, i)
 	}
@@ -1247,7 +1248,7 @@ func (m *MSLModule) VertexMSL(attrs []msl.AttrClass) string {
 	fmt.Fprintf(&b, "vertex VOut vs_main(VIn vin [[stage_in]], constant float4* C [[buffer(0)]], constant float4* S [[buffer(1)]]%s) {\n", m.stageTexParams())
 	m.entryCall(&b, func(l MSLLeaf, i int) string {
 		v := fmt.Sprintf("vin.a%d", i)
-		if i < len(attrs) && attrs[i] == msl.AttrInt {
+		if i < len(attrs) && attrs[i] != msl.AttrFloat {
 			v = "float4(" + v + ")"
 		}
 		return leafConv(v, l.Type)

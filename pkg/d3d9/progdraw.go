@@ -134,31 +134,7 @@ func (s *Subsystem) queueProgDraw(c *cpu.CPU, primType uint32, order []uint32, b
 		}
 	}
 	n := maxI - minI + 1
-	for _, e := range d.elems {
-		st := e.Stream
-		if st > 15 || d.streams[st].data != nil {
-			continue
-		}
-		var addr, stride uint32
-		switch {
-		case st == 0:
-			addr, stride = base0, stride0
-		case isUP:
-			continue
-		default:
-			res := s.Resources[s.StreamSources[st]]
-			if res == nil {
-				continue
-			}
-			addr, stride = res.DataPtr+s.StreamOffsets[st], s.StreamStrides[st]
-		}
-		lo := uint64(addr) + uint64(minI)*uint64(stride)
-		hi := lo + uint64(n)*uint64(stride) + 16
-		if hi > uint64(len(c.Mem)) {
-			continue
-		}
-		d.streams[st] = streamSnap{data: append([]byte(nil), c.Mem[lo:hi]...), stride: stride}
-	}
+	d.streams = s.snapStreams(c, d.elems, minI, n, base0, stride0, isUP)
 	d.order = make([]uint32, len(order))
 	d.need = make([]bool, n)
 	for k, i := range order {

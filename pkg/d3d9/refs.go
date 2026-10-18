@@ -114,6 +114,9 @@ func (s *Subsystem) destroy(c *cpu.CPU, obj uint32) {
 			c.Free(res.DataPtr)
 		}
 		delete(s.renderTargets, res)
+		if s.gpu != nil {
+			s.gpu.forget(res)
+		}
 	}
 	delete(s.Resources, obj)
 	delete(s.refs, obj)

@@ -187,7 +187,10 @@ type Subsystem struct {
 	bins                [numBands][]int32 // per-band operation lists (render goroutine)
 	bandShaders         []*progShader
 	drawCosts           map[int32]*drawCost
-	drawPix             []byte // render goroutine: current target (nil: back buffer)
+	gpu                 *gpuEncoder // GPU path (C32_GPU_SHM): frames go to the Metal viewer
+	gpuFrame            bool        // the frame being recorded goes to the GPU
+	curTargetDesc       *BufferDesc // GPU path: target of the operations being queued
+	drawPix             []byte      // render goroutine: current target (nil: back buffer)
 	drawSkip            bool
 	dumpedTex           map[uint32]bool
 	shadeWorkers        []*shadeWorker            // render goroutine only

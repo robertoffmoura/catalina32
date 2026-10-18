@@ -8,6 +8,7 @@ import (
 
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/hlsl"
+	"catalina32/pkg/msl"
 )
 
 // Real shader pipeline (the default; C32_REAL_SHADERS=0 selects the heuristic renderer).
@@ -24,6 +25,9 @@ import (
 func RealShadersEnabled() bool { return os.Getenv("C32_REAL_SHADERS") != "0" }
 
 type compiledShader struct {
+	file    *hlsl.File // the parsed source (for translation to MSL)
+	mod     msl.Shader // MSL translation (GPU path), made on first use
+	modErr  error
 	prog    *hlsl.Program
 	ps      bool
 	handles map[uint32]*hlsl.Constant // D3DXHANDLE (guest pointer to the name) -> constant
@@ -56,7 +60,7 @@ func (s *Subsystem) compileHLSL(c *cpu.CPU, src []byte, entry, profile string) (
 	if err != nil {
 		return nil, err
 	}
-	cs := &compiledShader{prog: prog, ps: len(profile) > 1 && profile[0] == 'p', handles: map[uint32]*hlsl.Constant{},
+	cs := &compiledShader{file: file, prog: prog, ps: len(profile) > 1 && profile[0] == 'p', handles: map[uint32]*hlsl.Constant{},
 		byName: map[string]uint32{}, texUnit: -1, maxReg: -1}
 	for _, k := range prog.Constants {
 		h := c.Malloc(uint32(len(k.Name) + 1))

@@ -401,8 +401,8 @@ func (p *Program) VertexMSL(attrs []msl.AttrClass) string {
 	b.WriteString("struct VIn {\n")
 	for i := range p.Inputs {
 		ty := "float4"
-		if i < len(attrs) && attrs[i] == msl.AttrInt {
-			ty = "int4"
+		if i < len(attrs) {
+			ty = msl.AttrType(attrs[i])
 		}
 		fmt.Fprintf(b, "\t%s a%d [[attribute(%d)]];\n", ty, i, i)
 	}
@@ -419,7 +419,7 @@ func (p *Program) VertexMSL(attrs []msl.AttrClass) string {
 	declarations(b)
 	for i, d := range p.Inputs {
 		v := fmt.Sprintf("vin.a%d", i)
-		if i < len(attrs) && attrs[i] == msl.AttrInt {
+		if i < len(attrs) && attrs[i] != msl.AttrFloat {
 			v = "float4(" + v + ")"
 		}
 		fmt.Fprintf(b, "\tV%d = %s;\n", d.Reg&15, v)
@@ -599,4 +599,5 @@ inline float4 h_divw(float4 v) { return float4(v.x / v.w, v.y / v.w, v.z, v.w); 
 inline float4 h_proj(float4 v) { return v.w != 0 ? float4(v.xyz / v.w, 1.0f) : v; }
 inline float4 h_crel(constant float4* C, int i) { return i >= 0 && i < 256 ? C[i] : float4(0); }
 inline int h_toA0(float f) { return f >= -2147483648.0f && f < 2147483648.0f ? int(f) : 0; }
+// end of prelude
 `

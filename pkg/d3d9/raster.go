@@ -74,10 +74,14 @@ type queuedTri struct {
 	v0, v1, v2   screenVertex
 	tex0, tex1   texSnap
 	clearOp      bool
-	rtOp         bool   // switch the target of the following operations
-	rtPix        []byte // rtOp: target colour buffer (nil: back buffer)
-	rtSkip       bool   // rtOp: unsupported target, drop the following operations
-	copyOp       bool   // StretchRect: copy copySrc (nil: back buffer) to copyDst
+	rtOp         bool        // switch the target of the following operations
+	rtPix        []byte      // rtOp: target colour buffer (nil: back buffer)
+	rtSkip       bool        // rtOp: unsupported target, drop the following operations
+	copyOp       bool        // StretchRect: copy copySrc (nil: back buffer) to copyDst
+	gpu          *gpuDrawCmd // GPU path: a draw for the viewer (gpu.go)
+	rtDesc       *BufferDesc // GPU path: rtOp target (nil: back buffer)
+	copySrcDesc  *BufferDesc // GPU path: copyOp source and destination (nil: back buffer)
+	copyDstDesc  *BufferDesc
 	copySrc      []byte
 	copyDst      []byte
 	draw         *drawCmd  // real-shader draw, expanded into triangles on the render goroutine
@@ -136,6 +140,7 @@ func (s *Subsystem) initRasterizer(framesDir string) {
 	s.LatestRGBA = make([]byte, ScreenWidth*ScreenHeight*4)
 	s.ZBuffer = make([]float32, ScreenWidth*ScreenHeight)
 	s.FramesDir = framesDir
+	s.gpu = newGPUEncoder()
 	if s.FramesDir != "" {
 		_ = os.MkdirAll(s.FramesDir, 0755)
 	}
@@ -891,6 +896,19 @@ func (s *Subsystem) submitFrame() {
 	}
 	ops := s.frameTris
 	s.frameTris = s.spareTris[:0]
+	if s.gpuFrame {
+		// The viewer draws this frame with Metal (gpu.go); audio and input still use the
+		// software path's shared memory.
+		gpuFrame := info.frame
+		s.renderWG.Add(1)
+		go func() {
+			defer s.renderWG.Done()
+			s.gpu.encodeFrame(ops, gpuFrame)
+		}()
+		s.gpuFrame = s.gpu.ready()
+		return
+	}
+	s.gpuFrame = s.gpu.ready()
 	s.renderWG.Add(1)
 	var ids []int32
 	if drawLogFrames[info.frame] {
@@ -1339,9 +1357,12 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 		for k := range order {
 			order[k] = first + uint32(k)
 		}
-		if s.progShading() {
+		switch {
+		case s.gpuFrame:
+			s.queueGPUDraw(c, primType, order, base0, stride, isUP)
+		case s.progShading():
 			s.queueProgDraw(c, primType, order, base0, stride, isUP)
-		} else {
+		default:
 			s.queueRealDraw(c, primType, primCount, order, base0, stride, isUP, s.realTexture(c))
 		}
 		return
@@ -1420,9 +1441,12 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 		for k := range order {
 			order[k] = readIdx(uint32(k))
 		}
-		if s.progShading() {
+		switch {
+		case s.gpuFrame:
+			s.queueGPUDraw(c, primType, order, pVerts, stride, isUP)
+		case s.progShading():
 			s.queueProgDraw(c, primType, order, pVerts, stride, isUP)
-		} else {
+		default:
 			s.queueRealDraw(c, primType, primCount, order, pVerts, stride, isUP, s.realTexture(c))
 		}
 		return

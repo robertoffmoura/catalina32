@@ -21,6 +21,22 @@ type renderTarget struct {
 func (s *Subsystem) setRenderTarget(surf uint32) {
 	var op queuedTri
 	op.rtOp = true
+	if s.gpuFrame {
+		// The GPU path draws into targets of any size.
+		var desc *BufferDesc
+		if surf != 0 && surf != s.defaultBackBuf {
+			desc = s.Resources[surf]
+			if desc != nil {
+				desc.IsRT = true
+			}
+		}
+		if desc != s.curTargetDesc || len(s.frameTris) == 0 {
+			s.curTargetDesc = desc
+			op.rtDesc = desc
+			s.frameTris = append(s.frameTris, op)
+		}
+		return
+	}
 	if surf != 0 && surf != s.defaultBackBuf {
 		desc := s.Resources[surf]
 		switch {
@@ -64,6 +80,22 @@ func (s *Subsystem) renderTargetFor(desc *BufferDesc) *renderTarget {
 // (whole surfaces): a copy queued in order with the draws.
 func (s *Subsystem) stretchRect(src, dst uint32) {
 	sd, dd := s.Resources[src], s.Resources[dst]
+	if s.gpuFrame {
+		op := queuedTri{copyOp: true, copySrcDesc: sd, copyDstDesc: dd}
+		if src == s.defaultBackBuf {
+			op.copySrcDesc = nil
+		}
+		if dst == s.defaultBackBuf {
+			op.copyDstDesc = nil
+		}
+		for _, d := range []*BufferDesc{op.copySrcDesc, op.copyDstDesc} {
+			if d != nil {
+				d.IsRT = true
+			}
+		}
+		s.frameTris = append(s.frameTris, op)
+		return
+	}
 	if src == s.defaultBackBuf {
 		sd = nil
 	} else if sd == nil || sd.Width != ScreenWidth || sd.Height != ScreenHeight {

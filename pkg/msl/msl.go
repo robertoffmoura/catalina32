@@ -14,8 +14,20 @@ type AttrClass uint8
 
 const (
 	AttrFloat AttrClass = iota // float, normalized or half formats
-	AttrInt                    // non-normalized integer formats (UBYTE4, SHORT2/4)
+	AttrInt                    // non-normalized signed integer formats (SHORT2, SHORT4)
+	AttrUint                   // non-normalized unsigned integer formats (UBYTE4)
 )
+
+// AttrType is the MSL type a vertex function declares for an attribute of class c.
+func AttrType(c AttrClass) string {
+	switch c {
+	case AttrInt:
+		return "int4"
+	case AttrUint:
+		return "uint4"
+	}
+	return "float4"
+}
 
 // Varying is a vertex function output read by fragment functions. Name is the Metal user
 // attribute linking the two ("COLOR0", "TEXCOORD3", ...).

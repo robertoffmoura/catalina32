@@ -24,6 +24,7 @@ typedef vec<float, 4> float4_t;
 typedef vec<int, 2> int2_t;
 typedef vec<int, 3> int3_t;
 typedef vec<int, 4> int4_t;
+typedef vec<unsigned, 4> uint4_t;
 
 // vlen<V>: number of components of a vector type (0 for scalars).
 template <typename V> constexpr int vlen = 0;
@@ -33,6 +34,7 @@ template <> constexpr int vlen<float4_t> = 4;
 template <> constexpr int vlen<int2_t> = 2;
 template <> constexpr int vlen<int3_t> = 3;
 template <> constexpr int vlen<int4_t> = 4;
+template <> constexpr int vlen<uint4_t> = 4;
 
 // Component gathering for constructors.
 struct Acc {
@@ -281,6 +283,7 @@ typedef float4_t float4;
 typedef int2_t int2;
 typedef int3_t int3;
 typedef int4_t int4;
+typedef uint4_t uint4;
 typedef int2_t bool2;
 typedef int3_t bool3;
 typedef int4_t bool4;
@@ -292,6 +295,7 @@ MATRIX(2, 2) MATRIX(2, 3) MATRIX(2, 4) MATRIX(3, 2) MATRIX(3, 3) MATRIX(3, 4) MA
 #define int2(...) mkvec<int, 2>(__VA_ARGS__)
 #define int3(...) mkvec<int, 3>(__VA_ARGS__)
 #define int4(...) mkvec<int, 4>(__VA_ARGS__)
+#define uint4(...) mkvec<unsigned, 4>(__VA_ARGS__)
 #define bool2(...) mkbool<2>(__VA_ARGS__)
 #define bool3(...) mkbool<3>(__VA_ARGS__)
 #define bool4(...) mkbool<4>(__VA_ARGS__)

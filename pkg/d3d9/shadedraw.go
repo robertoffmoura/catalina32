@@ -78,9 +78,27 @@ func (s *Subsystem) queueRealDraw(c *cpu.CPU, primType, primCount uint32, order 
 		cmd.psRegs = snapRegs(&s.PSConstants, cmd.ps.maxReg)
 	}
 	n := maxI - minI + 1
-	for _, e := range cmd.elems {
+	cmd.streams = s.snapStreams(c, cmd.elems, minI, n, base0, stride0, isUP)
+	cmd.order = make([]uint32, len(order))
+	for k, i := range order {
+		cmd.order[k] = i - minI
+	}
+	cmd.verts = make([]screenVertex, n)
+	cmd.colors = make([][4]float32, n)
+	cmd.need = make([]bool, n)
+	for _, i := range cmd.order {
+		cmd.need[i] = true
+	}
+	s.frameTris = append(s.frameTris, queuedTri{draw: cmd})
+}
+
+// snapStreams copies vertices minI..minI+n-1 of every stream the elements read (stream 0 starts
+// at base0 with stride0; draws from user memory have only stream 0). A stream whose data runs
+// past guest memory is left empty.
+func (s *Subsystem) snapStreams(c *cpu.CPU, elems []VertexElement, minI, n, base0, stride0 uint32, isUP bool) (out [16]streamSnap) {
+	for _, e := range elems {
 		st := e.Stream
-		if st > 15 || cmd.streams[st].data != nil {
+		if st > 15 || out[st].data != nil {
 			continue
 		}
 		var addr, stride uint32
@@ -101,19 +119,9 @@ func (s *Subsystem) queueRealDraw(c *cpu.CPU, primType, primCount uint32, order 
 		if hi > uint64(len(c.Mem)) {
 			continue
 		}
-		cmd.streams[st] = streamSnap{data: append([]byte(nil), c.Mem[lo:hi]...), stride: stride}
+		out[st] = streamSnap{data: append([]byte(nil), c.Mem[lo:hi]...), stride: stride}
 	}
-	cmd.order = make([]uint32, len(order))
-	for k, i := range order {
-		cmd.order[k] = i - minI
-	}
-	cmd.verts = make([]screenVertex, n)
-	cmd.colors = make([][4]float32, n)
-	cmd.need = make([]bool, n)
-	for _, i := range cmd.order {
-		cmd.need[i] = true
-	}
-	s.frameTris = append(s.frameTris, queuedTri{draw: cmd})
+	return out
 }
 
 // decodeElementBytes reads one vertex element (D3DDECLTYPE) as up to four floats.
