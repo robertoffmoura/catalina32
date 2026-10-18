@@ -1520,19 +1520,28 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 			_ = os.WriteFile(framePath, pngBytes, 0644)
 			linkOrWrite(framePath, latestPath, pngBytes)
 		default:
-			_ = os.WriteFile(latestPath, pngBytes, 0644)
+			replaceFile(latestPath, pngBytes)
 		}
 	}
 }
 
-// linkOrWrite makes dst a hard link to src (replacing dst), or writes data to it if linking fails.
+// linkOrWrite makes dst a hard link to src (replacing dst), or a copy of data if linking fails.
 func linkOrWrite(src, dst string, data []byte) {
 	tmp := dst + ".tmp"
 	_ = os.Remove(tmp)
 	if os.Link(src, tmp) == nil && os.Rename(tmp, dst) == nil {
 		return
 	}
-	_ = os.WriteFile(dst, data, 0644)
+	replaceFile(dst, data)
+}
+
+// replaceFile writes data to a new file that then replaces path. Writing in place would also
+// change any frame file that path is currently a hard link to.
+func replaceFile(path string, data []byte) {
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, data, 0644) == nil {
+		_ = os.Rename(tmp, path)
+	}
 }
 
 // shmPublish stores v at off in the viewer's shared memory with release ordering, so the viewer
