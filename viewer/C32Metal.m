@@ -203,6 +203,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     id<MTLCommandBuffer> _cb;
     id<MTLRenderCommandEncoder> _enc;
     id<MTLTexture> _target, _targetDepth;
+    MTLWinding _winding; // D3D9's front faces (C32_METAL_WINDING=ccw flips the convention)
 }
 
 - (instancetype)initWithPath:(NSString *)path layer:(CAMetalLayer *)layer {
@@ -224,6 +225,8 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         _inFlight = dispatch_semaphore_create(kFramesInFlight);
         _errorDir = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"msl_errors"];
         atomic_init(&_stop, false);
+        const char *wind = getenv("C32_METAL_WINDING");
+        _winding = (wind && strcmp(wind, "ccw") == 0) ? MTLWindingCounterClockwise : MTLWindingClockwise;
         [self setUpResources];
     }
     return self;
@@ -452,7 +455,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     _enc = [_cb renderCommandEncoderWithDescriptor:rp];
     MTLViewport vp = {0, 0, (double)_target.width, (double)_target.height, 0, 1};
     [_enc setViewport:vp];
-    [_enc setFrontFacingWinding:MTLWindingClockwise];
+    [_enc setFrontFacingWinding:_winding];
 }
 
 - (void)drawFrame:(const uint8_t *)data length:(uint32_t)length {
