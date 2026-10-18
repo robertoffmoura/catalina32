@@ -103,6 +103,31 @@ func (c *CPU) fprem(rem func(float64, float64) float64, quot func(float64) float
 	c.FPUSet(0, rem(a, b))
 }
 
+// fnstenv stores the 28-byte protected-mode FPU environment (control, status and tag words, then
+// zeroed instruction/operand pointers) and masks all exceptions, as FNSTENV does. Register tags
+// are not tracked: all registers are reported valid.
+func (c *CPU) fnstenv(addr uint32) {
+	b := c.WBytes(addr, 28)
+	if b == nil {
+		return
+	}
+	clear(b)
+	binary.LittleEndian.PutUint16(b[0:], c.FPUCW)
+	binary.LittleEndian.PutUint16(b[4:], c.FPUSW&0xC7FF|uint16(c.FPUTop&7)<<11)
+	c.FPUCW |= 0x3F
+}
+
+// fldenv loads the control and status words (and the stack top) from a 28-byte FPU environment.
+func (c *CPU) fldenv(addr uint32) {
+	b := c.Bytes(addr, 28)
+	if b == nil {
+		return
+	}
+	c.FPUCW = binary.LittleEndian.Uint16(b[0:])
+	sw := binary.LittleEndian.Uint16(b[4:])
+	c.FPUSW, c.FPUTop = sw&0xC7FF, int(sw>>11&7)
+}
+
 func (c *CPU) fpuCompareEFlags(a, b float64) {
 	c.SetFlag(FlagOF|FlagSF|FlagAF, false)
 	if math.IsNaN(a) || math.IsNaN(b) {
@@ -443,10 +468,12 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 			c.WriteF32(addr, float32(c.FPUGet(0)))
 		case 3: // FSTP m32fp
 			c.WriteF32(addr, float32(c.FPUPop()))
-		case 4: // FLDENV
+		case 4: // FLDENV m28
+			c.fldenv(addr)
 		case 5: // FLDCW m16
 			c.FPUCW = c.Read16(addr)
-		case 6: // FNSTENV
+		case 6: // FNSTENV m28
+			c.fnstenv(addr)
 		case 7: // FNSTCW m16
 			c.Write16(addr, c.FPUCW)
 		}
@@ -523,8 +550,21 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 			c.WriteF64(addr, c.FPUGet(0))
 		case 3: // FSTP m64fp
 			c.WriteF64(addr, c.FPUPop())
-		case 4: // FRSTOR
-		case 6: // FNSAVE
+		case 4: // FRSTOR m108
+			c.fldenv(addr)
+			for i := 0; i < 8; i++ {
+				if b := c.Bytes(addr+28+uint32(10*i), 10); b != nil {
+					c.FPUSet(i, readFloat80(b))
+				}
+			}
+		case 6: // FNSAVE m108: store, then FNINIT
+			c.fnstenv(addr)
+			for i := 0; i < 8; i++ {
+				if b := c.WBytes(addr+28+uint32(10*i), 10); b != nil {
+					writeFloat80(b, c.FPUGet(i))
+				}
+			}
+			c.FPUCW, c.FPUSW, c.FPUTop = 0x037F, 0, 0
 		case 7: // FNSTSW m16
 			sw := (c.FPUSW & 0xC7FF) | (uint16(c.FPUTop&7) << 11)
 			c.Write16(addr, sw)
@@ -704,7 +744,26 @@ func (c *CPU) readXMMOrMemF64(modrm uint8, segOverride uint32, hasSeg bool) floa
 	return c.ReadF64(addr)
 }
 
+// mmxOps marks the 0F opcodes that, without a 66/F2/F3 prefix, are MMX instructions on the
+// mm0-mm7 registers. MMX is not emulated: they report unimplemented (and halt) instead of
+// running as their SSE2 forms on the XMM registers.
+var mmxOps = func() (m [256]bool) {
+	for _, op := range []uint8{0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B,
+		0x6E, 0x6F, 0x70, 0x74, 0x75, 0x76, 0x7E, 0x7F, 0xC4, 0xC5, 0xD7, 0xE7, 0xF7} {
+		m[op] = true
+	}
+	for op := 0xD1; op <= 0xFE; op++ {
+		if op != 0xD6 && op != 0xE6 && op != 0xF0 {
+			m[op] = true
+		}
+	}
+	return m
+}()
+
 func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverride uint32, hasSeg bool) bool {
+	if mmxOps[op2] && !opSize16 && !repF3 && !repF2 {
+		return false
+	}
 	switch op2 {
 	case 0x10: // MOVUPS / MOVUPD / MOVSS / MOVSD (load)
 		modrm := c.Fetch8()
@@ -1343,10 +1402,21 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 	case 0x77: // EMMS
 		return true
 
-	case 0x7C: // HADDPD / HADDPS
+	case 0x7C: // HADDPD (66) / HADDPS (F2)
+		if !opSize16 && !repF2 {
+			return false
+		}
 		modrm := c.Fetch8()
 		reg := int((modrm >> 3) & 7)
 		src := c.readXMMOrMem128(modrm, segOverride, hasSeg)
+		if opSize16 {
+			a0, a1 := c.getXMMF64(reg, 0), c.getXMMF64(reg, 1)
+			b0 := math.Float64frombits(binary.LittleEndian.Uint64(src[0:8]))
+			b1 := math.Float64frombits(binary.LittleEndian.Uint64(src[8:16]))
+			c.setXMMF64(reg, 0, a0+a1)
+			c.setXMMF64(reg, 1, b0+b1)
+			return true
+		}
 		a0, a1, a2, a3 := c.getXMMF32(reg, 0), c.getXMMF32(reg, 1), c.getXMMF32(reg, 2), c.getXMMF32(reg, 3)
 		b0 := math.Float32frombits(binary.LittleEndian.Uint32(src[0:4]))
 		b1 := math.Float32frombits(binary.LittleEndian.Uint32(src[4:8]))
@@ -1632,7 +1702,10 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 		c.Regs[reg] = mask
 		return true
 
-	case 0xE6: // CVTDQ2PD / CVTPD2DQ / CVTTPD2DQ
+	case 0xE6: // CVTDQ2PD (F3) / CVTTPD2DQ (66) / CVTPD2DQ (F2)
+		if !repF3 && !repF2 && !opSize16 {
+			return false
+		}
 		modrm := c.Fetch8()
 		reg := int((modrm >> 3) & 7)
 		src := c.readXMMOrMem128(modrm, segOverride, hasSeg)
@@ -1641,13 +1714,13 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 			i1 := int32(binary.LittleEndian.Uint32(src[4:8]))
 			c.setXMMF64(reg, 0, float64(i0))
 			c.setXMMF64(reg, 1, float64(i1))
-		} else if repF2 { // CVTTPD2DQ
+		} else if opSize16 { // CVTTPD2DQ (truncates)
 			f0 := math.Float64frombits(binary.LittleEndian.Uint64(src[0:8]))
 			f1 := math.Float64frombits(binary.LittleEndian.Uint64(src[8:16]))
 			clear(c.XMM[reg][:])
 			c.setXMMU32(reg, 0, uint32(ToInt32(math.Trunc(f0))))
 			c.setXMMU32(reg, 1, uint32(ToInt32(math.Trunc(f1))))
-		} else if opSize16 { // CVTPD2DQ
+		} else { // F2: CVTPD2DQ (rounds)
 			f0 := math.Float64frombits(binary.LittleEndian.Uint64(src[0:8]))
 			f1 := math.Float64frombits(binary.LittleEndian.Uint64(src[8:16]))
 			clear(c.XMM[reg][:])
