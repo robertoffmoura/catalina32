@@ -210,6 +210,8 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, prof *profile.Profile) {
 			if env.TraceLog && vm.UnmappedCalls[fnAddr] <= 3 {
 				fmt.Printf("[BOUNDARY-UNMAPPED] 0x%08x called from 0x%08x (arg0=0x%08x arg1=0x%08x arg2=0x%08x)\n",
 					fnAddr, caller, vm.Arg(0), vm.Arg(1), vm.Arg(2))
+			} else {
+				vm.ReportOnce(fmt.Sprintf("boundary:%x", fnAddr), "[BOUNDARY-UNMAPPED] 0x%08x has no shim: returns 1", fnAddr)
 			}
 			vm.Regs[cpu.RegEAX] = 1
 			vm.Ret()

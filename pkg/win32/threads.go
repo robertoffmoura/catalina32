@@ -2,6 +2,7 @@ package win32
 
 import (
 	"fmt"
+	"slices"
 
 	"catalina32/pkg/cpu"
 )
@@ -252,7 +253,9 @@ func (env *Win32Env) thunkWaitForSingleObject(c *cpu.CPU) {
 		if env.blockAndSwitch(c, still) {
 			return // thunk re-executes when this thread is resumed
 		}
-		// Nothing else can run: avoid hanging forever (legacy behaviour).
+		// Nothing else can run: a real deadlock. Report it and pretend the wait succeeded rather
+		// than hang forever (legacy behaviour).
+		c.ReportOnce(fmt.Sprintf("deadlock:%x", h), "[Win32] WaitForSingleObject(0x%x, INFINITE) can never return (no other thread can run); continuing as if signalled", h)
 		c.Regs[cpu.RegEAX] = 0
 		c.Ret()
 		return
@@ -345,7 +348,13 @@ func (env *Win32Env) fireTimers(c *cpu.CPU) {
 	}
 	now := env.currentMs(c)
 	fired := false
-	for id, t := range env.sched.timers {
+	ids := make([]uint32, 0, len(env.sched.timers))
+	for id := range env.sched.timers {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids) // a fixed order (map iteration is random): runs stay reproducible
+	for _, id := range ids {
+		t := env.sched.timers[id]
 		if now-t.lastFireMs >= t.delayMs {
 			t.lastFireMs = now
 			if !t.periodic {

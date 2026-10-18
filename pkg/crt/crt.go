@@ -61,9 +61,7 @@ func RegisterCRT(c *CPUWrapper, img *macho32.Image, prof *profile.Profile) {
 			addrCopy := stubAddr
 			c.RegisterIntercept(stubAddr, symName, func(vm *cpu.CPU) {
 				vm.UnmappedCalls[addrCopy]++
-				if vm.TraceCalls {
-					fmt.Printf("[CRT-STUB] Default no-op for %s @ 0x%08x\n", nameCopy, addrCopy)
-				}
+				vm.ReportOnce("crt:"+nameCopy, "[CRT-STUB] %s @ 0x%08x is not implemented: returns 0", nameCopy, addrCopy)
 				vm.Regs[cpu.RegEAX] = 0
 				vm.Ret()
 			})

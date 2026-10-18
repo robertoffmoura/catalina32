@@ -121,6 +121,7 @@ type CPU struct {
 	ProfSelf    map[uint32]uint64
 	ProfIncl    map[uint32]uint64
 	profSeen    map[uint32]bool
+	reported    map[string]bool // ReportOnce keys
 
 	// Green-thread scheduling support. NestDepth counts host-initiated nested guest calls
 	// (CallGuest/CallGuestNested); thread switches are only legal at depth 0.
@@ -414,6 +415,19 @@ func (c *CPU) CBytes(addr uint32) []byte {
 		return m[:n:n]
 	}
 	return m
+}
+
+// ReportOnce prints a message the first time key is seen (gaps in the shims: unimplemented
+// functions, deadlocks), with the guest EIP of that first occurrence.
+func (c *CPU) ReportOnce(key, format string, args ...any) {
+	if c.reported[key] {
+		return
+	}
+	if c.reported == nil {
+		c.reported = map[string]bool{}
+	}
+	c.reported[key] = true
+	fmt.Printf(format+" (first at EIP=0x%08x)\n", append(args, c.EIP)...)
 }
 
 // PatchCode overwrites guest code (host-side binary patches), invalidating decoded instructions.

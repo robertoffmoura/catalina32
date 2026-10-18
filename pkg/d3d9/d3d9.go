@@ -465,6 +465,13 @@ func (s *Subsystem) guestBuf(c *cpu.CPU, res *BufferDesc) uint32 {
 	return res.DataPtr
 }
 
+// unimplemented reports (once per method) a COM method the shims answer with S_OK and nothing
+// else, so missing features show up in the log instead of failing silently.
+func (s *Subsystem) unimplemented(c *cpu.CPU, iface string, winSlot int) {
+	c.ReportOnce(fmt.Sprintf("%s:%d", iface, winSlot), "[D3D9] %s is not implemented: returns S_OK (called from 0x%08x)",
+		methodName(iface, winSlot), c.Read32(c.Regs[cpu.RegESP]))
+}
+
 // RegisterIndirectXThunks binds the IndirectX (D3D9/D3DX/DirectInput/DirectSound/XInput) and Bink
 // shims to the functions the game profile names.
 func (s *Subsystem) RegisterIndirectXThunks(c *cpu.CPU, prof *profile.Profile) {
@@ -626,6 +633,7 @@ func (s *Subsystem) handleIDirect3D9(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	default:
+		s.unimplemented(c, "IDirect3D9", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
@@ -926,7 +934,12 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			s.bind(c, &s.BoundTextures[stage], c.Arg(2))
 		}
 		c.Regs[cpu.RegEAX] = 0
-	case 66: // GetTexture(this, Stage, ppTexture)
+	case 66: // GetTextureStageState(this, Stage, Type, pValue): stage states are not tracked
+		if p := c.Arg(3); p != 0 {
+			c.Write32(p, 0)
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 64: // GetTexture(this, Stage, ppTexture)
 		stage := c.Arg(1)
 		pp := c.Arg(2)
 		if pp != 0 && stage < 16 {
@@ -1093,7 +1106,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			s.StreamStrides[st] = c.Arg(4)
 		}
 		c.Regs[cpu.RegEAX] = 0
-	case 102, 104: // SetIndices(this, pIndexData)
+	case 102: // SetStreamSourceFreq(this, StreamNumber, Setting): no instancing
+		c.Regs[cpu.RegEAX] = 0
+	case 104: // SetIndices(this, pIndexData)
 		s.bind(c, &s.BoundIndices, c.Arg(1))
 		c.Regs[cpu.RegEAX] = 0
 	case 106: // CreatePixelShader(this, pFunction, ppShader)
@@ -1131,7 +1146,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, s.allocCOMObject(c, s.vtQuery9, 16))
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 12, 41, 42: // ShowCursor, BeginScene, EndScene: nothing to do
+		c.Regs[cpu.RegEAX] = 0
 	default:
+		s.unimplemented(c, "IDirect3DDevice9", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
@@ -1381,6 +1399,7 @@ func (s *Subsystem) handleID3DXBuffer(c *cpu.CPU, winSlot int) {
 			c.Regs[cpu.RegEAX] = 0
 		}
 	default:
+		s.unimplemented(c, "ID3DXBuffer", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
@@ -1554,6 +1573,7 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	default:
+		s.unimplemented(c, "IDirectInput8A", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
@@ -1622,7 +1642,10 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 			c.Write32(pdwInOut, 0)
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 7, 8, 11, 13, 25: // Acquire, Unacquire, SetDataFormat, SetCooperativeLevel, Poll: nothing to do
+		c.Regs[cpu.RegEAX] = 0
 	default:
+		s.unimplemented(c, "IDirectInputDevice8A", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
@@ -1727,7 +1750,10 @@ func (s *Subsystem) handleIDirectSound8(c *cpu.CPU, winSlot int) {
 			c.Write32(ppDup, sb)
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 6: // SetCooperativeLevel: nothing to do
+		c.Regs[cpu.RegEAX] = 0
 	default:
+		s.unimplemented(c, "IDirectSound8", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
@@ -1904,6 +1930,7 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 	case 19: // Unlock(this, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2, dwAudioBytes2)
 		c.Regs[cpu.RegEAX] = 0
 	default:
+		s.unimplemented(c, "IDirectSoundBuffer8", winSlot)
 		c.Regs[cpu.RegEAX] = 0
 	}
 	c.Ret()
