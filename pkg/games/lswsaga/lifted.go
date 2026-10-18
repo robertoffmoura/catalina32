@@ -1,8 +1,8 @@
 package lswsaga
 
 import (
-	"encoding/binary"
 	"math"
+	"math/bits"
 	"os"
 
 	"catalina32/pkg/cpu"
@@ -83,7 +83,7 @@ func liftedNuBufReadF32(c *cpu.CPU) {
 		c.Write32(0x02bb2114, ebx+4)
 		var f float32
 		if c.Read32(0x02bb2118) != 0 {
-			u := binary.BigEndian.Uint32(c.Mem[0x02bb1108+ebx : 0x02bb1108+ebx+4])
+			u := bits.ReverseBytes32(c.Read32(0x02bb1108 + ebx))
 			f = math.Float32frombits(u)
 		} else {
 			f = c.ReadF32(0x02bb1108 + ebx)
@@ -102,15 +102,15 @@ func liftedNuStrCpy(c *cpu.CPU) {
 	var n uint32
 	if src != 0 {
 		for {
-			b := c.Mem[src+n]
+			b := c.Read8(src + n)
 			if b == 0 {
 				break
 			}
-			c.Mem[dst+n] = b
+			c.Write8(dst+n, b)
 			n++
 		}
 	}
-	c.Mem[dst+n] = 0
+	c.Write8(dst+n, 0)
 	c.Regs[cpu.RegEAX] = n
 	c.Ret()
 }
@@ -262,19 +262,19 @@ func liftedNuStrNCmp(c *cpu.CPU) {
 	}
 	if eax == 0xFFFFFFFF {
 		eax = 0
-		for c.Mem[s1+eax] != 0 {
+		for c.Read8(s1+eax) != 0 {
 			eax++
 		}
 	} else if eax == 0xFFFFFFFE {
 		eax = 0
-		for c.Mem[s2+eax] != 0 {
+		for c.Read8(s2+eax) != 0 {
 			eax++
 		}
 	}
 	edi := uint32(1) - eax
 	for {
-		cl := int8(c.Mem[s1])
-		bl := int8(c.Mem[s2])
+		cl := int8(c.Read8(s1))
+		bl := int8(c.Read8(s2))
 		if cl > bl {
 			c.Regs[cpu.RegEAX] = 1
 			c.Ret()
@@ -303,7 +303,7 @@ func liftedNuStrNCmp(c *cpu.CPU) {
 
 func liftedNuTxtReadLine(c *cpu.CPU) {
 	edi := c.Arg(0)
-	if c.Mem[edi+0x578] != 0 {
+	if c.Read8(edi+0x578) != 0 {
 		c.EIP = 0x00275370
 		return
 	}
@@ -331,7 +331,7 @@ func liftedNuTxtReadLine(c *cpu.CPU) {
 			c.EIP = 0x00275511
 			return
 		}
-		al := c.Mem[buf+uint32(pos)-base]
+		al := c.Read8(buf + uint32(pos) - base)
 		pos++
 		esi := int32(int8(al))
 		edx := uint32(1)
@@ -396,7 +396,7 @@ func liftedNuTxtReadLine(c *cpu.CPU) {
 					c.EIP = 0x00275511
 					return
 				}
-				dl := int8(c.Mem[buf+uint32(pos)-base])
+				dl := int8(c.Read8(buf + uint32(pos) - base))
 				pos++
 				if dl == 0 || dl == 10 {
 					break
@@ -427,8 +427,8 @@ func liftedNuTxtReadLine(c *cpu.CPU) {
 	c.Write32(edi+0x520, 0)
 	c.Write32(edi+0x51c, lineNo)
 	c.Write32(edi+0x524, uint32(pos))
-	copy(c.Mem[lineBuf:lineBuf+ebx], temp[:ebx])
-	c.Mem[lineBuf+ebx] = 0
+	copy(c.WBytes(lineBuf, uint32(ebx)), temp[:ebx])
+	c.Write8(lineBuf+ebx, 0)
 	c.Regs[cpu.RegEAX] = ebx
 	c.Ret()
 }
@@ -451,7 +451,7 @@ func cstrContains(mem []byte, ptr uint32, ch uint8) bool {
 
 func liftedNuTxtReadToken(c *cpu.CPU) {
 	ecx := c.Arg(0)
-	if c.Mem[ecx+0x578] != 0 {
+	if c.Read8(ecx+0x578) != 0 {
 		c.EIP = 0x00275990
 		return
 	}
@@ -464,21 +464,21 @@ func liftedNuTxtReadToken(c *cpu.CPU) {
 	for {
 		lineBuf := c.Read32(ecx + 0x50c)
 		lineMask := c.Read32(ecx+0x514) - 1
-		if c.Mem[lineBuf+(edi&lineMask)] == 0 {
+		if c.Read8(lineBuf+(edi&lineMask)) == 0 {
 			break
 		}
-		bl := c.Mem[lineBuf+edi]
+		bl := c.Read8(lineBuf + edi)
 		if inQuote == 0 {
 			if cstrContains(c.Mem, c.Read32(ecx+0x580), bl) {
 				if outLen == 0 {
 					tokBuf := c.Read32(ecx + 0x510)
-					c.Mem[tokBuf] = bl
+					c.Write8(tokBuf, bl)
 					c.Write32(ecx+0x520, edi+1)
 					outLen = 1
 				}
 				tokBuf := c.Read32(ecx + 0x510)
 				tokMask := c.Read32(ecx+0x518) - 1
-				c.Mem[tokBuf+(outLen&tokMask)] = 0
+				c.Write8(tokBuf+(outLen&tokMask), 0)
 				c.Regs[cpu.RegEAX] = outLen
 				c.Ret()
 				return
@@ -492,7 +492,7 @@ func liftedNuTxtReadToken(c *cpu.CPU) {
 			if outLen != 0 {
 				tokBuf := c.Read32(ecx + 0x510)
 				tokMask := c.Read32(ecx+0x518) - 1
-				c.Mem[tokBuf+(outLen&tokMask)] = 0
+				c.Write8(tokBuf+(outLen&tokMask), 0)
 				c.Regs[cpu.RegEAX] = outLen
 				c.Ret()
 				return
@@ -505,7 +505,7 @@ func liftedNuTxtReadToken(c *cpu.CPU) {
 		} else {
 			tokBuf := c.Read32(ecx + 0x510)
 			tokMask := c.Read32(ecx+0x518) - 1
-			c.Mem[tokBuf+(outLen&tokMask)] = bl
+			c.Write8(tokBuf+(outLen&tokMask), bl)
 			outLen++
 			edi = c.Read32(ecx + 0x520)
 		}
@@ -517,7 +517,7 @@ func liftedNuTxtReadToken(c *cpu.CPU) {
 	}
 	tokBuf := c.Read32(ecx + 0x510)
 	tokMask := c.Read32(ecx+0x518) - 1
-	c.Mem[tokBuf+(outLen&tokMask)] = 0
+	c.Write8(tokBuf+(outLen&tokMask), 0)
 	c.Regs[cpu.RegEAX] = outLen
 	c.Ret()
 }
@@ -604,22 +604,22 @@ func liftedNuStrNICmp(c *cpu.CPU) {
 	}
 	if eax == 0xFFFFFFFF {
 		eax = 0
-		for c.Mem[s1+eax] != 0 {
+		for c.Read8(s1+eax) != 0 {
 			eax++
 		}
 	} else if eax == 0xFFFFFFFE {
 		eax = 0
-		for c.Mem[s2+eax] != 0 {
+		for c.Read8(s2+eax) != 0 {
 			eax++
 		}
 	}
 	esi := uint32(1) - eax
 	for {
-		bl := c.Mem[s1]
+		bl := c.Read8(s1)
 		if bl-'a' < 26 {
 			bl -= 0x20
 		}
-		bh := c.Mem[s2]
+		bh := c.Read8(s2)
 		if bh-'a' < 26 {
 			bh -= 0x20
 		}
@@ -664,7 +664,7 @@ func liftedNuShaderGenerateHLSL(c *cpu.CPU) {
 			c.Write32(vec, buf)
 			c.Write32(vec+8, 64)
 		}
-		copy(c.Mem[buf:], stubHLSL)
+		copy(c.WBytes(buf, uint32(len(stubHLSL))), stubHLSL)
 		c.Write32(vec+4, uint32(len(stubHLSL)))
 	}
 	c.Regs[cpu.RegEAX] = 1
@@ -674,7 +674,7 @@ func liftedNuShaderGenerateHLSL(c *cpu.CPU) {
 func liftedNuStrLen(c *cpu.CPU) {
 	s := c.Arg(0)
 	var n uint32
-	for c.Mem[s+n] != 0 {
+	for c.Read8(s+n) != 0 {
 		n++
 	}
 	c.Regs[cpu.RegEAX] = n
@@ -695,11 +695,11 @@ func liftedNuStrICmp(c *cpu.CPU) {
 		return
 	}
 	for {
-		bl := c.Mem[s1]
+		bl := c.Read8(s1)
 		if bl-'a' < 26 {
 			bl -= 0x20
 		}
-		bh := c.Mem[s2]
+		bh := c.Read8(s2)
 		if bh-'a' < 26 {
 			bh -= 0x20
 		}
@@ -738,7 +738,7 @@ func liftedNuFileReadU16(c *cpu.CPU) {
 		buf := c.Read32(esi)
 		base := c.Read32(esi + 0x528)
 		idx := uint32(pos) - base
-		val := uint32(binary.LittleEndian.Uint16(c.Mem[buf+idx : buf+idx+2]))
+		val := uint32(c.Read16(buf + idx))
 		c.Write32(esi+0x524, uint32(pos+2))
 		c.Regs[cpu.RegEAX] = val
 		c.Ret()
@@ -755,7 +755,7 @@ func liftedNuStrSliceEq(c *cpu.CPU) {
 	if slen > 0 {
 		sptr := c.Read32(edx)
 		for i := int32(0); i < slen; i++ {
-			if c.Mem[eax+uint32(i)] != c.Mem[sptr+uint32(i)] {
+			if c.Read8(eax+uint32(i)) != c.Read8(sptr+uint32(i)) {
 				c.Regs[cpu.RegEAX] = 0
 				c.Ret()
 				return
@@ -763,7 +763,7 @@ func liftedNuStrSliceEq(c *cpu.CPU) {
 		}
 		eax += uint32(slen)
 	}
-	if c.Mem[eax] == 0 {
+	if c.Read8(eax) == 0 {
 		c.Regs[cpu.RegEAX] = 1
 	} else {
 		c.Regs[cpu.RegEAX] = 0
@@ -790,7 +790,7 @@ func lzhufFillBits(c *cpu.CPU, bitbuf uint32, nbits uint32) uint32 {
 			c.Write32(0x02b940dc, rem-1)
 			ptr := c.Read32(0x02b940cc)
 			c.Write32(0x02b940cc, ptr+1)
-			nextByte = uint32(c.Mem[ptr])
+			nextByte = uint32(c.Read8(ptr))
 		}
 		c.Write32(0x02cccf94, nextByte)
 		c.Write32(0x02cccf90, 8)
@@ -821,19 +821,19 @@ func liftedNuLZHUFDecodeC(c *cpu.CPU) {
 			}
 			c.Write32(0x02ccefa0, blockRem-1)
 			bitbuf := c.Read32(0x02b940d4)
-			sym := uint32(binary.LittleEndian.Uint16(c.Mem[0x02ccefa4+(bitbuf>>20)*2:]))
+			sym := uint32(c.Read16(0x02ccefa4 + (bitbuf>>20)*2))
 			if sym >= 0x1fe {
 				mask := uint32(0x00080000)
 				for sym > 0x1fd {
 					if (bitbuf & mask) != 0 {
-						sym = uint32(binary.LittleEndian.Uint16(c.Mem[0x02b948d6+sym*2:]))
+						sym = uint32(c.Read16(0x02b948d6 + sym*2))
 					} else {
-						sym = uint32(binary.LittleEndian.Uint16(c.Mem[0x02b940e0+sym*2:]))
+						sym = uint32(c.Read16(0x02b940e0 + sym*2))
 					}
 					mask >>= 1
 				}
 			}
-			nbits := uint32(c.Mem[0x02cd0fa4+sym])
+			nbits := uint32(c.Read8(0x02cd0fa4 + sym))
 			lzhufFillBits(c, bitbuf, nbits)
 			if sym > 0xff {
 				c.Regs[cpu.RegESI] = esi
@@ -841,7 +841,7 @@ func liftedNuLZHUFDecodeC(c *cpu.CPU) {
 				c.Ret()
 				return
 			}
-			c.Mem[0x02cccf9d+esi] = uint8(sym)
+			c.Write8(0x02cccf9d+esi, uint8(sym))
 			esi++
 			if esi == limit {
 				c.Regs[cpu.RegESI] = esi
@@ -861,19 +861,19 @@ func liftedNuLZHUFDecodeC(c *cpu.CPU) {
 	}
 	c.Write32(0x02ccefa0, blockRem-1)
 	bitbuf := c.Read32(0x02b940d4)
-	sym := uint32(binary.LittleEndian.Uint16(c.Mem[0x02ccefa4+(bitbuf>>20)*2:]))
+	sym := uint32(c.Read16(0x02ccefa4 + (bitbuf>>20)*2))
 	if sym >= 0x1fe {
 		mask := uint32(0x00080000)
 		for sym > 0x1fd {
 			if (bitbuf & mask) != 0 {
-				sym = uint32(binary.LittleEndian.Uint16(c.Mem[0x02b948d6+sym*2:]))
+				sym = uint32(c.Read16(0x02b948d6 + sym*2))
 			} else {
-				sym = uint32(binary.LittleEndian.Uint16(c.Mem[0x02b940e0+sym*2:]))
+				sym = uint32(c.Read16(0x02b940e0 + sym*2))
 			}
 			mask >>= 1
 		}
 	}
-	nbits := uint32(c.Mem[0x02cd0fa4+sym])
+	nbits := uint32(c.Read8(0x02cd0fa4 + sym))
 	lzhufFillBits(c, bitbuf, nbits)
 	c.Regs[cpu.RegEAX] = sym
 	c.Ret()
@@ -882,19 +882,19 @@ func liftedNuLZHUFDecodeC(c *cpu.CPU) {
 // Statically lifted 64-bit translation of NuEngine's LZHUF distance decoder (0x0027d9d0)
 func liftedNuLZHUFDecodeP(c *cpu.CPU) {
 	bitbuf := c.Read32(0x02b940d4)
-	pt := uint32(binary.LittleEndian.Uint16(c.Mem[0x02cd11a2+(bitbuf>>24)*2:]))
+	pt := uint32(c.Read16(0x02cd11a2 + (bitbuf>>24)*2))
 	if pt >= 0x0e {
 		mask := uint32(0x00800000)
 		for pt > 0x0d {
 			if (bitbuf & mask) != 0 {
-				pt = uint32(binary.LittleEndian.Uint16(c.Mem[0x02b948d6+pt*2:]))
+				pt = uint32(c.Read16(0x02b948d6 + pt*2))
 			} else {
-				pt = uint32(binary.LittleEndian.Uint16(c.Mem[0x02b940e0+pt*2:]))
+				pt = uint32(c.Read16(0x02b940e0 + pt*2))
 			}
 			mask >>= 1
 		}
 	}
-	nbits := uint32(c.Mem[0x02cd13a2+pt])
+	nbits := uint32(c.Read8(0x02cd13a2 + pt))
 	bitbuf = lzhufFillBits(c, bitbuf, nbits)
 	var dist uint32
 	if pt != 0 {
@@ -916,8 +916,8 @@ func liftedNuLZHUFDecodeP(c *cpu.CPU) {
 		eax := int32(c.Read32(0x02cd23f4))
 		for eax > 0 {
 			eax--
-			bl := c.Mem[0x02cccf9d+ecx]
-			c.Mem[0x02cccf9d+esi] = bl
+			bl := c.Read8(0x02cccf9d + ecx)
+			c.Write8(0x02cccf9d+esi, bl)
 			ecx = (ecx + 1) & 0x1fff
 			c.Write32(0x02cd23f8, ecx)
 			esi++
