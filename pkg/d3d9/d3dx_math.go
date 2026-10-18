@@ -14,10 +14,12 @@ func thunkD3DXMatrixMultiply(c *cpu.CPU) {
 	}
 	for r := 0; r < 4; r++ {
 		for col := 0; col < 4; col++ {
-			out[r*4+col] = a[r*4+0]*b[0*4+col] +
-				a[r*4+1]*b[1*4+col] +
-				a[r*4+2]*b[2*4+col] +
-				a[r*4+3]*b[3*4+col]
+			// float32() around each product keeps it rounded (no fused multiply-add on arm64),
+			// so results are the same on every host.
+			out[r*4+col] = float32(a[r*4+0]*b[0*4+col]) +
+				float32(a[r*4+1]*b[1*4+col]) +
+				float32(a[r*4+2]*b[2*4+col]) +
+				float32(a[r*4+3]*b[3*4+col])
 		}
 	}
 	for i := 0; i < 16; i++ {

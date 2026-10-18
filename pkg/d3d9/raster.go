@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	"image/color"
 	"image/png"
 	"math"
 	"net"
@@ -13,10 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"catalina32/pkg/cpu"
 )
@@ -116,7 +117,7 @@ func (s *Subsystem) wantRender(frame uint64) bool {
 	if drawLogFrames[frame] {
 		return true
 	}
-	if s.ShmFile != nil && s.FrameDrawCalls > 0 && s.FrameDrawCalls < 80 {
+	if s.shm != nil && s.FrameDrawCalls > 0 && s.FrameDrawCalls < 80 {
 		return true
 	}
 	if s.CantinaDIPLogged > 0 || (liveMode && s.TitleFirstFrame > 0) {
@@ -151,7 +152,12 @@ func (s *Subsystem) initRasterizer(framesDir string) {
 				modeByte[0] = 3
 			}
 			_, _ = f.WriteAt(modeByte[:], 32)
-			s.ShmFile = f
+			if m, err := mapShm(f, ShmTotalSize); err == nil {
+				s.shm = m
+			} else {
+				fmt.Printf("[Display] cannot map %s: %v\n", shmPath, err)
+			}
+			f.Close() // the mapping stays valid
 		}
 	}
 	s.clearFramebuffer(0xFF000000)
@@ -409,24 +415,13 @@ func (s *Subsystem) ensureTextureDecoded(c *cpu.CPU, texObj uint32) *BufferDesc 
 	if res == nil || res.IsRT {
 		return res
 	}
-	if len(res.Pixels) == 0 && res.DataPtr != 0 && res.Length > 0 {
-		end := res.DataPtr + res.Length
-		if end <= uint32(len(c.Mem)) {
-			// Check if any non-zero bytes were written to DataPtr
-			nonZero := false
-			checkLen := res.Length
-			if checkLen > 256 {
-				checkLen = 256
-			}
-			for i := uint32(0); i < checkLen; i++ {
-				if c.Mem[res.DataPtr+i] != 0 {
-					nonZero = true
-					break
-				}
-			}
-			if nonZero {
-				res.Pixels = decodeTexturePixels(c.Mem[res.DataPtr:end], res.Width, res.Height, res.Format)
-			}
+	if (len(res.Pixels) == 0 || res.Stale) && res.DataPtr != 0 && res.Length > 0 {
+		data := c.Bytes(res.DataPtr, res.Length)
+		// A texture never written through a lock is decoded only once something is in it.
+		if data != nil && (res.Unlocked || slices.ContainsFunc(data[:min(len(data), 256)], func(b byte) bool { return b != 0 })) {
+			// A new slice: frames already queued keep sampling the old pixels (texSnap).
+			res.Pixels = decodeTexturePixels(data, res.Width, res.Height, res.Format)
+			res.Stale = false
 		}
 	}
 	return res
@@ -924,9 +919,9 @@ func (s *Subsystem) reportFPS(c *cpu.CPU) {
 		return
 	}
 	if dt := now.Sub(s.fpsTime).Seconds(); dt >= 2 {
-		fmt.Printf("[catalina32] %.1f FPS, %.1fM x86 instructions/s, %.0f%% waiting for the renderer (frame %d)\n",
+		fmt.Printf("[catalina32] %.1f FPS, %.1fM x86 instructions/s, %.0f%% waiting for the renderer, guest heap %d MB (frame %d)\n",
 			float64(s.FrameCount-s.fpsFrame)/dt, float64(c.Steps-s.fpsStep)/dt/1e6,
-			100*s.renderWait.Seconds()/dt, s.FrameCount)
+			100*s.renderWait.Seconds()/dt, c.HeapInUse()>>20, s.FrameCount)
 		s.fpsTime, s.fpsFrame, s.fpsStep, s.renderWait = now, s.FrameCount, c.Steps, 0
 	}
 }
@@ -1474,24 +1469,23 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 		return
 	}
 
-	s.FrameMu.Lock()
-	copy(s.LatestRGBA, s.Framebuffer.Pix)
-	s.LatestPNG = nil
-	s.FrameMu.Unlock()
+	if s.browserWatching() {
+		s.FrameMu.Lock()
+		copy(s.LatestRGBA, s.Framebuffer.Pix)
+		s.LatestPNG = nil
+		s.FrameMu.Unlock()
+	}
 
-	if s.ShmFile != nil {
-		var hdr [32]byte
-		steps := fi.steps
-		binary.LittleEndian.PutUint64(hdr[0:8], fi.frame)
-		binary.LittleEndian.PutUint64(hdr[8:16], fi.drawCalls)
-		binary.LittleEndian.PutUint64(hdr[16:24], fi.triangles)
-		binary.LittleEndian.PutUint64(hdr[24:32], steps)
-		_, _ = s.ShmFile.WriteAt(s.Framebuffer.Pix, ShmHeaderSize)
-		_, _ = s.ShmFile.WriteAt(hdr[:], 0)
+	if s.shm != nil {
+		copy(s.shm[ShmHeaderSize:], s.Framebuffer.Pix)
+		binary.LittleEndian.PutUint64(s.shm[8:16], fi.drawCalls)
+		binary.LittleEndian.PutUint64(s.shm[16:24], fi.triangles)
+		binary.LittleEndian.PutUint64(s.shm[24:32], fi.steps)
+		shmPublish(s.shm, 0, fi.frame) // last: the viewer polls the frame number
 	}
 
 	if liveMode {
-		if s.ShmFile != nil {
+		if s.shm != nil {
 			return
 		}
 		if s.FramesDir != "" && fi.frame%60 == 0 {
@@ -1514,25 +1508,44 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 		s.LatestPNG = pngBytes
 		s.FrameMu.Unlock()
 
+		// The PNG is written once; latest.png and cantina_latest.png become links to it.
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
-		_ = os.WriteFile(latestPath, pngBytes, 0644)
-		if fi.cubeTexCount >= 8 && (fi.frameDrawCalls > 50 || exportAllFrames) {
-			cantinaPath := filepath.Join(s.FramesDir, "cantina_latest.png")
-			_ = os.WriteFile(cantinaPath, pngBytes, 0644)
-			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))
+		framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))
+		switch {
+		case fi.cubeTexCount >= 8 && (fi.frameDrawCalls > 50 || exportAllFrames):
 			_ = os.WriteFile(framePath, pngBytes, 0644)
-		} else if fi.frame == 1 || fi.frame == 30 || fi.frame == 60 || fi.frame == 90 || fi.frame == 120 || fi.frame%30 == 0 {
-			framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))
+			linkOrWrite(framePath, filepath.Join(s.FramesDir, "cantina_latest.png"), pngBytes)
+			linkOrWrite(framePath, latestPath, pngBytes)
+		case fi.frame == 1 || fi.frame%30 == 0:
 			_ = os.WriteFile(framePath, pngBytes, 0644)
+			linkOrWrite(framePath, latestPath, pngBytes)
+		default:
+			_ = os.WriteFile(latestPath, pngBytes, 0644)
 		}
 	}
+}
+
+// linkOrWrite makes dst a hard link to src (replacing dst), or writes data to it if linking fails.
+func linkOrWrite(src, dst string, data []byte) {
+	tmp := dst + ".tmp"
+	_ = os.Remove(tmp)
+	if os.Link(src, tmp) == nil && os.Rename(tmp, dst) == nil {
+		return
+	}
+	_ = os.WriteFile(dst, data, 0644)
+}
+
+// shmPublish stores v at off in the viewer's shared memory with release ordering, so the viewer
+// sees everything written before it (pixels before the frame number, samples before the index).
+func shmPublish(shm []byte, off int, v uint64) {
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&shm[off])), v)
 }
 
 func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 	const maxOutFrames = 4096
 	outFrames := 735 // ~16.67ms at 44.1 kHz
 	now := time.Now()
-	if s.ShmFile != nil && s.AutoKeysMode == "off" && !s.LastAudioTime.IsZero() {
+	if s.shm != nil && s.AutoKeysMode == "off" && !s.LastAudioTime.IsZero() {
 		dt := now.Sub(s.LastAudioTime).Seconds()
 		if dt < 0.005 {
 			dt = 0.005
@@ -1574,7 +1587,7 @@ func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 			freq = 44100
 		}
 
-		if s.ShmFile != nil && ab.DataPtr != 0 && ab.DataPtr+ab.Length <= memLen && ab.Volume > -5000 {
+		if s.shm != nil && ab.DataPtr != 0 && ab.DataPtr+ab.Length <= memLen && ab.Volume > -5000 {
 			gain := float32(1.0)
 			if ab.Volume < 0 {
 				gain = float32(math.Pow(10.0, float64(ab.Volume)/2000.0))
@@ -1633,7 +1646,7 @@ func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 		}
 	}
 
-	if s.ShmFile != nil && anyPlaying {
+	if s.shm != nil && anyPlaying {
 		var pcm [maxOutFrames * 4]byte
 		for i := 0; i < outFrames; i++ {
 			l, r := mixL[i], mixR[i]
@@ -1656,20 +1669,22 @@ func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 		if ringPos+firstFrames > ShmAudioFrames {
 			firstFrames = ShmAudioFrames - ringPos
 		}
-		_, _ = s.ShmFile.WriteAt(pcm[:firstFrames*4], int64(ShmAudioOffset+8+ringPos*4))
+		copy(s.shm[ShmAudioOffset+8+ringPos*4:], pcm[:firstFrames*4])
 		if firstFrames < uOut {
-			_, _ = s.ShmFile.WriteAt(pcm[firstFrames*4:uOut*4], int64(ShmAudioOffset+8))
+			copy(s.shm[ShmAudioOffset+8:], pcm[firstFrames*4:uOut*4])
 		}
 		s.AudioWriteSamples += uOut
-		var idxBuf [8]byte
-		binary.LittleEndian.PutUint64(idxBuf[:], s.AudioWriteSamples)
-		_, _ = s.ShmFile.WriteAt(idxBuf[:], int64(ShmAudioOffset))
+		shmPublish(s.shm, ShmAudioOffset, s.AudioWriteSamples)
 	}
 }
 
 func (s *Subsystem) startDisplayServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		st := s.statusSnap()
+		s.KeyMu.Lock()
+		ak := s.AutoKeysMode
+		s.KeyMu.Unlock()
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
@@ -1714,24 +1729,25 @@ func (s *Subsystem) startDisplayServer() {
       'KeyU': 0x16, 'KeyH': 0x23, 'KeyJ': 0x24, 'KeyK': 0x25
     };
     let autoMode = %q;
+    const post = {method: 'POST', headers: {'X-C32-Viewer': '1'}};
     function tapKey(dik) {
-      fetch('/key?dik=' + dik + '&action=tap', {method: 'POST'});
+      fetch('/key?dik=' + dik + '&action=tap', post);
     }
     function cycleAutoKeys() {
       const order = ['boot', 'off', 'loop'];
       autoMode = order[(order.indexOf(autoMode) + 1) %% order.length];
-      fetch('/autokeys?mode=' + autoMode, {method: 'POST'});
+      fetch('/autokeys?mode=' + autoMode, post);
     }
     window.addEventListener('keydown', (e) => {
       if (keyMap[e.code] !== undefined) {
         e.preventDefault();
-        fetch('/key?dik=' + keyMap[e.code] + '&action=down', {method: 'POST'});
+        fetch('/key?dik=' + keyMap[e.code] + '&action=down', post);
       }
     });
     window.addEventListener('keyup', (e) => {
       if (keyMap[e.code] !== undefined) {
         e.preventDefault();
-        fetch('/key?dik=' + keyMap[e.code] + '&action=up', {method: 'POST'});
+        fetch('/key?dik=' + keyMap[e.code] + '&action=up', post);
       }
     });
     const screenImg = document.getElementById('screen');
@@ -1772,22 +1788,23 @@ func (s *Subsystem) startDisplayServer() {
     }, 250);
   </script>
 </body>
-</html>`, s.FrameCount, s.DrawCallCount, s.TriangleCount, s.AutoKeysMode, s.AutoKeysMode)
+</html>`, st.Frame, st.DrawCalls, st.Triangles, ak, ak)
 	})
 	mux.HandleFunc("/status.json", func(w http.ResponseWriter, r *http.Request) {
-		steps := uint64(0)
-		if s.VM != nil {
-			steps = s.VM.Steps
-		}
+		st := s.statusSnap()
 		s.KeyMu.Lock()
 		ak := s.AutoKeysMode
 		s.KeyMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprintf(w, `{"frame":%d,"drawCalls":%d,"triangles":%d,"clears":%d,"steps":%d,"autoKeys":%q}`,
-			s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, steps, ak)
+			st.Frame, st.DrawCalls, st.Triangles, st.Clears, st.Steps, ak)
 	})
 	mux.HandleFunc("/key", func(w http.ResponseWriter, r *http.Request) {
+		if !viewerRequest(w, r) {
+			return
+		}
+		frame := s.statusSnap().Frame
 		dik, err := strconv.ParseUint(r.URL.Query().Get("dik"), 0, 8)
 		if err != nil {
 			http.Error(w, "bad dik", http.StatusBadRequest)
@@ -1797,16 +1814,19 @@ func (s *Subsystem) startDisplayServer() {
 		s.KeyMu.Lock()
 		switch action {
 		case "down":
-			s.KeyHoldUntil[dik] = s.FrameCount + 60
+			s.KeyHoldUntil[dik] = frame + 60
 		case "up":
 			s.KeyHoldUntil[dik] = 0
 		default: // "tap"
-			s.KeyHoldUntil[dik] = s.FrameCount + 10
+			s.KeyHoldUntil[dik] = frame + 10
 		}
 		s.KeyMu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/autokeys", func(w http.ResponseWriter, r *http.Request) {
+		if !viewerRequest(w, r) {
+			return
+		}
 		mode := r.URL.Query().Get("mode")
 		if mode == "boot" || mode == "off" || mode == "loop" {
 			s.KeyMu.Lock()
@@ -1816,6 +1836,7 @@ func (s *Subsystem) startDisplayServer() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/latest.png", func(w http.ResponseWriter, r *http.Request) {
+		s.browserSeen.Store(time.Now().Unix())
 		s.FrameMu.Lock()
 		data := s.LatestPNG
 		if len(data) == 0 && len(s.LatestRGBA) == ScreenWidth*ScreenHeight*4 {
@@ -1857,4 +1878,35 @@ func (s *Subsystem) startDisplayServer() {
 	}
 }
 
-var _ = color.RGBA{}
+// viewerStatus is what the HTTP viewer reports, published once per frame by the emulation thread.
+type viewerStatus struct {
+	Frame, DrawCalls, Triangles, Clears, Steps uint64
+}
+
+func (s *Subsystem) publishStatus(c *cpu.CPU) {
+	s.status.Store(&viewerStatus{s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, c.Steps})
+}
+
+func (s *Subsystem) statusSnap() viewerStatus {
+	if st := s.status.Load(); st != nil {
+		return *st
+	}
+	return viewerStatus{}
+}
+
+// browserWatching reports whether the HTTP viewer fetched a frame in the last few seconds (only
+// then is each frame copied for it).
+func (s *Subsystem) browserWatching() bool {
+	return time.Now().Unix()-s.browserSeen.Load() <= 5
+}
+
+// viewerRequest accepts only POSTs from the viewer page: the custom header cannot be sent by
+// another site without a CORS preflight (which this server never approves), so web pages cannot
+// inject keys.
+func viewerRequest(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost || r.Header.Get("X-C32-Viewer") != "1" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
+}

@@ -4,11 +4,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"catalina32/pkg/cpu"
@@ -40,6 +40,15 @@ type BufferDesc struct {
 	RefCount      int
 	IsDuplicate   bool
 	IsRT          bool // texture used as a render target: Pixels is its colour buffer
+	Unlocked      bool // the game has written level 0 through a lock at least once
+	Stale         bool // level 0 changed since Pixels was decoded
+}
+
+// unlocked records a write to level 0 through LockRect/LockBox: the next draw re-decodes it.
+func (res *BufferDesc) unlocked() {
+	if res != nil {
+		res.Unlocked, res.Stale = true, true
+	}
 }
 
 type VertexDecl struct {
@@ -110,6 +119,7 @@ type Subsystem struct {
 	dupDSBuffer     uint32
 	dummy3DObj      uint32
 	mipScratchBuf   uint32
+	mipScratchLen   uint32
 
 	Resources         map[uint32]*BufferDesc
 	VertexDecls       map[uint32]*VertexDecl
@@ -138,7 +148,9 @@ type Subsystem struct {
 	FrameMu           sync.Mutex
 	LatestPNG         []byte
 	LatestRGBA        []byte
-	ShmFile           *os.File
+	shm               []byte // the live viewer's shared memory (C32_SHM_FILE), mapped
+	status            atomic.Pointer[viewerStatus]
+	browserSeen       atomic.Int64 // unix time the HTTP viewer last fetched a frame
 	AudioBuffers      []*BufferDesc
 	AudioWriteSamples uint64
 	LastAudioTime     time.Time
@@ -160,11 +172,12 @@ type Subsystem struct {
 	shaderObjs          map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
 	constTables         map[uint32]*compiledShader
 	curVS, curPS        *compiledShader
-	curVSObj, curPSObj  uint32            // bound shader objects (as the game sees them)
-	drawSeq             int32             // draw calls so far in the frame being recorded
-	curRT               uint32            // render target 0 as set by the game (0: back buffer)
-	origin              map[uint32]string // C32_DRAW_LOG: how each texture/surface was created
-	devCalls            [128]int          // C32_DRAW_LOG: device method calls in the inspected frame
+	curVSObj, curPSObj  uint32             // bound shader objects (as the game sees them)
+	drawSeq             int32              // draw calls so far in the frame being recorded
+	curRT               uint32             // render target 0 as set by the game (0: back buffer)
+	refs                map[uint32]*comRef // reference counts of device resources (refs.go)
+	origin              map[uint32]string  // C32_DRAW_LOG: how each texture/surface was created
+	devCalls            [128]int           // C32_DRAW_LOG: device method calls in the inspected frame
 	renderTargets       map[*BufferDesc]*renderTarget
 	curTargetPix        []byte // emulation side: target of the operations being queued (nil: back buffer)
 	curTargetSkip       bool
@@ -297,6 +310,11 @@ func (s *Subsystem) buildVTable(c *cpu.CPU, ifaceName string, slots int, handler
 				vm.Regs[cpu.RegEAX] = vm.Arg(0)
 				vm.Ret()
 			case 2: // AddRef
+				if s.refs[vm.Arg(0)] != nil {
+					vm.Regs[cpu.RegEAX] = uint32(s.addRef(vm.Arg(0)))
+					vm.Ret()
+					return
+				}
 				if ifaceName == "IDirectSoundBuffer8" {
 					if res := s.Resources[vm.Arg(0)]; res != nil {
 						res.RefCount++
@@ -308,6 +326,11 @@ func (s *Subsystem) buildVTable(c *cpu.CPU, ifaceName string, slots int, handler
 				vm.Regs[cpu.RegEAX] = 2
 				vm.Ret()
 			case 3: // Release
+				if s.refs[vm.Arg(0)] != nil {
+					vm.Regs[cpu.RegEAX] = uint32(s.release(vm, vm.Arg(0)))
+					vm.Ret()
+					return
+				}
 				if ifaceName == "IDirectSoundBuffer8" {
 					thisObj := vm.Arg(0)
 					if res := s.Resources[thisObj]; res != nil {
@@ -367,6 +390,12 @@ func (s *Subsystem) allocCOMObject(c *cpu.CPU, vtAddr uint32, size uint32) uint3
 	}
 	obj := c.Calloc(1, size)
 	c.Write32(obj, vtAddr)
+	if s.tracked(vtAddr) {
+		if s.refs == nil {
+			s.refs = map[uint32]*comRef{}
+		}
+		s.refs[obj] = &comRef{count: 1}
+	}
 	return obj
 }
 
@@ -379,10 +408,7 @@ func (s *Subsystem) allocSurface(c *cpu.CPU, width, height, format uint32) uint3
 	}
 	obj := s.allocCOMObject(c, s.vtSurface9, 32)
 	pitch := width * 4
-	bufSize := pitch * height
-	if bufSize > 4*1024*1024 {
-		bufSize = 4 * 1024 * 1024
-	}
+	bufSize := lockSize(pitch, height, format)
 	// Guest backing store is allocated lazily (guestBuf on LockRect): GetSurfaceLevel is called every frame and
 	// eagerly reserving a 3.6MB buffer each time exhausted the guest heap after ~2800 frames.
 	s.Resources[obj] = &BufferDesc{
@@ -410,12 +436,25 @@ func (s *Subsystem) allocTextureLazy(c *cpu.CPU, width, height, format uint32) u
 	}
 	obj := s.allocCOMObject(c, s.vtTexture9, 32)
 	pitch := width * 4
-	bufSize := pitch * height
-	if bufSize > 4*1024*1024 {
-		bufSize = 4 * 1024 * 1024
-	}
+	bufSize := lockSize(pitch, height, format)
 	s.Resources[obj] = &BufferDesc{Length: bufSize, Format: format, Width: width, Height: height, Pitch: pitch}
 	return obj
+}
+
+// isDXT reports whether format is a block-compressed FourCC format (DXT1..DXT5).
+func isDXT(format uint32) bool {
+	return format >= 0x31545844 && format <= 0x35545844
+}
+
+// lockSize is the guest backing store for a w-pitch, h-row image: what the game may write through
+// LockRect with the pitch we report (rows of 4x4 blocks for DXT formats). Sizes up to 4 MB keep
+// the historical rounding (pitch*height, capped), so guest heap layout is unchanged for them.
+func lockSize(pitch, height, format uint32) uint32 {
+	rows := height
+	if isDXT(format) {
+		rows = (height + 3) / 4
+	}
+	return max(min(pitch*height, 4<<20), pitch*rows)
 }
 
 // guestBuf returns the resource's guest-memory backing store, allocating it on first use.
@@ -435,7 +474,7 @@ func (s *Subsystem) RegisterIndirectXThunks(c *cpu.CPU, prof *profile.Profile) {
 
 	prof.Bind(c, "D3DXCreateTextureFromFileExA", s.thunkD3DXCreateTextureFromFileExA)
 	prof.Bind(c, "D3DXCreateTextureFromFileInMemory", s.thunkD3DXCreateTextureFromFileInMemory)
-	prof.Bind(c, "D3DXAssembleShader", s.thunkD3DXAssembleShader)
+	prof.Bind(c, "D3DXCreateCubeTextureFromFileInMemory", s.thunkD3DXCreateCubeTextureFromFileInMemory)
 	prof.Bind(c, "D3DXCompileShader", s.thunkD3DXCompileShader)
 	prof.Bind(c, "D3DXMatrixMultiply", thunkD3DXMatrixMultiply)
 
@@ -644,6 +683,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 17: // Present
 		s.FrameCount++
+		s.publishStatus(c)
 		if s.OnPresent != nil {
 			s.OnPresent(s.FrameCount)
 		}
@@ -659,7 +699,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if liveMode {
 			s.reportFPS(c)
 		}
-		if s.ShmFile != nil && s.AutoKeysMode == "off" {
+		if s.shm != nil && s.AutoKeysMode == "off" {
 			if !s.LastPresentTime.IsZero() {
 				const targetFrame = 16667 * time.Microsecond
 				if elapsed := time.Since(s.LastPresentTime); elapsed < targetFrame {
@@ -673,6 +713,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if s.TraceLog && (s.FrameCount <= 10 || s.FrameCount%30 == 0) {
 			fmt.Printf("[D3D9] Present() Frame #%d completed (DrawCalls=%d, Triangles=%d, Clears=%d, AudioSamples=%d, Steps=%d)\n",
 				s.FrameCount, s.DrawCallCount, s.TriangleCount, s.ClearCount, s.AudioWriteSamples, c.Steps)
+			if s.FrameCount%300 == 0 {
+				fmt.Printf("[catalina32] guest heap: %d MB in use, high-water mark %d MB\n", c.HeapInUse()>>20, c.HeapPeak()>>20)
+			}
 		}
 		s.FrameDrawCalls = 0
 		s.drawSeq = 0
@@ -686,6 +729,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		pp := c.Arg(4)
 		if pp != 0 {
 			c.Write32(pp, s.defaultBackBuf)
+			s.addRef(s.defaultBackBuf)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 23: // CreateTexture(this, Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle)
@@ -705,8 +749,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		fmtCode := c.Arg(6)
 		pp := c.Arg(8)
 		tex := s.allocCOMObject(c, s.vtVolTex9, 32)
-		buf := c.Malloc(65536)
-		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: 65536, Format: fmtCode, Width: w, Height: h, Pitch: w * 4}
+		size := max(65536, lockSize(w*4, h, fmtCode)*max(c.Arg(3), 1))
+		buf := c.Malloc(size)
+		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: w, Height: h, Pitch: w * 4}
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -716,8 +761,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		fmtCode := c.Arg(4)
 		pp := c.Arg(6)
 		tex := s.allocCOMObject(c, s.vtCubeTex9, 32)
-		buf := c.Malloc(65536)
-		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: 65536, Format: fmtCode, Width: edge, Height: edge, Pitch: edge * 4}
+		size := max(65536, lockSize(edge*4, edge, fmtCode)) // all faces share one buffer
+		buf := c.Malloc(size)
+		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: edge, Height: edge, Pitch: edge * 4}
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -785,7 +831,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 37: // SetRenderTarget(this, RenderTargetIndex, pRenderTarget)
 		if c.Arg(1) == 0 {
-			s.curRT = c.Arg(2)
+			s.bind(c, &s.curRT, c.Arg(2))
 			s.setRenderTarget(c.Arg(2))
 		}
 		if s.drawLogging() {
@@ -805,12 +851,14 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		pp := c.Arg(2)
 		if pp != 0 {
 			c.Write32(pp, s.defaultBackBuf)
+			s.addRef(s.defaultBackBuf)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 40: // GetDepthStencilSurface(this, ppZStencilSurface)
 		pp := c.Arg(1)
 		if pp != 0 {
 			c.Write32(pp, s.defaultDepthBuf)
+			s.addRef(s.defaultDepthBuf)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 43: // Clear(this, Count, pRects, Flags, Color, Z, Stencil)
@@ -875,7 +923,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			fmt.Printf("[DEV f%d] SetTexture(%d, %x [%s]) after draw #%d\n", s.FrameCount+1, stage, c.Arg(2), s.origin[c.Arg(2)], s.drawSeq)
 		}
 		if stage < 16 {
-			s.BoundTextures[stage] = c.Arg(2)
+			s.bind(c, &s.BoundTextures[stage], c.Arg(2))
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 66: // GetTexture(this, Stage, ppTexture)
@@ -883,6 +931,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		pp := c.Arg(2)
 		if pp != 0 && stage < 16 {
 			c.Write32(pp, s.BoundTextures[stage])
+			s.addRef(s.BoundTextures[stage])
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 81: // DrawPrimitive(this, PrimitiveType, StartVertex, PrimitiveCount)
@@ -1039,13 +1088,13 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 	case 100: // SetStreamSource(this, StreamNumber, pStreamData, OffsetInBytes, Stride)
 		st := c.Arg(1)
 		if st < 16 {
-			s.StreamSources[st] = c.Arg(2)
+			s.bind(c, &s.StreamSources[st], c.Arg(2))
 			s.StreamOffsets[st] = c.Arg(3)
 			s.StreamStrides[st] = c.Arg(4)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 102, 104: // SetIndices(this, pIndexData)
-		s.BoundIndices = c.Arg(1)
+		s.bind(c, &s.BoundIndices, c.Arg(1))
 		c.Regs[cpu.RegEAX] = 0
 	case 106: // CreatePixelShader(this, pFunction, ppShader)
 		pp := c.Arg(2)
@@ -1127,11 +1176,14 @@ func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
 		if res != nil {
 			w, h, fmtCode = res.Width, res.Height, res.Format
 		}
-		surf := s.allocSurface(c, w, h, fmtCode)
-		s.noteOrigin(surf, "GetSurfaceLevel(%x [%s], %d)", thisPtr, s.origin[thisPtr], lvl)
-		if lvl == 0 && res != nil {
-			s.Resources[surf] = res
-		}
+		surf := s.child(c, thisPtr, lvl, func() uint32 {
+			surf := s.allocSurface(c, max(w>>lvl, 1), max(h>>lvl, 1), fmtCode)
+			s.noteOrigin(surf, "GetSurfaceLevel(%x [%s], %d)", thisPtr, s.origin[thisPtr], lvl)
+			if lvl == 0 && res != nil {
+				s.Resources[surf] = res
+			}
+			return surf
+		})
 		if pp != 0 {
 			c.Write32(pp, surf)
 		}
@@ -1144,13 +1196,21 @@ func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
 			if lvl == 0 {
 				buf = s.guestBuf(c, res)
 			} else {
-				if s.mipScratchBuf == 0 {
-					s.mipScratchBuf = c.Malloc(1024 * 1024)
+				// Lower mip levels are not sampled: they all go to one scratch buffer, grown to
+				// the largest level locked so far.
+				need := max(lockSize(res.Pitch, max(res.Height>>lvl, 1), res.Format), 1<<20)
+				if need > s.mipScratchLen {
+					c.Free(s.mipScratchBuf)
+					s.mipScratchBuf, s.mipScratchLen = c.Malloc(need), need
 				}
 				buf = s.mipScratchBuf
 			}
 			c.Write32(pLock+0, res.Pitch)
 			c.Write32(pLock+4, buf)
+		}
+	case 20: // UnlockRect(this, Level)
+		if c.Arg(1) == 0 {
+			s.Resources[thisPtr].unlocked()
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -1169,7 +1229,8 @@ func (s *Subsystem) handleIDirect3DCubeTexture9(c *cpu.CPU, winSlot int) {
 	case 18: // GetCubeMapSurface(this, FaceType, Level, ppCubeMapSurface)
 		pp := c.Arg(3)
 		if pp != 0 {
-			c.Write32(pp, s.allocSurface(c, 64, 64, 21))
+			face, lvl := c.Arg(1), c.Arg(2)
+			c.Write32(pp, s.child(c, thisPtr, face<<16|lvl, func() uint32 { return s.allocSurface(c, 64, 64, 21) }))
 		}
 	case 19: // LockRect(this, FaceType, Level, pLockedRect, pRect, Flags)
 		pLock := c.Arg(3)
@@ -1177,6 +1238,10 @@ func (s *Subsystem) handleIDirect3DCubeTexture9(c *cpu.CPU, winSlot int) {
 		if pLock != 0 && res != nil {
 			c.Write32(pLock+0, res.Pitch)
 			c.Write32(pLock+4, s.guestBuf(c, res))
+		}
+	case 20: // UnlockRect(this, FaceType, Level)
+		if c.Arg(2) == 0 {
+			s.Resources[thisPtr].unlocked()
 		}
 	}
 	c.Regs[cpu.RegEAX] = 0
@@ -1198,6 +1263,10 @@ func (s *Subsystem) handleIDirect3DVolumeTexture9(c *cpu.CPU, winSlot int) {
 			c.Write32(pLock+4, res.Pitch*res.Height)
 			c.Write32(pLock+8, s.guestBuf(c, res))
 		}
+	case 20: // UnlockBox(this, Level)
+		if c.Arg(1) == 0 {
+			s.Resources[thisPtr].unlocked()
+		}
 	}
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
@@ -1218,6 +1287,8 @@ func (s *Subsystem) handleIDirect3DSurface9(c *cpu.CPU, winSlot int) {
 			c.Write32(pLock+0, res.Pitch)
 			c.Write32(pLock+4, s.guestBuf(c, res))
 		}
+	case 14: // UnlockRect(this)
+		s.Resources[thisPtr].unlocked() // level 0 of its texture when it is GetSurfaceLevel(0)
 	}
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
@@ -1273,10 +1344,12 @@ func (s *Subsystem) handleIDirect3DSwapChain9(c *cpu.CPU, winSlot int) {
 			fmt.Printf("[D3D9] IDirect3DSwapChain9::Present(%x) at frame %d\n", c.Arg(0), s.FrameCount)
 		}
 		s.FrameCount++
+		s.publishStatus(c)
 	case 5: // GetBackBuffer(this, iBackBuffer, Type, ppBackBuffer)
 		pp := c.Arg(3)
 		if pp != 0 {
 			c.Write32(pp, s.defaultBackBuf)
+			s.addRef(s.defaultBackBuf)
 		}
 	case 7: // GetDisplayMode(this, pMode)
 		pMode := c.Arg(1)
@@ -1371,8 +1444,9 @@ func (s *Subsystem) allocD3DXBuffer(c *cpu.CPU, size uint32) uint32 {
 	return obj
 }
 
-func (s *Subsystem) thunkD3DXAssembleShader(c *cpu.CPU) {
-	// 0x00691ef0 is D3DXCreateCubeTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppCubeTexture)
+// D3DXCreateCubeTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppCubeTexture): cube maps
+// are not sampled yet, so this returns an empty cube texture.
+func (s *Subsystem) thunkD3DXCreateCubeTextureFromFileInMemory(c *cpu.CPU) {
 	s.CubeTexCount++
 	ppCubeTex := c.Arg(3)
 	if ppCubeTex != 0 {
@@ -1501,9 +1575,9 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 		if lpvData != 0 && cbData > 0 && cbData <= 4096 {
 			clear(c.Mem[lpvData : lpvData+cbData])
 			if cbData == 256 {
-				if s.ShmFile != nil {
+				if s.shm != nil {
 					var shmKeys [256]byte
-					if _, err := s.ShmFile.ReadAt(shmKeys[:], 32); err == nil {
+					if copy(shmKeys[:], s.shm[32:]) == len(shmKeys) {
 						switch shmKeys[0] {
 						case 1:
 							s.KeyMu.Lock()
@@ -1841,20 +1915,19 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 // later, and any pad reported once stays connected (neutral if it drops, e.g. Bluetooth sleep).
 func (s *Subsystem) readPad(user uint32) ([12]byte, bool) {
 	var pad [12]byte
-	if s.ShmFile == nil || user >= ShmPads {
+	if s.shm == nil || user >= ShmPads {
 		return pad, false
 	}
-	var hdr [4]byte
 	if !s.padWaited {
 		s.padWaited = true
 		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-			if _, err := s.ShmFile.ReadAt(hdr[:], ShmPadOffset); err == nil && binary.LittleEndian.Uint32(hdr[:]) == ShmPadReady {
+			if binary.LittleEndian.Uint32(s.shm[ShmPadOffset:]) == ShmPadReady {
 				break
 			}
 		}
 	}
 	if !s.padViewer {
-		if _, err := s.ShmFile.ReadAt(hdr[:], ShmPadOffset); err == nil && binary.LittleEndian.Uint32(hdr[:]) == ShmPadReady {
+		if binary.LittleEndian.Uint32(s.shm[ShmPadOffset:]) == ShmPadReady {
 			s.padViewer = true
 		}
 	}
@@ -1862,7 +1935,7 @@ func (s *Subsystem) readPad(user uint32) ([12]byte, bool) {
 	// controllers connected after the game's one-time enumeration still reach it.
 	always := s.padViewer && user < ShmHotplugPads
 	var rec [ShmPadSize]byte
-	if _, err := s.ShmFile.ReadAt(rec[:], int64(ShmPadOffset+4+user*ShmPadSize)); err != nil || rec[0] == 0 {
+	if copy(rec[:], s.shm[ShmPadOffset+4+user*ShmPadSize:]); rec[0] == 0 {
 		return pad, s.padSeen[user] || always
 	}
 	s.padSeen[user] = true
@@ -1915,5 +1988,3 @@ func (s *Subsystem) thunkXInputGetCapabilities(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
 }
-
-var _ = math.Float32frombits

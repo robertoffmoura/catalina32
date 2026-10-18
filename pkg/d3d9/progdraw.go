@@ -173,6 +173,24 @@ func (s *Subsystem) queueProgDraw(c *cpu.CPU, primType uint32, order []uint32, b
 // shadeProg runs the vertex shader for every referenced vertex of d.
 func shadeProg(d *progDraw, m *d3dsm.Machine) {
 	m.C = d.vsC
+	// Which vertex elements feed which input registers, worked out once for the draw.
+	type binding struct {
+		sn  *streamSnap
+		off uint32
+		typ uint8
+		reg int
+	}
+	var binds []binding
+	for _, e := range d.elems {
+		if e.Stream > 15 {
+			continue
+		}
+		for _, in := range d.vs.Inputs {
+			if in.Usage == int(e.Usage) && in.UsageIdx == int(e.UIdx) {
+				binds = append(binds, binding{&d.streams[e.Stream], uint32(e.Offset), e.Type, d3dsm.FileV + in.Reg&15})
+			}
+		}
+	}
 	for i := range d.verts {
 		if !d.need[i] {
 			continue
@@ -180,20 +198,12 @@ func shadeProg(d *progDraw, m *d3dsm.Machine) {
 		for r := d3dsm.FileV; r < d3dsm.FileV+16; r++ {
 			m.F[r] = d3dsm.Vec{0, 0, 0, 1}
 		}
-		for _, e := range d.elems {
-			if e.Stream > 15 {
+		for _, b := range binds {
+			off := uint32(i)*b.sn.stride + b.off
+			if b.sn.data == nil || int(off)+16 > len(b.sn.data) {
 				continue
 			}
-			sn := &d.streams[e.Stream]
-			off := uint32(i)*sn.stride + uint32(e.Offset)
-			if sn.data == nil || int(off)+16 > len(sn.data) {
-				continue
-			}
-			for _, in := range d.vs.Inputs {
-				if in.Usage == int(e.Usage) && in.UsageIdx == int(e.UIdx) {
-					m.F[d3dsm.FileV+in.Reg&15] = decodeElementBytes(sn.data[off:], e.Type)
-				}
-			}
+			m.F[b.reg] = decodeElementBytes(b.sn.data[off:], b.typ)
 		}
 		m.F[d3dsm.FileOPos], m.F[d3dsm.FileOD], m.F[d3dsm.FileOD+1] = d3dsm.Vec{}, d3dsm.Vec{1, 1, 1, 1}, d3dsm.Vec{}
 		clear(m.F[d3dsm.FileOT : d3dsm.FileOT+8])
@@ -549,6 +559,7 @@ func blendFactor(f uint32, src, dst d3dsm.Vec, bf [4]float32) d3dsm.Vec {
 type progShader struct {
 	m  d3dsm.Machine
 	wm d3dsm.WideMachine
+	o  *outState // the draw whose samplers m and wm are bound to
 }
 
 func (s *Subsystem) rasterizeProg(qt *queuedTri, sh *progShader, ids []int32, pix []byte, yStart, yEnd int) {
@@ -558,10 +569,13 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, sh *progShader, ids []int32, pi
 	v0, v1, v2 := &pt.v[0], &pt.v[1], &pt.v[2]
 	zbuf := s.ZBuffer
 	m, wm := &sh.m, &sh.wm
-	sample := func(st int, uv d3dsm.Vec) d3dsm.Vec { return sampleTex(o, st&7, uv) }
-	m.C, m.Sample = d.psC, sample
-	wm.C, wm.Sample = d.psC, sample
-	wm.SampleLanes = func(st int, uv *[4]d3dsm.Lane, n int, out *[4]d3dsm.Lane) { sampleLanes(o, st&7, uv, n, out) }
+	if sh.o != o { // bind the samplers once per draw, not per triangle
+		sh.o = o
+		sample := func(st int, uv d3dsm.Vec) d3dsm.Vec { return sampleTex(o, st&7, uv) }
+		m.Sample, wm.Sample = sample, sample
+		wm.SampleLanes = func(st int, uv *[4]d3dsm.Lane, n int, out *[4]d3dsm.Lane) { sampleLanes(o, st&7, uv, n, out) }
+	}
+	m.C, wm.C = d.psC, d.psC
 	wide := !d.fixedPixel && d.ps.Wide()
 	// plainWrite: the output merger just stores the colour (no alpha test, blending or depth write).
 	plainWrite := !o.alphaTest && !o.blend && o.colorWrite&7 == 7 && !(o.zTest && o.zWrite)

@@ -20,7 +20,7 @@ const (
 
 // rsDefaults are the D3D9 device defaults for states the rasterizer reads (ZENABLE assumes an
 // automatic depth-stencil surface).
-var rsDefaults = map[int]uint32{
+var rsDefaults = [256]uint32{
 	rsZEnable:          1,
 	rsZWriteEnable:     1,
 	rsSrcBlend:         2, // ONE

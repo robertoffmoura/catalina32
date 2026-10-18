@@ -31,7 +31,7 @@ placed in the .app, original binary kept as `LEGO Star Wars Saga.i386`.
 | Universal macOS .app packaging & `/workspace/run_on_mac.sh` | DONE (`bin/catalina32-darwin-arm64`, `bin/catalina32-darwin-amd64`, `dist/LEGO Star Wars Saga 64-Bit.app`) |
 
 ## Layout
-- `cmd/catalina32` — main (`-game <i386 executable>` or `C32_BIN_PATH`): loads image, registers shims, runs WinMain. `C32_WATCH_KEYS=1` enables a debug memory watch.
+- `cmd/catalina32` — main (`-game <i386 executable>` or `C32_BIN_PATH`): loads image, registers shims, runs WinMain. `C32_WATCH=0xlo-0xhi` logs the first guest access to that range from each instruction address.
 - `cmd/lift` — **disassembler/lifter; prints to stdout only (does not modify any package)**. `go run ./cmd/lift -start=0x... -end=0x...`
   VAs are the Mach-O VAs (e.g. WinMain 0x00209d10). Linear sweep: start at a function boundary or output desyncs.
 - `pkg/cpu` — x86 interpreter (`exec.go`), FPU/SSE, `Intercepts` (host thunks keyed by guest address), `context.go` (thread context).
