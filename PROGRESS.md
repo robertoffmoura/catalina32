@@ -109,7 +109,7 @@ To ensure this runtime can be open-sourced on GitHub as a general runner for 32-
    - Parallelize scanline band rasterization across host CPU cores (and/or offload triangles to Metal/OpenGL in `C32Window`) and support general `D3DXCompileShader` constant tables (`ID3DXConstantTable`).
 
 ## Session log (latest first)
-- **Code review pass** (external review of the whole tree; all items checked against the code, fixed in 9 commits):
+- **Code review pass** (external review of the whole tree; every item checked against the code before fixing):
   - Crashes → clean guest halts: DIV/IDIV #DE (zero divisor, quotient overflow); instruction fetch at the end of the arena; every shim bulk access (`CPU.Bytes/WBytes/CBytes`, `Read128/Write128`, x87 m80) is bounds-checked; the heap halts with a reason when exhausted.
   - Cross-host determinism: float→int conversions use x86 "integer indefinite" semantics (`cpu.ToInt16/32/64`) in the interpreter, crt and c32aot; products in lifted math, D3DXMatrixMultiply and compiled SSE arithmetic are explicitly rounded so arm64 cannot fuse multiply-adds.
   - Saves/data: CreateFileA honours dispositions, fopen r+/a/a+ no longer truncate; writes to game data go to `SaveRoot/DataOverlay` (copy-on-write), which reads prefer.
