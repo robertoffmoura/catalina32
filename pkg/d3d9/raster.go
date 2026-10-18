@@ -12,12 +12,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"catalina32/pkg/cpu"
-	"catalina32/pkg/d3dsm"
 )
 
 const (
@@ -820,6 +821,18 @@ func emitScreenTriangle(dst *[]queuedTri, v0, v1, v2 screenVertex, st *triState)
 		return
 	}
 
+	// rasterizeBand writes a pixel only if its alpha reaches 8. Alpha is the interpolated vertex
+	// alpha, scaled by texture alpha and the 2x rule, except that untextured-alpha 3D texturing
+	// forces it opaque. A triangle whose vertices all fall short writes nothing (the engine draws
+	// full-screen layers that are invisible most of the time).
+	maxA := max(v0.a, v1.a, v2.a)
+	if st.x2 {
+		maxA = sat2x(maxA)
+	}
+	if maxA < 8 && !(hasTex && v0.u > -900.0 && is3D && !st.alpha) {
+		return
+	}
+
 	*dst = append(*dst, queuedTri{
 		v0:           v0,
 		v1:           v1,
@@ -877,6 +890,7 @@ func (s *Subsystem) submitFrame() {
 		s.drawOps(s.expandProg(s.expandDraws(ops)), ids)
 		if ids != nil {
 			reportDrawFootprints(info.frame, ids, s.ZBuffer)
+			s.reportDrawCosts(info.frame)
 		}
 		s.exportFrame(info)
 		s.spareTris = ops
@@ -946,6 +960,13 @@ func (s *Subsystem) drawOps(ops []queuedTri, ids []int32) {
 	s.drawSegment(ops[start:], ids)
 }
 
+// Rasterization splits the target into bands of bandH rows. Each operation is binned into the
+// bands it touches; workers take bands as they free up, so uneven bands keep every core busy.
+const (
+	bandH    = 16
+	numBands = (ScreenHeight + bandH - 1) / bandH
+)
+
 // drawSegment rasterizes operations into the current target in parallel horizontal bands.
 func (s *Subsystem) drawSegment(ops []queuedTri, ids []int32) {
 	if len(ops) == 0 || s.drawSkip {
@@ -955,28 +976,42 @@ func (s *Subsystem) drawSegment(ops []queuedTri, ids []int32) {
 	if s.drawPix != nil {
 		target = s.drawPix
 	}
-	const numBands = 8
-	const bandH = ScreenHeight / numBands
-	var wg sync.WaitGroup
-	wg.Add(numBands)
-	for b := 0; b < numBands; b++ {
-		bMinY := b * bandH
-		bMaxY := (b+1)*bandH - 1
-		if b == numBands-1 {
-			bMaxY = ScreenHeight - 1
+	for b := range s.bins {
+		s.bins[b] = s.bins[b][:0]
+	}
+	for i := range ops {
+		lo, hi := max(ops[i].minY, 0), min(ops[i].maxY, ScreenHeight-1)
+		for b := lo / bandH; b <= hi/bandH && hi >= lo; b++ {
+			s.bins[b] = append(s.bins[b], int32(i))
 		}
-		go func(yLo, yHi int) {
+	}
+	workers := min(runtime.GOMAXPROCS(0), numBands)
+	for len(s.bandShaders) < workers {
+		s.bandShaders = append(s.bandShaders, new(progShader))
+	}
+	var next atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(sh *progShader) {
 			defer wg.Done()
-			s.rasterizeBand(ops, ids, target, yLo, yHi)
-		}(bMinY, bMaxY)
+			for {
+				b := int(next.Add(1) - 1)
+				if b >= numBands {
+					return
+				}
+				s.rasterizeBand(ops, s.bins[b], ids, target, b*bandH, min((b+1)*bandH, ScreenHeight)-1, sh)
+			}
+		}(s.bandShaders[w])
 	}
 	wg.Wait()
 }
 
-func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, pix []byte, bandMinY, bandMaxY int) {
+// rasterizeBand draws the operations listed (indices into ops, in order) within rows
+// bandMinY..bandMaxY.
+func (s *Subsystem) rasterizeBand(ops []queuedTri, list []int32, ids []int32, pix []byte, bandMinY, bandMaxY int, pm *progShader) {
 	zbuf := s.ZBuffer
-	var pm d3dsm.Machine
-	for i := range ops {
+	for _, i := range list {
 		qt := &ops[i]
 		if qt.clearOp {
 			s.clearRows(pix, qt.clearColor, qt.clearFlags, bandMinY, bandMaxY)
@@ -993,8 +1028,11 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, pix []byte, band
 		if yEnd > bandMaxY {
 			yEnd = bandMaxY
 		}
+		if ids != nil {
+			s.noteDrawCost(qt, yStart, yEnd)
+		}
 		if qt.prog != nil {
-			s.rasterizeProg(qt, &pm, ids, pix, yStart, yEnd)
+			s.rasterizeProg(qt, pm, ids, pix, yStart, yEnd)
 			continue
 		}
 
@@ -1047,188 +1085,201 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, ids []int32, pix []byte, band
 			tex1Pixels = texRes1.Pixels
 		}
 
-		v0r, v1r, v2r := float32(v0.r), float32(v1.r), float32(v2.r)
 		perspTex := (sampleTex || sampleTex1) && v0.invW > 0 && v1.invW > 0 && v2.invW > 0 &&
 			(v0.invW != v1.invW || v1.invW != v2.invW)
-		u0w, u1w, u2w := v0.u*v0.invW, v1.u*v1.invW, v2.u*v2.invW
-		t0w, t1w, t2w := v0.v*v0.invW, v1.v*v1.invW, v2.v*v2.invW
-		l1u0w, l1u1w, l1u2w := v0.u1*v0.invW, v1.u1*v1.invW, v2.u1*v2.invW
-		l1t0w, l1t1w, l1t2w := v0.v1*v0.invW, v1.v1*v1.invW, v2.v1*v2.invW
-		v0g, v1g, v2g := float32(v0.g), float32(v1.g), float32(v2.g)
-		v0b, v1b, v2b := float32(v0.b), float32(v1.b), float32(v2.b)
-		v0a, v1a, v2a := float32(v0.a), float32(v1.a), float32(v2.a)
+
+		// Attributes are linear in the barycentric weights, so along a row each is its value at the
+		// first covered pixel plus k times a per-pixel step. Texture coordinates of perspective
+		// triangles are interpolated as u/w, v/w and 1/w.
+		sx0, sx1 := float32(te.dx[0]*te.sign)*te.inv, float32(te.dx[1]*te.sign)*te.inv
+		attr := func(f0, f1, f2 float32) lerpAttr {
+			return lerpAttr{c: f2, d0: f0 - f2, d1: f1 - f2, dx: (f0-f2)*sx0 + (f1-f2)*sx1}
+		}
+		az := attr(v0.sz, v1.sz, v2.sz)
+		ar := attr(float32(v0.r), float32(v1.r), float32(v2.r))
+		ag := attr(float32(v0.g), float32(v1.g), float32(v2.g))
+		ab := attr(float32(v0.b), float32(v1.b), float32(v2.b))
+		aa := attr(float32(v0.a), float32(v1.a), float32(v2.a))
+		var au, av, aq, au1, av1, ab1 lerpAttr
+		if perspTex {
+			au = attr(v0.u*v0.invW, v1.u*v1.invW, v2.u*v2.invW)
+			av = attr(v0.v*v0.invW, v1.v*v1.invW, v2.v*v2.invW)
+			aq = attr(v0.invW, v1.invW, v2.invW)
+			au1 = attr(v0.u1*v0.invW, v1.u1*v1.invW, v2.u1*v2.invW)
+			av1 = attr(v0.v1*v0.invW, v1.v1*v1.invW, v2.v1*v2.invW)
+		} else {
+			au = attr(v0.u, v1.u, v2.u)
+			av = attr(v0.v, v1.v, v2.v)
+			au1 = attr(v0.u1, v1.u1, v2.u1)
+			av1 = attr(v0.v1, v1.v1, v2.v1)
+		}
+		ab1 = attr(v0.blend1, v1.blend1, v2.blend1)
+		opaque3D := is3D && !alphaEnabled
+		x2, additive := qt.x2, qt.additive
+		zWrite := is3D && !additive
+		markIDs := ids != nil && !qt.tex0.fromRT
 
 		for y := yStart; y <= yEnd; y++ {
 			rowIdx := y * ScreenWidth
 			e, step := te.start(minX, y)
-			for x := minX; x <= maxX; x, e[0], e[1], e[2] = x+1, e[0]+step[0], e[1]+step[1], e[2]+step[2] {
-				if te.inside(&e) {
-					w0 := float32(e[0]) * te.inv
-					w1 := float32(e[1]) * te.inv
-					w2 := 1.0 - w0 - w1
-					z := w0*v0.sz + w1*v1.sz + w2*v2.sz
-					zIdx := rowIdx + x
-					if !is3D || z <= zbuf[zIdx] {
-						r := uint8(w0*v0r + w1*v1r + w2*v2r)
-						g := uint8(w0*v0g + w1*v1g + w2*v2g)
-						b := uint8(w0*v0b + w1*v1b + w2*v2b)
-						a := uint8(w0*v0a + w1*v1a + w2*v2a)
-						skip := false
-
-						if sampleTex {
-							var tu, tv, iw float32
+			x0, x1, ok := te.span(&e, step, minX, maxX)
+			if !ok {
+				continue
+			}
+			w0, w1 := float32(e[0])*te.inv, float32(e[1])*te.inv
+			z0, dz := az.row(w0, w1), az.dx
+			a0, da := aa.row(w0, w1), aa.dx
+			r0, g0, b0 := ar.row(w0, w1), ag.row(w0, w1), ab.row(w0, w1)
+			var u0, tv0, q0, u10, tv10, bl0 float32
+			if sampleTex || sampleTex1 {
+				u0, tv0 = au.row(w0, w1), av.row(w0, w1)
+				u10, tv10 = au1.row(w0, w1), av1.row(w0, w1)
+				q0 = aq.row(w0, w1)
+				bl0 = ab1.row(w0, w1)
+			}
+			for x := x0; x <= x1; x++ {
+				k := float32(x - x0)
+				zIdx := rowIdx + x
+				z := z0 + k*dz
+				if is3D && !(z <= zbuf[zIdx]) {
+					continue
+				}
+				a := uint8(a0 + k*da)
+				var tr, tg, tb uint8 = 255, 255, 255
+				if sampleTex {
+					tu, tv := u0+k*au.dx, tv0+k*av.dx
+					var rq float32
+					if perspTex {
+						rq = 1 / (q0 + k*aq.dx)
+						tu, tv = tu*rq, tv*rq
+					}
+					var tx, ty uint32
+					if isPow2 {
+						ui := int32(tu * texWf)
+						if tu < 0 {
+							ui--
+						}
+						vi := int32(tv * texHf)
+						if tv < 0 {
+							vi--
+						}
+						tx = uint32(ui) & wMask
+						ty = uint32(vi) & hMask
+					} else {
+						tu = tu - float32(math.Floor(float64(tu)))
+						tv = tv - float32(math.Floor(float64(tv)))
+						tx = uint32(tu*texWf) % texW
+						ty = uint32(tv*texHf) % texH
+					}
+					tp := texPixels[ty*texW+tx]
+					if tp == 0 && !isDXT1 && !sampleTex1 {
+						continue
+					}
+					tr, tg, tb = uint8(tp), uint8(tp>>8), uint8(tp>>16)
+					ta := uint8(tp >> 24)
+					if sampleTex1 {
+						if b1 := bl0 + k*ab1.dx; b1 > 0.01 {
+							tu1, tv1 := u10+k*au1.dx, tv10+k*av1.dx
 							if perspTex {
-								iw = w0*v0.invW + w1*v1.invW + w2*v2.invW
-								tu = (w0*u0w + w1*u1w + w2*u2w) / iw
-								tv = (w0*t0w + w1*t1w + w2*t2w) / iw
+								tu1, tv1 = tu1*rq, tv1*rq
+							}
+							var tx1, ty1 uint32
+							if isPow2_1 {
+								ui1 := int32(tu1 * tex1Wf)
+								if tu1 < 0 {
+									ui1--
+								}
+								vi1 := int32(tv1 * tex1Hf)
+								if tv1 < 0 {
+									vi1--
+								}
+								tx1 = uint32(ui1) & w1Mask
+								ty1 = uint32(vi1) & h1Mask
 							} else {
-								tu = w0*v0.u + w1*v1.u + w2*v2.u
-								tv = w0*v0.v + w1*v1.v + w2*v2.v
+								tu1 = tu1 - float32(math.Floor(float64(tu1)))
+								tv1 = tv1 - float32(math.Floor(float64(tv1)))
+								tx1 = uint32(tu1*tex1Wf) % tex1W
+								ty1 = uint32(tv1*tex1Hf) % tex1H
 							}
-							var tx, ty uint32
-							if isPow2 {
-								ui := int32(tu * texWf)
-								if tu < 0 {
-									ui--
-								}
-								vi := int32(tv * texHf)
-								if tv < 0 {
-									vi--
-								}
-								tx = uint32(ui) & wMask
-								ty = uint32(vi) & hMask
-							} else {
-								tu = tu - float32(math.Floor(float64(tu)))
-								tv = tv - float32(math.Floor(float64(tv)))
-								tx = uint32(tu*texWf) % texW
-								ty = uint32(tv*texHf) % texH
+							tp1 := tex1Pixels[ty1*tex1W+tx1]
+							a1 := uint16(b1 * float32(uint8(tp1>>24)))
+							if a1 > 255 {
+								a1 = 255
 							}
-							tp := texPixels[ty*texW+tx]
-							if tp == 0 && !isDXT1 && !sampleTex1 {
-								skip = true
-							} else {
-								tr := uint8(tp & 0xFF)
-								tg := uint8((tp >> 8) & 0xFF)
-								tb := uint8((tp >> 16) & 0xFF)
-								ta := uint8((tp >> 24) & 0xFF)
-								if sampleTex1 {
-									b1 := w0*v0.blend1 + w1*v1.blend1 + w2*v2.blend1
-									if b1 > 0.01 {
-										var tu1, tv1 float32
-										if perspTex {
-											tu1 = (w0*l1u0w + w1*l1u1w + w2*l1u2w) / iw
-											tv1 = (w0*l1t0w + w1*l1t1w + w2*l1t2w) / iw
-										} else {
-											tu1 = w0*v0.u1 + w1*v1.u1 + w2*v2.u1
-											tv1 = w0*v0.v1 + w1*v1.v1 + w2*v2.v1
-										}
-										var tx1, ty1 uint32
-										if isPow2_1 {
-											ui1 := int32(tu1 * tex1Wf)
-											if tu1 < 0 {
-												ui1--
-											}
-											vi1 := int32(tv1 * tex1Hf)
-											if tv1 < 0 {
-												vi1--
-											}
-											tx1 = uint32(ui1) & w1Mask
-											ty1 = uint32(vi1) & h1Mask
-										} else {
-											tu1 = tu1 - float32(math.Floor(float64(tu1)))
-											tv1 = tv1 - float32(math.Floor(float64(tv1)))
-											tx1 = uint32(tu1*tex1Wf) % tex1W
-											ty1 = uint32(tv1*tex1Hf) % tex1H
-										}
-										tp1 := tex1Pixels[ty1*tex1W+tx1]
-										tr1 := uint8(tp1 & 0xFF)
-										tg1 := uint8((tp1 >> 8) & 0xFF)
-										tb1 := uint8((tp1 >> 16) & 0xFF)
-										ta1 := uint8((tp1 >> 24) & 0xFF)
-										a1 := uint16(b1 * float32(ta1))
-										if a1 > 255 {
-											a1 = 255
-										}
-										ia1 := 255 - a1
-										tr = uint8((uint16(tr)*ia1 + uint16(tr1)*a1) / 255)
-										tg = uint8((uint16(tg)*ia1 + uint16(tg1)*a1) / 255)
-										tb = uint8((uint16(tb)*ia1 + uint16(tb1)*a1) / 255)
-										ta = 255
-									}
-								}
-								r = uint8((uint16(r) * uint16(tr)) / 255)
-								g = uint8((uint16(g) * uint16(tg)) / 255)
-								b = uint8((uint16(b) * uint16(tb)) / 255)
-								if !is3D || alphaEnabled {
-									a = uint8((uint16(a) * uint16(ta)) / 255)
-								} else {
-									a = 255
-								}
-							}
-						} else if isGlyphQuad {
-							rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
-							ry := float64(y-qt.minY) / math.Max(1.0, float64(qt.maxY-qt.minY))
-							if rx < 0.15 || rx > 0.85 || ry < 0.15 || ry > 0.85 {
-								skip = true
-							} else {
-								uSeed := int(v0.u*256.0) + int(v0.v*512.0)
-								gx := int((rx - 0.15) / 0.70 * 5.0)
-								gy := int((ry - 0.15) / 0.70 * 7.0)
-								bit := ((uSeed*31 + gx*7 + gy*13) ^ (gx * gy)) & 3
-								if bit == 0 && gy != 0 && gy != 3 && gx != 2 {
-									skip = true
-								}
-							}
-						}
-						if qt.x2 {
-							r, g, b, a = sat2x(r), sat2x(g), sat2x(b), sat2x(a)
-						}
-						if !skip && a >= 8 {
-							if is3D && a >= 240 && !qt.additive {
-								zbuf[zIdx] = z
-							}
-							off := zIdx * 4
-							if ids != nil && !qt.tex0.fromRT {
-								ids[zIdx] = qt.id
-							}
-							if qt.additive {
-								af := uint16(a)
-								rAdd := uint16(pix[off+0]) + (uint16(r)*af)/255
-								gAdd := uint16(pix[off+1]) + (uint16(g)*af)/255
-								bAdd := uint16(pix[off+2]) + (uint16(b)*af)/255
-								if rAdd > 255 {
-									rAdd = 255
-								}
-								if gAdd > 255 {
-									gAdd = 255
-								}
-								if bAdd > 255 {
-									bAdd = 255
-								}
-								pix[off+0] = uint8(rAdd)
-								pix[off+1] = uint8(gAdd)
-								pix[off+2] = uint8(bAdd)
-								pix[off+3] = 255
-							} else if a == 255 {
-								pix[off+0] = r
-								pix[off+1] = g
-								pix[off+2] = b
-								pix[off+3] = 255
-							} else {
-								af := uint16(a)
-								ia := 255 - af
-								pix[off+0] = uint8((uint16(r)*af + uint16(pix[off+0])*ia) / 255)
-								pix[off+1] = uint8((uint16(g)*af + uint16(pix[off+1])*ia) / 255)
-								pix[off+2] = uint8((uint16(b)*af + uint16(pix[off+2])*ia) / 255)
-								pix[off+3] = 255
-							}
+							ia1 := 255 - a1
+							tr = uint8((uint16(tr)*ia1 + uint16(uint8(tp1))*a1) / 255)
+							tg = uint8((uint16(tg)*ia1 + uint16(uint8(tp1>>8))*a1) / 255)
+							tb = uint8((uint16(tb)*ia1 + uint16(uint8(tp1>>16))*a1) / 255)
+							ta = 255
 						}
 					}
+					if opaque3D {
+						a = 255
+					} else {
+						a = uint8((uint16(a) * uint16(ta)) / 255)
+					}
+				} else if isGlyphQuad {
+					rx := float64(x-minX) / math.Max(1.0, float64(maxX-minX))
+					ry := float64(y-qt.minY) / math.Max(1.0, float64(qt.maxY-qt.minY))
+					if rx < 0.15 || rx > 0.85 || ry < 0.15 || ry > 0.85 {
+						continue
+					}
+					uSeed := int(v0.u*256.0) + int(v0.v*512.0)
+					gx := int((rx - 0.15) / 0.70 * 5.0)
+					gy := int((ry - 0.15) / 0.70 * 7.0)
+					bit := ((uSeed*31 + gx*7 + gy*13) ^ (gx * gy)) & 3
+					if bit == 0 && gy != 0 && gy != 3 && gx != 2 {
+						continue
+					}
 				}
+				if x2 {
+					a = sat2x(a)
+				}
+				if a < 8 {
+					continue
+				}
+				r, g, b := uint8(r0+k*ar.dx), uint8(g0+k*ag.dx), uint8(b0+k*ab.dx)
+				if sampleTex {
+					r = uint8((uint16(r) * uint16(tr)) / 255)
+					g = uint8((uint16(g) * uint16(tg)) / 255)
+					b = uint8((uint16(b) * uint16(tb)) / 255)
+				}
+				if x2 {
+					r, g, b = sat2x(r), sat2x(g), sat2x(b)
+				}
+				if zWrite && a >= 240 {
+					zbuf[zIdx] = z
+				}
+				if markIDs {
+					ids[zIdx] = qt.id
+				}
+				px := pix[zIdx*4 : zIdx*4+4 : zIdx*4+4]
+				switch {
+				case additive:
+					af := uint16(a)
+					px[0] = uint8(min(uint16(px[0])+(uint16(r)*af)/255, 255))
+					px[1] = uint8(min(uint16(px[1])+(uint16(g)*af)/255, 255))
+					px[2] = uint8(min(uint16(px[2])+(uint16(b)*af)/255, 255))
+				case a == 255:
+					px[0], px[1], px[2] = r, g, b
+				default:
+					af := uint16(a)
+					ia := 255 - af
+					px[0] = uint8((uint16(r)*af + uint16(px[0])*ia) / 255)
+					px[1] = uint8((uint16(g)*af + uint16(px[1])*ia) / 255)
+					px[2] = uint8((uint16(b)*af + uint16(px[2])*ia) / 255)
+				}
+				px[3] = 255
 			}
 		}
 	}
 }
+
+// lerpAttr is a vertex attribute over a triangle: c + w0*d0 + w1*d1 at barycentric weights
+// (w0, w1), changing by dx per pixel along a row.
+type lerpAttr struct{ c, d0, d1, dx float32 }
+
+func (a *lerpAttr) row(w0, w1 float32) float32 { return a.c + w0*a.d0 + w1*a.d1 }
 
 func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCount uint32, pVerts uint32, stride uint32, isUP bool) {
 	if pVerts == 0 || stride < 12 || primCount == 0 || !s.rendering {

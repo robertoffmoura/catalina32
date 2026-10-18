@@ -7,6 +7,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strconv"
+	"time"
 
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/crt"
@@ -102,7 +103,12 @@ func main() {
 	}
 	if pf := os.Getenv("C32_CPUPROF"); pf != "" {
 		if f, err := os.Create(pf); err == nil {
-			_ = pprof.StartCPUProfile(f)
+			// C32_CPUPROF_AFTER=<seconds> starts the profile later (e.g. once a level is running).
+			if d, err := time.ParseDuration(os.Getenv("C32_CPUPROF_AFTER") + "s"); err == nil && d > 0 {
+				time.AfterFunc(d, func() { _ = pprof.StartCPUProfile(f) })
+			} else {
+				_ = pprof.StartCPUProfile(f)
+			}
 			defer pprof.StopCPUProfile()
 		}
 	}

@@ -109,6 +109,20 @@ To ensure this runtime can be open-sourced on GitHub as a general runner for 32-
    - Parallelize scanline band rasterization across host CPU cores (and/or offload triangles to Metal/OpenGL in `C32Window`) and support general `D3DXCompileShader` constant tables (`ID3DXConstantTable`).
 
 ## Session log (latest first)
+- **Renderer speed after the fidelity pass** (user: title ~8 FPS and level 4–5 FPS on the Mac, 80–95% waiting for the renderer):
+  - Causes, found with `C32_DRAW_LOG` (now also prints `[DRAWCOST]`: pixels visited per draw, i.e. overdraw, and max vertex alpha) and a delayed CPU profile (`C32_CPUPROF_AFTER=<s>`):
+    - Title/menus: 16 full-screen additive fog layers (25 vertices, 44-triangle strips at y≈0) are drawn every frame — the old "post-process grid" skip had been hiding them. 16.4 screens of pixels per frame (0.8 before). They are the real title-screen fog, so they stay.
+    - Level: the post-process composite (`ps_2_0` at `0x8e2ebc`: two bilinear reads, three ALU ops) ran at ~430 ns/pixel through the closure interpreter — ~60% of render CPU.
+  - Fixes (render output within 1–2 texel picks per frame of before; guest traces identical to 2.6B steps):
+    - Exact per-row coverage spans (`triEdges.span`, tested against the per-pixel test) instead of testing every pixel of the bounding box.
+    - Fixed-function loop: attributes as row value + k·step (no drift: k is an integer offset), one reciprocal for perspective, alpha rejection before colour work.
+    - Triangles whose vertex alpha cannot reach the rasterizer's write threshold are dropped at setup (exact).
+    - `d3dsm`: flat register file, operands resolved at compile time, switch dispatch, components passed in registers (Vec returns caused store-forwarding stalls). New `RunWide`: pixel shaders run 32 pixels of a row span per instruction (SoA registers), batch texture sampling (`SampleLanes`), batched plain colour writes. `TestWideMatchesScalar` checks every batchable pixel shader in the game binary against `Run`.
+    - Sampler: no closures, 8-bit bilinear weights and SWAR filtering like texture hardware (a coordinate on a texel centre reads one texel).
+    - Bands: 45 bands of 16 rows, operations binned once, workers pull bands (was 8 fixed bands that waited for the slowest).
+    - Composite benchmark (`BenchmarkPostProcessComposite`, needs `C32_BIN_PATH`): 427 → ~90 ns/pixel; level route (this VM, 12 threads) ~5.6 → ~15 FPS.
+  - The dev VM is CPU-starved (a spin loop gets ~0.5 core per thread; memory-heavy loops worse), so wall-clock numbers here are pessimistic; compare CPU time (profiles, `cpu-ns/pixel` in `BenchmarkFogLayer`).
+  - Next if still slow: real-shader vertex shading (`pkg/hlsl` closure tree, ~30% of level render CPU: VS plus the per-vertex PS) — same treatment as `d3dsm`, or batch vertices; the fog layers at ~14 ns/pixel CPU in game.
 - **Rendering fidelity pass (user-reported issues: crawl colour/stars, see-through ship, "Press" flash, sabres, studs, Force glow, door-menu flash)**:
   - **Real shaders are now the default** (`C32_REAL_SHADERS=0` selects the heuristic renderer). Paired in-level runs: ~10% slower than the heuristic renderer (was ~25%); fixes things the heuristics cannot see (Force-glow smoke tinted by shader constants, sky/planet depth, lighting, reflections).
   - **Shader bytecode (`pkg/d3dsm`)**: effects use precompiled vs_1_1/ps_1_1/ps_2_0 token streams embedded in the binary (24 shaders), passed to `CreateVertexShader`/`CreatePixelShader`. `d3dsm` decodes and executes SM1.1–2.0 (closure per instruction; `cmd/smdis` disassembles from an executable). Draws with a bytecode vertex shader run exactly in both renderers: VS per vertex, PS per pixel, bilinear/point and wrap/clamp from sampler states, full output merger (blend factors/op, alpha test, depth func/write, cull, colour mask). This brought sabre glows, studs (billboards expanded in the VS), sparkles, hit flashes, lamp beams. Placeholder blobs from our `D3DXCompileShader` stub are excluded.

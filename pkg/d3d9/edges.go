@@ -80,3 +80,35 @@ func (t *triEdges) start(x, y int) (e, step [3]int64) {
 func (t *triEdges) inside(e *[3]int64) bool {
 	return e[0]+t.adj[0] >= 0 && e[1]+t.adj[1] >= 0 && e[2]+t.adj[2] >= 0
 }
+
+// span returns the first and last x in [x0, x1] covered on the row whose oriented edge values at
+// x0 are e (from start), stepping the values to x = first. ok is false if the row is not covered.
+// It is exact: the pixels in [first, last] are those inside reports covered.
+func (t *triEdges) span(e *[3]int64, step [3]int64, x0, x1 int) (first, last int, ok bool) {
+	lo, hi := int64(0), int64(x1-x0)
+	for i := 0; i < 3; i++ {
+		v, s := e[i]+t.adj[i], step[i]
+		switch {
+		case s > 0:
+			if v < 0 {
+				lo = max(lo, (-v+s-1)/s)
+			}
+		case s < 0:
+			if v < 0 {
+				return 0, 0, false
+			}
+			hi = min(hi, v/-s)
+		default:
+			if v < 0 {
+				return 0, 0, false
+			}
+		}
+	}
+	if lo > hi {
+		return 0, 0, false
+	}
+	for i := 0; i < 3; i++ {
+		e[i] += lo * step[i]
+	}
+	return x0 + int(lo), x0 + int(hi), true
+}

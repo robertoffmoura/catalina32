@@ -158,3 +158,63 @@ func (s *Subsystem) noteOrigin(obj uint32, format string, args ...any) {
 	}
 	s.origin[obj] = fmt.Sprintf(format, args...)
 }
+
+// drawCost counts, per logged draw, the triangles and pixels the rasterizer visits: footprints
+// show only the final winners, this shows overdraw (pixels rejected by depth, alpha or blending).
+type drawCost struct{ tris, px, maxA int }
+
+// noteDrawCost records one triangle's covered pixels in rows yStart..yEnd (draw-log frames only).
+func (s *Subsystem) noteDrawCost(qt *queuedTri, yStart, yEnd int) {
+	var v [3]struct{ x, y float32 }
+	id := qt.id
+	if qt.prog != nil {
+		id = qt.prog.d.id
+		for k := range v {
+			v[k].x, v[k].y = qt.prog.v[k].sx, qt.prog.v[k].sy
+		}
+	} else {
+		v[0].x, v[0].y, v[1].x, v[1].y, v[2].x, v[2].y = qt.v0.sx, qt.v0.sy, qt.v1.sx, qt.v1.sy, qt.v2.sx, qt.v2.sy
+	}
+	te, ok := setupEdges(v[0].x, v[0].y, v[1].x, v[1].y, v[2].x, v[2].y)
+	if !ok {
+		return
+	}
+	n := 0
+	for y := yStart; y <= yEnd; y++ {
+		e, step := te.start(qt.minX, y)
+		if x0, x1, ok := te.span(&e, step, qt.minX, qt.maxX); ok {
+			n += x1 - x0 + 1
+		}
+	}
+	s.costMu.Lock()
+	if s.drawCosts == nil {
+		s.drawCosts = map[int32]*drawCost{}
+	}
+	c := s.drawCosts[id]
+	if c == nil {
+		c = &drawCost{}
+		s.drawCosts[id] = c
+	}
+	c.tris++
+	c.px += n
+	if qt.prog == nil {
+		c.maxA = max(c.maxA, int(qt.v0.a), int(qt.v1.a), int(qt.v2.a))
+	}
+	s.costMu.Unlock()
+}
+
+func (s *Subsystem) reportDrawCosts(frame uint64) {
+	keys := make([]int32, 0, len(s.drawCosts))
+	total := 0
+	for k, c := range s.drawCosts {
+		keys = append(keys, k)
+		total += c.px
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, k := range keys {
+		c := s.drawCosts[k]
+		fmt.Printf("[DRAWCOST f%d #%d] %d triangle-bands, %d px visited, max vertex alpha %d\n", frame, k, c.tris, c.px, c.maxA)
+	}
+	fmt.Printf("[DRAWCOST f%d] total %d px visited (%.1f screens)\n", frame, total, float64(total)/(ScreenWidth*ScreenHeight))
+	s.drawCosts = nil
+}

@@ -178,8 +178,8 @@ func shadeProg(d *progDraw, m *d3dsm.Machine) {
 		if !d.need[i] {
 			continue
 		}
-		for r := range m.V {
-			m.V[r] = d3dsm.Vec{0, 0, 0, 1}
+		for r := d3dsm.FileV; r < d3dsm.FileV+16; r++ {
+			m.F[r] = d3dsm.Vec{0, 0, 0, 1}
 		}
 		for _, e := range d.elems {
 			if e.Stream > 15 {
@@ -192,24 +192,26 @@ func shadeProg(d *progDraw, m *d3dsm.Machine) {
 			}
 			for _, in := range d.vs.Inputs {
 				if in.Usage == int(e.Usage) && in.UsageIdx == int(e.UIdx) {
-					m.V[in.Reg&15] = decodeElementBytes(sn.data[off:], e.Type)
+					m.F[d3dsm.FileV+in.Reg&15] = decodeElementBytes(sn.data[off:], e.Type)
 				}
 			}
 		}
-		m.OPos, m.OD, m.OT = d3dsm.Vec{}, [2]d3dsm.Vec{{1, 1, 1, 1}, {0, 0, 0, 0}}, [8]d3dsm.Vec{}
+		m.F[d3dsm.FileOPos], m.F[d3dsm.FileOD], m.F[d3dsm.FileOD+1] = d3dsm.Vec{}, d3dsm.Vec{1, 1, 1, 1}, d3dsm.Vec{}
+		clear(m.F[d3dsm.FileOT : d3dsm.FileOT+8])
 		d.vs.Run(m)
 		v := &d.verts[i]
-		v.cx, v.cy, v.cz, v.cw = m.OPos[0], m.OPos[1], m.OPos[2], m.OPos[3]
+		pos := m.F[d3dsm.FileOPos]
+		v.cx, v.cy, v.cz, v.cw = pos[0], pos[1], pos[2], pos[3]
 		if v.cx != v.cx || v.cy != v.cy || v.cz != v.cz || v.cw != v.cw {
 			continue
 		}
 		for k := 0; k < 2; k++ { // colour outputs are clamped to [0, 1]
 			for j := 0; j < 4; j++ {
-				v.vary[varyD0+k][j] = min(max(m.OD[k][j], 0), 1)
+				v.vary[varyD0+k][j] = min(max(m.F[d3dsm.FileOD+k][j], 0), 1)
 			}
 		}
 		for k := 0; k < 8; k++ {
-			v.vary[varyT0+k] = m.OT[k]
+			v.vary[varyT0+k] = m.F[d3dsm.FileOT+k]
 		}
 		v.valid = true
 		if v.cw > nearW {
@@ -370,36 +372,117 @@ func sampleTex(o *outState, st int, uv d3dsm.Vec) d3dsm.Vec {
 		return d3dsm.Vec{1, 1, 1, 1}
 	}
 	w, h := int(t.Width), int(t.Height)
-	addr := func(i, n int, clamp bool) int {
-		if clamp {
-			return min(max(i, 0), n-1)
-		}
-		i %= n
-		if i < 0 {
-			i += n
-		}
-		return i
-	}
-	texel := func(x, y int) d3dsm.Vec {
-		p := t.Pixels[addr(y, h, o.clampV[st])*w+addr(x, w, o.clampU[st])]
-		return d3dsm.Vec{float32(p&0xFF) / 255, float32((p>>8)&0xFF) / 255, float32((p>>16)&0xFF) / 255, float32(p>>24) / 255}
-	}
+	clampU, clampV := o.clampU[st], o.clampV[st]
 	fu, fv := uv[0]*float32(w), uv[1]*float32(h)
 	if !o.linear[st] {
-		return texel(int(math.Floor(float64(fu))), int(math.Floor(float64(fv))))
+		x, y := texAddr(floorInt(fu), w, clampU), texAddr(floorInt(fv), h, clampV)
+		return unpackTexel(t.Pixels[y*w+x])
 	}
 	fu, fv = fu-0.5, fv-0.5
-	x0, y0 := math.Floor(float64(fu)), math.Floor(float64(fv))
-	ax, ay := fu-float32(x0), fv-float32(y0)
-	a, b := texel(int(x0), int(y0)), texel(int(x0)+1, int(y0))
-	c, e := texel(int(x0), int(y0)+1), texel(int(x0)+1, int(y0)+1)
-	var r d3dsm.Vec
-	for k := 0; k < 4; k++ {
-		top := a[k] + (b[k]-a[k])*ax
-		bot := c[k] + (e[k]-c[k])*ax
-		r[k] = top + (bot-top)*ay
+	x0, y0 := floorInt(fu), floorInt(fv)
+	ax, ay := filterWeight(fu-float32(x0)), filterWeight(fv-float32(y0))
+	xa, ya := texAddr(x0, w, clampU), texAddr(y0, h, clampV)
+	if ax == 0 && ay == 0 { // on a texel centre (e.g. a screen-aligned copy)
+		return unpackTexel(t.Pixels[ya*w+xa])
 	}
-	return r
+	xb, yb := texAddr(x0+1, w, clampU), texAddr(y0+1, h, clampV)
+	return unpackTexel(bilerp(t.Pixels[ya*w+xa], t.Pixels[ya*w+xb], t.Pixels[yb*w+xa], t.Pixels[yb*w+xb], ax, ay))
+}
+
+// bilerp filters four packed 8-bit texels with weights in 1/256 steps, two channels per
+// multiply, at the 8-bit precision of texture units.
+func bilerp(p00, p10, p01, p11 uint32, ax, ay float32) uint32 {
+	wx, wy := uint32(ax*256), uint32(ay*256)
+	return lerp8(lerp8(p00, p10, wx), lerp8(p01, p11, wx), wy)
+}
+
+// lerp8 interpolates each 8-bit channel of p towards q by w/256 (w <= 256).
+func lerp8(p, q, w uint32) uint32 {
+	const m = 0x00FF00FF
+	rb := ((p&m)*(256-w) + (q&m)*w) >> 8 & m
+	ga := ((p>>8&m)*(256-w) + (q>>8&m)*w) & (m << 8)
+	return rb | ga
+}
+
+// sampleLanes is sampleTex for the coordinates (uv[0][i], uv[1][i]) of lanes i < n.
+func sampleLanes(o *outState, st int, uv *[4]d3dsm.Lane, n int, out *[4]d3dsm.Lane) {
+	t := &o.tex[st]
+	if len(t.Pixels) == 0 || t.Width == 0 || t.Height == 0 {
+		for c := range out {
+			for i := 0; i < n; i++ {
+				out[c][i] = 1
+			}
+		}
+		return
+	}
+	w, h := int(t.Width), int(t.Height)
+	wf, hf := float32(w), float32(h)
+	clampU, clampV, linear := o.clampU[st], o.clampV[st], o.linear[st]
+	px := t.Pixels
+	for i := 0; i < n; i++ {
+		fu, fv := uv[0][i]*wf, uv[1][i]*hf
+		var p00 uint32
+		if !linear {
+			p00 = px[texAddr(floorInt(fv), h, clampV)*w+texAddr(floorInt(fu), w, clampU)]
+		} else {
+			fu, fv = fu-0.5, fv-0.5
+			x0, y0 := floorInt(fu), floorInt(fv)
+			ax, ay := filterWeight(fu-float32(x0)), filterWeight(fv-float32(y0))
+			xa, ya := texAddr(x0, w, clampU), texAddr(y0, h, clampV)
+			p00 = px[ya*w+xa]
+			if ax != 0 || ay != 0 {
+				xb, yb := texAddr(x0+1, w, clampU), texAddr(y0+1, h, clampV)
+				p00 = bilerp(p00, px[ya*w+xb], px[yb*w+xa], px[yb*w+xb], ax, ay)
+			}
+		}
+		out[0][i], out[1][i], out[2][i], out[3][i] = unorm8[uint8(p00)], unorm8[uint8(p00>>8)], unorm8[uint8(p00>>16)], unorm8[uint8(p00>>24)]
+	}
+}
+
+// unorm8To8 converts a colour component to 8 bits as the output merger does (clamped, rounded).
+func unorm8To8(f float32) uint8 { return uint8(min(max(f, 0), 1)*255 + 0.5) }
+
+// filterWeight quantizes a bilinear weight to 8 bits, as texture units do: a coordinate within
+// rounding error of a texel centre reads that texel alone.
+func filterWeight(f float32) float32 { return float32(int(f*256+0.5)) / 256 }
+
+// unorm8[i] = i / 255.
+var unorm8 = func() (t [256]float32) {
+	for i := range t {
+		t[i] = float32(i) / 255
+	}
+	return
+}()
+
+func unpackTexel(p uint32) d3dsm.Vec {
+	return d3dsm.Vec{unorm8[uint8(p)], unorm8[uint8(p>>8)], unorm8[uint8(p>>16)], unorm8[uint8(p>>24)]}
+}
+
+// floorInt is floor(f) as an int (f within int range).
+func floorInt(f float32) int {
+	i := int(f)
+	if f < float32(i) {
+		i--
+	}
+	return i
+}
+
+// texAddr maps texel index i into [0, n) by clamping or wrapping.
+func texAddr(i, n int, clamp bool) int {
+	if uint(i) < uint(n) {
+		return i
+	}
+	if clamp {
+		return min(max(i, 0), n-1)
+	}
+	if n&(n-1) == 0 {
+		return i & (n - 1)
+	}
+	i %= n
+	if i < 0 {
+		i += n
+	}
+	return i
 }
 
 func cmpFunc(f uint32, a, b float32) bool {
@@ -461,17 +544,38 @@ func blendFactor(f uint32, src, dst d3dsm.Vec, bf [4]float32) d3dsm.Vec {
 }
 
 // rasterizeProg draws one programmable triangle's rows within the band.
-func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, pix []byte, yStart, yEnd int) {
+// progShader is the pixel stage of one band's programmable triangles: a per-pixel machine and a
+// wide one that shades a row's pixels in batches.
+type progShader struct {
+	m  d3dsm.Machine
+	wm d3dsm.WideMachine
+}
+
+func (s *Subsystem) rasterizeProg(qt *queuedTri, sh *progShader, ids []int32, pix []byte, yStart, yEnd int) {
 	pt := qt.prog
 	d := pt.d
 	o := &d.out
 	v0, v1, v2 := &pt.v[0], &pt.v[1], &pt.v[2]
 	zbuf := s.ZBuffer
-	m.C = d.psC
-	m.Sample = func(st int, uv d3dsm.Vec) d3dsm.Vec { return sampleTex(o, st&7, uv) }
-	// Perspective-correct varyings: interpolate vary/w and 1/w.
+	m, wm := &sh.m, &sh.wm
+	sample := func(st int, uv d3dsm.Vec) d3dsm.Vec { return sampleTex(o, st&7, uv) }
+	m.C, m.Sample = d.psC, sample
+	wm.C, wm.Sample = d.psC, sample
+	wm.SampleLanes = func(st int, uv *[4]d3dsm.Lane, n int, out *[4]d3dsm.Lane) { sampleLanes(o, st&7, uv, n, out) }
+	wide := !d.fixedPixel && d.ps.Wide()
+	// plainWrite: the output merger just stores the colour (no alpha test, blending or depth write).
+	plainWrite := !o.alphaTest && !o.blend && o.colorWrite&7 == 7 && !(o.zTest && o.zWrite)
+	// Perspective-correct varyings: interpolate vary/w and 1/w. Lane inputs live in the wide
+	// machine's registers (v0, v1, t0..t7), whichever way the batch is shaded.
 	var pw [3][nVary]d3dsm.Vec
 	used := d.varyUsed
+	var regs [nVary]int
+	for k := 0; k < nVary; k++ {
+		regs[k] = d3dsm.FileV + k // varyD0, varyD1
+		if k >= varyT0 {
+			regs[k] = d3dsm.FileT + k - varyT0
+		}
+	}
 	for i, v := range []*progVertex{v0, v1, v2} {
 		for k := 0; k < nVary; k++ {
 			if used&(1<<k) == 0 {
@@ -486,13 +590,109 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, 
 	if !ok {
 		return
 	}
+	// Each used varying component (times 1/w) is linear along a row: its value at the first
+	// covered pixel plus k times a per-pixel step.
+	sx0, sx1 := float32(te.dx[0]*te.sign)*te.inv, float32(te.dx[1]*te.sign)*te.inv
+	attr := func(f0, f1, f2 float32) lerpAttr {
+		return lerpAttr{c: f2, d0: f0 - f2, d1: f1 - f2, dx: (f0-f2)*sx0 + (f1-f2)*sx1}
+	}
+	type varyAttr struct {
+		dst *d3dsm.Lane
+		a   lerpAttr
+	}
+	var attrs [nVary * 4]varyAttr
+	var rowv [nVary * 4]float32
+	na := 0
+	for k := 0; k < nVary; k++ {
+		if used&(1<<k) == 0 {
+			continue
+		}
+		for j := 0; j < 4; j++ {
+			attrs[na] = varyAttr{&wm.F[regs[k]][j], attr(pw[0][k][j], pw[1][k][j], pw[2][k][j])}
+			na++
+		}
+	}
+	aq := attr(v0.inW, v1.inW, v2.inW)
+	persp := v0.inW != v1.inW || v1.inW != v2.inW
+	var lidx [d3dsm.Lanes]int
+	var lz [d3dsm.Lanes]float32
+	n := 0
+	lane := func(k, l int) d3dsm.Vec {
+		r := &wm.F[regs[k]]
+		return d3dsm.Vec{r[0][l], r[1][l], r[2][l], r[3][l]}
+	}
+	flush := func() {
+		wm.N = n
+		if wide {
+			clear(wm.Kill[:n])
+			d.ps.RunWide(wm)
+		}
+		if wide && plainWrite {
+			oc := &wm.F[d3dsm.FileOC]
+			for l := 0; l < n; l++ {
+				if wm.Kill[l] {
+					continue
+				}
+				off := lidx[l] * 4
+				px := pix[off : off+4 : off+4]
+				px[0] = unorm8To8(oc[0][l])
+				px[1] = unorm8To8(oc[1][l])
+				px[2] = unorm8To8(oc[2][l])
+				px[3] = 255
+				if ids != nil && !o.tex[0].fromRT {
+					ids[lidx[l]] = d.id
+				}
+			}
+			n = 0
+			return
+		}
+		for l := 0; l < n; l++ {
+			var col d3dsm.Vec
+			switch {
+			case d.fixedPixel:
+				col = lane(varyD0, l)
+				if len(o.tex[0].Pixels) > 0 {
+					t := sampleTex(o, 0, lane(varyT0, l))
+					col = d3dsm.Vec{col[0] * t[0], col[1] * t[1], col[2] * t[2], col[3] * t[3]}
+				}
+			case wide:
+				if wm.Kill[l] {
+					continue
+				}
+				oc := &wm.F[d3dsm.FileOC]
+				col = d3dsm.Vec{oc[0][l], oc[1][l], oc[2][l], oc[3][l]}
+			default:
+				for k := 0; k < nVary; k++ {
+					m.F[regs[k]] = d3dsm.Vec{}
+					if used&(1<<k) != 0 {
+						m.F[regs[k]] = lane(k, l)
+					}
+				}
+				m.Kill = false
+				d.ps.Run(m)
+				if m.Kill {
+					continue
+				}
+				col = m.F[d3dsm.FileOC]
+			}
+			s.mergeProg(o, d, pix, ids, lidx[l], lz[l], col)
+		}
+		n = 0
+	}
 	for y := yStart; y <= yEnd; y++ {
 		row := y * ScreenWidth
 		e, step := te.start(qt.minX, y)
-		for x := qt.minX; x <= qt.maxX; x, e[0], e[1], e[2] = x+1, e[0]+step[0], e[1]+step[1], e[2]+step[2] {
-			if !te.inside(&e) {
-				continue
-			}
+		x0, x1, ok := te.span(&e, step, qt.minX, qt.maxX)
+		if !ok {
+			continue
+		}
+		rw0, rw1 := float32(e[0])*te.inv, float32(e[1])*te.inv
+		for i := 0; i < na; i++ {
+			rowv[i] = attrs[i].a.row(rw0, rw1)
+		}
+		q0 := aq.row(rw0, rw1)
+		iw := 1 / q0
+		for x := x0; x <= x1; x, e[0], e[1], e[2] = x+1, e[0]+step[0], e[1]+step[1], e[2]+step[2] {
 			w0 := float32(e[0]) * te.inv
 			w1 := float32(e[1]) * te.inv
 			w2 := 1 - w0 - w1
@@ -501,74 +701,66 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, m *d3dsm.Machine, ids []int32, 
 			if o.zTest && !cmpFunc(o.zFunc, z, zbuf[idx]) {
 				continue
 			}
-			iw := 1 / (w0*v0.inW + w1*v1.inW + w2*v2.inW)
-			var vary [nVary]d3dsm.Vec
-			for k := 0; k < nVary; k++ {
-				if used&(1<<k) == 0 {
-					continue
-				}
-				for j := 0; j < 4; j++ {
-					vary[k][j] = (w0*pw[0][k][j] + w1*pw[1][k][j] + w2*pw[2][k][j]) * iw
-				}
+			k := float32(x - x0)
+			if persp {
+				iw = 1 / (q0 + k*aq.dx)
 			}
-			var col d3dsm.Vec
-			if d.fixedPixel {
-				col = vary[varyD0]
-				if len(o.tex[0].Pixels) > 0 {
-					t := sampleTex(o, 0, vary[varyT0])
-					col = d3dsm.Vec{col[0] * t[0], col[1] * t[1], col[2] * t[2], col[3] * t[3]}
-				}
-			} else {
-				m.V[0], m.V[1] = vary[varyD0], vary[varyD1]
-				copy(m.T[:], vary[varyT0:])
-				m.Kill = false
-				d.ps.Run(m)
-				if m.Kill {
-					continue
-				}
-				col = m.OC[0]
+			for i := 0; i < na; i++ {
+				attrs[i].dst[n] = (rowv[i] + k*attrs[i].a.dx) * iw
 			}
-			for j := 0; j < 4; j++ {
-				col[j] = min(max(col[j], 0), 1)
-			}
-			if o.alphaTest && !cmpFunc(o.alphaFunc, float32(math.Round(float64(col[3]*255)))/255, o.alphaRef) {
-				continue
-			}
-			off := idx * 4
-			if o.blend {
-				dst := d3dsm.Vec{float32(pix[off]) / 255, float32(pix[off+1]) / 255, float32(pix[off+2]) / 255, 1}
-				sf := blendFactor(o.src, col, dst, o.blendFactor)
-				df := blendFactor(o.dst, col, dst, o.blendFactor)
-				for j := 0; j < 3; j++ {
-					a, b := col[j]*sf[j], dst[j]*df[j]
-					switch o.op {
-					case 2:
-						col[j] = a - b
-					case 3:
-						col[j] = b - a
-					case 4:
-						col[j] = min(col[j], dst[j])
-					case 5:
-						col[j] = max(col[j], dst[j])
-					default:
-						col[j] = a + b
-					}
-					col[j] = min(max(col[j], 0), 1)
-				}
-			}
-			for j := 0; j < 3; j++ {
-				if o.colorWrite&(1<<j) != 0 {
-					pix[off+j] = uint8(col[j]*255 + 0.5)
-				}
-			}
-			pix[off+3] = 255
-			if o.zTest && o.zWrite {
-				zbuf[idx] = z
-			}
-			if ids != nil && !o.tex[0].fromRT {
-				ids[idx] = d.id
+			lidx[n], lz[n] = idx, z
+			if n++; n == d3dsm.Lanes {
+				flush()
 			}
 		}
+		if n > 0 {
+			flush()
+		}
+	}
+}
+
+// mergeProg applies the output merger to one shaded pixel: alpha test, blending, colour write
+// mask, depth write.
+func (s *Subsystem) mergeProg(o *outState, d *progDraw, pix []byte, ids []int32, idx int, z float32, col d3dsm.Vec) {
+	for j := 0; j < 4; j++ {
+		col[j] = min(max(col[j], 0), 1)
+	}
+	if o.alphaTest && !cmpFunc(o.alphaFunc, float32(math.Round(float64(col[3]*255)))/255, o.alphaRef) {
+		return
+	}
+	off := idx * 4
+	if o.blend {
+		dst := d3dsm.Vec{unorm8[pix[off]], unorm8[pix[off+1]], unorm8[pix[off+2]], 1}
+		sf := blendFactor(o.src, col, dst, o.blendFactor)
+		df := blendFactor(o.dst, col, dst, o.blendFactor)
+		for j := 0; j < 3; j++ {
+			a, b := col[j]*sf[j], dst[j]*df[j]
+			switch o.op {
+			case 2:
+				col[j] = a - b
+			case 3:
+				col[j] = b - a
+			case 4:
+				col[j] = min(col[j], dst[j])
+			case 5:
+				col[j] = max(col[j], dst[j])
+			default:
+				col[j] = a + b
+			}
+			col[j] = min(max(col[j], 0), 1)
+		}
+	}
+	for j := 0; j < 3; j++ {
+		if o.colorWrite&(1<<j) != 0 {
+			pix[off+j] = uint8(col[j]*255 + 0.5)
+		}
+	}
+	pix[off+3] = 255
+	if o.zTest && o.zWrite {
+		s.ZBuffer[idx] = z
+	}
+	if ids != nil && !o.tex[0].fromRT {
+		ids[idx] = d.id
 	}
 }
 

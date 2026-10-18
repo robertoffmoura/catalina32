@@ -37,17 +37,17 @@ func TestVS(t *testing.T) {
 	m := &Machine{C: make([]Vec, 256)}
 	m.C[0], m.C[1], m.C[2], m.C[3] = Vec{2, 0, 0, 0}, Vec{0, 3, 0, 0}, Vec{0, 0, 4, 0}, Vec{0, 0, 0, 1}
 	p.ApplyDefs(m.C)
-	m.V[0] = Vec{1, 1, 1, 1}
-	m.V[1] = Vec{0.25, 0.5, 0.75, 0.5}
+	m.F[FileV+0] = Vec{1, 1, 1, 1}
+	m.F[FileV+1] = Vec{0.25, 0.5, 0.75, 0.5}
 	p.Run(m)
-	if m.OPos != (Vec{2, 3, 4, 1}) {
-		t.Errorf("oPos = %v", m.OPos)
+	if m.F[FileOPos] != (Vec{2, 3, 4, 1}) {
+		t.Errorf("oPos = %v", m.F[FileOPos])
 	}
-	if m.OD[0] != (Vec{0.5, 1, 1.5, 1}) {
-		t.Errorf("oD0 = %v", m.OD[0])
+	if m.F[FileOD] != (Vec{0.5, 1, 1.5, 1}) {
+		t.Errorf("oD0 = %v", m.F[FileOD])
 	}
-	if m.OT[0][0] != 0.5 {
-		t.Errorf("oT0.x = %v", m.OT[0][0])
+	if m.F[FileOT][0] != 0.5 {
+		t.Errorf("oT0.x = %v", m.F[FileOT][0])
 	}
 	if len(p.Inputs) != 2 || p.Inputs[1].Usage != 10 {
 		t.Errorf("inputs = %v", p.Inputs)
@@ -71,11 +71,11 @@ func TestPS11(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Machine{C: make([]Vec, 8), Sample: func(s int, uv Vec) Vec { return Vec{uv[0], uv[1], 1, 0.5} }}
-	m.T[0] = Vec{0.25, 0.5, 0, 0}
-	m.V[0] = Vec{1, 1, 0.5, 1}
+	m.F[FileT+0] = Vec{0.25, 0.5, 0, 0}
+	m.F[FileV+0] = Vec{1, 1, 0.5, 1}
 	p.Run(m)
-	if m.OC[0] != (Vec{0.5, 1, 1, 1}) {
-		t.Errorf("oC0 = %v", m.OC[0])
+	if m.F[FileOC] != (Vec{0.5, 1, 1, 1}) {
+		t.Errorf("oC0 = %v", m.F[FileOC])
 	}
 }
 

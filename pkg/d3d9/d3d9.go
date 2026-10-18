@@ -169,6 +169,10 @@ type Subsystem struct {
 	curTargetPix        []byte // emulation side: target of the operations being queued (nil: back buffer)
 	curTargetSkip       bool
 	loggedRTSize        bool
+	costMu              sync.Mutex
+	bins                [numBands][]int32 // per-band operation lists (render goroutine)
+	bandShaders         []*progShader
+	drawCosts           map[int32]*drawCost
 	drawPix             []byte // render goroutine: current target (nil: back buffer)
 	drawSkip            bool
 	dumpedTex           map[uint32]bool

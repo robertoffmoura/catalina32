@@ -8,30 +8,69 @@ import (
 // Vec is one four-component register.
 type Vec = [4]float32
 
-// Machine holds the register state of one shader invocation. Callers fill the inputs (V for
-// vertex shaders; V = colours and T = texture coordinates for pixel shaders), run a Program,
-// and read the outputs.
+// Register file layout: every register a program reads or writes, except constants, lives in
+// Machine.F at these offsets.
+const (
+	FileR       = 0  // r0..r31
+	FileV       = 32 // v0..v15 (vs inputs; ps colours)
+	FileT       = 48 // t0..t7 (ps texture coordinates / texture registers)
+	FileOPos    = 56
+	FileOFog    = 57
+	FileOPts    = 58
+	FileOD      = 59 // oD0, oD1
+	FileOT      = 61 // oT0..oT7
+	FileOC      = 69 // oC0..oC3 (ps_1_x: r0 is copied to oC0)
+	fileScratch = 73 // writes to registers without a home (a0 is handled separately)
+	fileLen     = 74
+)
+
+// Machine holds the register state of one shader invocation. Callers fill the inputs (F[FileV:]
+// for vertex shaders; colours F[FileV:] and texture coordinates F[FileT:] for pixel shaders), run
+// a Program, and read the outputs.
 type Machine struct {
 	C    []Vec // float constants (the draw's snapshot, with the shader's def values applied)
-	R    [32]Vec
-	V    [16]Vec
-	T    [8]Vec // ps: texture registers / texture coordinate inputs
+	F    [fileLen]Vec
 	A0   [4]int32
-	OPos Vec
-	OD   [2]Vec // vs colour outputs
-	OT   [8]Vec // vs texture coordinate outputs
-	OFog Vec
-	OPts Vec
-	OC   [4]Vec // ps colour outputs (ps_1_x: r0 is copied to OC[0])
 	Kill bool
 	// Sample returns the texel of sampler stage s at texture coordinate uv.
 	Sample func(s int, uv Vec) Vec
 }
 
-// Program is a shader ready to execute: one closure per instruction.
+// operand is a source register resolved at compile time.
+type operand struct {
+	idx     int  // index into F, or into C for constants
+	konst   bool // constant register
+	rel     bool // constant indexed by a0
+	relComp uint8
+	sw      [4]uint8
+	mod     uint8 // D3DSPSM_*
+}
+
+// dest is a destination register resolved at compile time.
+type dest struct {
+	idx   int
+	mask  uint8
+	sat   bool
+	scale float32
+	a0    bool // vs address register
+	floor bool // a0 conversion: floor (vs_1_x) rather than round
+}
+
+// inst is one executable instruction.
+type inst struct {
+	op   int
+	src  [3]operand
+	dst  dest
+	n    int  // matrix rows; texture stage or register for tex/texcoord; components for texkill
+	cols int  // matrix columns
+	proj bool // texldp
+	cnd1 bool // ps_1_0..1_3 cnd: select on src0.w
+}
+
+// Program is a shader ready to execute.
 type Program struct {
 	Shader *Shader
-	steps  []func(m *Machine)
+	code   []inst
 	defs   []def
 	// Inputs lists the declared vertex shader inputs (v# with usage) or pixel shader inputs.
 	Inputs []Decl
@@ -42,6 +81,8 @@ type Program struct {
 	// ReadsV and ReadsT are bit masks of the input (v#) and texture (t#) registers read: for a
 	// pixel shader, the interpolated colours and texture coordinates it needs.
 	ReadsV, ReadsT uint32
+	ps1            bool // ps_1_x: r0 is the colour output
+	wide           bool // RunWide supports it
 }
 
 // Decl is a dcl'd input register.
@@ -63,19 +104,9 @@ func (p *Program) ApplyDefs(c []Vec) {
 	}
 }
 
-// Run executes the program on m.
-func (p *Program) Run(m *Machine) {
-	for _, f := range p.steps {
-		f(m)
-	}
-	if p.Shader.Pixel && p.Shader.Major < 2 {
-		m.OC[0] = m.R[0]
-	}
-}
-
 // Compile prepares a decoded shader for execution.
 func Compile(sh *Shader) (*Program, error) {
-	p := &Program{Shader: sh}
+	p := &Program{Shader: sh, ps1: sh.Pixel && sh.Major < 2}
 	for i := range sh.Insts {
 		in := &sh.Insts[i]
 		switch in.Op {
@@ -118,140 +149,170 @@ func Compile(sh *Shader) (*Program, error) {
 				p.Samplers |= 1 << in.Dst.Num
 			}
 		}
-		f, err := p.compileInst(in)
+		c, err := p.compileInst(in)
 		if err != nil {
 			return nil, err
 		}
-		p.steps = append(p.steps, f)
+		p.code = append(p.code, c)
 	}
+	p.checkWide()
 	return p, nil
 }
 
-// reg returns a pointer to a register.
-func (p *Program) reg(m *Machine, t, n int) *Vec {
+// regIndex is the F index of a non-constant register.
+func (p *Program) regIndex(t, n int) int {
 	switch t {
 	case RegTemp:
-		return &m.R[n&31]
+		return FileR + n&31
 	case RegInput:
-		return &m.V[n&15]
-	case RegConst:
-		if n < len(m.C) {
-			return &m.C[n]
-		}
-		return &zeroVec
+		return FileV + n&15
 	case RegAddrTex:
 		if p.Shader.Pixel {
-			return &m.T[n&7]
+			return FileT + n&7
 		}
-		return &scratch // a0 is written through mova/mov handling
 	case RegRastOut:
 		switch n {
 		case 0:
-			return &m.OPos
+			return FileOPos
 		case 1:
-			return &m.OFog
+			return FileOFog
 		}
-		return &m.OPts
+		return FileOPts
 	case RegAttrOut:
-		return &m.OD[n&1]
+		return FileOD + n&1
 	case RegTexCrdOut:
-		return &m.OT[n&7]
+		return FileOT + n&7
 	case RegColorOut:
-		return &m.OC[n&3]
+		return FileOC + n&3
 	}
-	return &scratch
+	return fileScratch
 }
 
-var zeroVec, scratch Vec
-
-func (p *Program) fetch(s Param) func(m *Machine) Vec {
-	sw := s.Swizzle
-	mod := s.SrcMod
-	rel := s.Relative && s.Type == RegConst
-	t, n, rc := s.Type, s.Num, s.RelComp
-	return func(m *Machine) Vec {
-		var r *Vec
-		if rel {
-			i := n + int(m.A0[rc])
-			if i >= 0 && i < len(m.C) {
-				r = &m.C[i]
-			} else {
-				r = &zeroVec
-			}
-		} else {
-			r = p.reg(m, t, n)
-		}
-		v := Vec{r[sw[0]], r[sw[1]], r[sw[2]], r[sw[3]]}
-		switch mod {
-		case 0:
-		case 1:
-			v = Vec{-v[0], -v[1], -v[2], -v[3]}
-		case 2:
-			v = Vec{v[0] - 0.5, v[1] - 0.5, v[2] - 0.5, v[3] - 0.5}
-		case 3:
-			v = Vec{0.5 - v[0], 0.5 - v[1], 0.5 - v[2], 0.5 - v[3]}
-		case 4:
-			v = Vec{2*v[0] - 1, 2*v[1] - 1, 2*v[2] - 1, 2*v[3] - 1}
-		case 5:
-			v = Vec{1 - 2*v[0], 1 - 2*v[1], 1 - 2*v[2], 1 - 2*v[3]}
-		case 6:
-			v = Vec{1 - v[0], 1 - v[1], 1 - v[2], 1 - v[3]}
-		case 7:
-			v = Vec{2 * v[0], 2 * v[1], 2 * v[2], 2 * v[3]}
-		case 8:
-			v = Vec{-2 * v[0], -2 * v[1], -2 * v[2], -2 * v[3]}
-		case 9: // dz: divide by z
-			v = Vec{v[0] / v[2], v[1] / v[2], v[2], v[3]}
-		case 10: // dw
-			v = Vec{v[0] / v[3], v[1] / v[3], v[2], v[3]}
-		case 11:
-			v = Vec{abs(v[0]), abs(v[1]), abs(v[2]), abs(v[3])}
-		case 12:
-			v = Vec{-abs(v[0]), -abs(v[1]), -abs(v[2]), -abs(v[3])}
-		}
-		return v
+func (p *Program) operand(s Param) operand {
+	o := operand{sw: s.Swizzle, mod: uint8(s.SrcMod)}
+	if s.Type == RegConst {
+		o.konst, o.idx = true, s.Num
+		o.rel, o.relComp = s.Relative, s.RelComp
+		return o
 	}
+	o.idx = p.regIndex(s.Type, s.Num)
+	return o
+}
+
+func (p *Program) dest(d Param) dest {
+	r := dest{idx: p.regIndex(d.Type, d.Num), mask: d.Mask, sat: d.Saturate, scale: float32(math.Ldexp(1, d.Shift))}
+	if d.Type == RegAddrTex && !p.Shader.Pixel {
+		r.a0, r.floor = true, p.Shader.Major < 2
+	}
+	return r
+}
+
+var zeroVec Vec
+
+// fetch reads a source operand with its swizzle and modifier applied. Components travel as
+// separate values (in registers) rather than as a Vec, which the CPU would store and reload.
+func (m *Machine) fetch(o *operand) (x, y, z, w float32) {
+	var r *Vec
+	switch {
+	case !o.konst:
+		r = &m.F[o.idx]
+	case o.rel:
+		r = &zeroVec
+		if i := o.idx + int(m.A0[o.relComp]); i >= 0 && i < len(m.C) {
+			r = &m.C[i]
+		}
+	case o.idx < len(m.C):
+		r = &m.C[o.idx]
+	default:
+		r = &zeroVec
+	}
+	x, y, z, w = r[o.sw[0]], r[o.sw[1]], r[o.sw[2]], r[o.sw[3]]
+	if o.mod != 0 {
+		v := applyMod(Vec{x, y, z, w}, o.mod)
+		x, y, z, w = v[0], v[1], v[2], v[3]
+	}
+	return
+}
+
+// fetchVec is fetch for the less common instructions that work on whole vectors.
+func (m *Machine) fetchVec(o *operand) Vec {
+	x, y, z, w := m.fetch(o)
+	return Vec{x, y, z, w}
+}
+
+func applyMod(v Vec, mod uint8) Vec {
+	switch mod {
+	case 1:
+		v = Vec{-v[0], -v[1], -v[2], -v[3]}
+	case 2:
+		v = Vec{v[0] - 0.5, v[1] - 0.5, v[2] - 0.5, v[3] - 0.5}
+	case 3:
+		v = Vec{0.5 - v[0], 0.5 - v[1], 0.5 - v[2], 0.5 - v[3]}
+	case 4:
+		v = Vec{2*v[0] - 1, 2*v[1] - 1, 2*v[2] - 1, 2*v[3] - 1}
+	case 5:
+		v = Vec{1 - 2*v[0], 1 - 2*v[1], 1 - 2*v[2], 1 - 2*v[3]}
+	case 6:
+		v = Vec{1 - v[0], 1 - v[1], 1 - v[2], 1 - v[3]}
+	case 7:
+		v = Vec{2 * v[0], 2 * v[1], 2 * v[2], 2 * v[3]}
+	case 8:
+		v = Vec{-2 * v[0], -2 * v[1], -2 * v[2], -2 * v[3]}
+	case 9: // dz: divide by z
+		v = Vec{v[0] / v[2], v[1] / v[2], v[2], v[3]}
+	case 10: // dw
+		v = Vec{v[0] / v[3], v[1] / v[3], v[2], v[3]}
+	case 11:
+		v = Vec{abs(v[0]), abs(v[1]), abs(v[2]), abs(v[3])}
+	case 12:
+		v = Vec{-abs(v[0]), -abs(v[1]), -abs(v[2]), -abs(v[3])}
+	}
+	return v
 }
 
 func abs(f float32) float32 { return float32(math.Abs(float64(f))) }
 
 // store writes a result through the destination's mask, shift and saturate.
-func (p *Program) store(d Param) func(m *Machine, v Vec) {
-	mask, sat := d.Mask, d.Saturate
-	scale := float32(math.Ldexp(1, d.Shift))
-	t, n := d.Type, d.Num
-	if t == RegAddrTex && !p.Shader.Pixel { // a0
-		floor := p.Shader.Major < 2
-		return func(m *Machine, v Vec) {
-			for i := 0; i < 4; i++ {
-				if mask&(1<<i) != 0 {
-					if floor {
-						m.A0[i] = int32(math.Floor(float64(v[i])))
-					} else {
-						m.A0[i] = int32(math.Floor(float64(v[i]) + 0.5))
-					}
+func (m *Machine) store(d *dest, x, y, z, w float32) {
+	if d.a0 {
+		v := Vec{x, y, z, w}
+		for i := 0; i < 4; i++ {
+			if d.mask&(1<<i) != 0 {
+				if d.floor {
+					m.A0[i] = int32(math.Floor(float64(v[i])))
+				} else {
+					m.A0[i] = int32(math.Floor(float64(v[i]) + 0.5))
 				}
 			}
 		}
+		return
 	}
-	return func(m *Machine, v Vec) {
-		r := p.reg(m, t, n)
-		for i := 0; i < 4; i++ {
-			if mask&(1<<i) == 0 {
-				continue
-			}
-			x := v[i] * scale
-			if sat {
-				x = min(max(x, 0), 1)
-			}
-			r[i] = x
-		}
+	if d.scale != 1 {
+		x, y, z, w = x*d.scale, y*d.scale, z*d.scale, w*d.scale
+	}
+	if d.sat {
+		x, y, z, w = min(max(x, 0), 1), min(max(y, 0), 1), min(max(z, 0), 1), min(max(w, 0), 1)
+	}
+	r := &m.F[d.idx]
+	if d.mask&1 != 0 {
+		r[0] = x
+	}
+	if d.mask&2 != 0 {
+		r[1] = y
+	}
+	if d.mask&4 != 0 {
+		r[2] = z
+	}
+	if d.mask&8 != 0 {
+		r[3] = w
 	}
 }
 
+// storeVec is store for a whole vector.
+func (m *Machine) storeVec(d *dest, v Vec) { m.store(d, v[0], v[1], v[2], v[3]) }
+
 func dot3(a, b Vec) float32 { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
 func dot4(a, b Vec) float32 { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3] }
-func splat(f float32) Vec   { return Vec{f, f, f, f} }
 
 // Scalar operands use component 3 of the swizzled source: the replicated component, or w when
 // no swizzle is given (the D3D rule).
@@ -263,147 +324,196 @@ func rcp(f float32) float32 {
 	return 1 / f
 }
 
-func (p *Program) compileInst(in *Inst) (func(m *Machine), error) {
-	src := make([]func(m *Machine) Vec, len(in.Src))
+func b2f(b bool) float32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// compileInst resolves an instruction's operands.
+func (p *Program) compileInst(in *Inst) (inst, error) {
+	c := inst{op: in.Op, dst: p.dest(in.Dst)}
 	for i, s := range in.Src {
-		src[i] = p.fetch(s)
-	}
-	st := p.store(in.Dst)
-	comp := func(f func(a, b, c float32) float32) func(m *Machine) {
-		return func(m *Machine) {
-			var a, b, c Vec
-			a = src[0](m)
-			if len(src) > 1 {
-				b = src[1](m)
-			}
-			if len(src) > 2 {
-				c = src[2](m)
-			}
-			st(m, Vec{f(a[0], b[0], c[0]), f(a[1], b[1], c[1]), f(a[2], b[2], c[2]), f(a[3], b[3], c[3])})
-		}
-	}
-	scalar := func(f func(x float32) float32) func(m *Machine) {
-		return func(m *Machine) { st(m, splat(f(src[0](m)[3]))) }
-	}
-	matrix := func(cols, rows int) func(m *Machine) {
-		// mAxB dst, src0, src1: dst.i = dot(src0, src1 + i) for i < rows
-		base := in.Src[1]
-		rowsF := make([]func(m *Machine) Vec, rows)
-		for i := 0; i < rows; i++ {
-			b := base
-			b.Num += i
-			rowsF[i] = p.fetch(b)
-		}
-		return func(m *Machine) {
-			a := src[0](m)
-			var r Vec
-			for i := 0; i < rows; i++ {
-				b := rowsF[i](m)
-				if cols == 4 {
-					r[i] = dot4(a, b)
-				} else {
-					r[i] = dot3(a, b)
-				}
-			}
-			st(m, r)
+		if i < len(c.src) {
+			c.src[i] = p.operand(s)
 		}
 	}
 	sh := p.Shader
 	switch in.Op {
-	case OpMov, OpMova:
-		return func(m *Machine) { st(m, src[0](m)) }, nil
-	case OpAdd:
-		return comp(func(a, b, _ float32) float32 { return a + b }), nil
-	case OpSub:
-		return comp(func(a, b, _ float32) float32 { return a - b }), nil
-	case OpMul:
-		return comp(func(a, b, _ float32) float32 { return a * b }), nil
-	case OpMad:
-		return comp(func(a, b, c float32) float32 { return a*b + c }), nil
-	case OpMin:
-		return comp(func(a, b, _ float32) float32 { return min(a, b) }), nil
-	case OpMax:
-		return comp(func(a, b, _ float32) float32 { return max(a, b) }), nil
-	case OpSlt:
-		return comp(func(a, b, _ float32) float32 { return b2f(a < b) }), nil
-	case OpSge:
-		return comp(func(a, b, _ float32) float32 { return b2f(a >= b) }), nil
-	case OpLrp:
-		return comp(func(a, b, c float32) float32 { return a*(b-c) + c }), nil
-	case OpCmp:
-		return comp(func(a, b, c float32) float32 {
-			if a >= 0 {
-				return b
-			}
-			return c
-		}), nil
+	case OpMov, OpMova, OpAdd, OpSub, OpMul, OpMad, OpMin, OpMax, OpSlt, OpSge, OpLrp, OpCmp, OpFrc,
+		OpAbs, OpDp3, OpDp4, OpDp2Add, OpRcp, OpRsq, OpExp, OpLog, OpExpp, OpLogp, OpPow, OpLit, OpDst,
+		OpNrm, OpCrs, OpSinCos:
+		return c, nil
 	case OpCnd:
-		if sh.Pixel && sh.Major == 1 && sh.Minor < 4 {
-			return func(m *Machine) {
-				a, b, c := src[0](m), src[1](m), src[2](m)
-				if a[3] > 0.5 {
-					st(m, b)
-				} else {
-					st(m, c)
-				}
-			}, nil
+		c.cnd1 = sh.Pixel && sh.Major == 1 && sh.Minor < 4
+		return c, nil
+	case OpM4x4, OpM4x3, OpM3x4, OpM3x3, OpM3x2:
+		c.cols = 4
+		if in.Op >= OpM3x4 {
+			c.cols = 3
 		}
-		return comp(func(a, b, c float32) float32 {
-			if a > 0.5 {
-				return b
+		c.n = map[int]int{OpM4x4: 4, OpM4x3: 3, OpM3x4: 4, OpM3x3: 3, OpM3x2: 2}[in.Op]
+		return c, nil
+	case OpTexCoord:
+		if sh.Major == 1 && sh.Minor < 4 {
+			c.n = in.Dst.Num & 7
+			return c, nil
+		}
+	case OpTex:
+		switch {
+		case sh.Major >= 2: // texld dst, coord, sampler
+			c.proj, c.n = in.Ctrl&1 != 0, in.Src[1].Num
+			return c, nil
+		case sh.Minor < 4: // tex t#: sample stage # at texture coordinate t#
+			c.n = in.Dst.Num & 7
+			return c, nil
+		}
+	case OpTexKill:
+		c.src[0] = operand{idx: c.dst.idx, sw: [4]uint8{0, 1, 2, 3}}
+		c.n = 4
+		if sh.Major < 2 {
+			c.n = 3 // ps_1_x: x, y, z of the texture coordinate
+		}
+		return c, nil
+	}
+	return c, fmt.Errorf("d3dsm: unsupported instruction %s", opNames[in.Op])
+}
+
+// Run executes the program on m.
+func (p *Program) Run(m *Machine) {
+	for i := range p.code {
+		in := &p.code[i]
+		d := &in.dst
+		switch in.op {
+		case OpMov, OpMova:
+			x, y, z, w := m.fetch(&in.src[0])
+			m.store(d, x, y, z, w)
+		case OpAdd:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, ax+bx, ay+by, az+bz, aw+bw)
+		case OpSub:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, ax-bx, ay-by, az-bz, aw-bw)
+		case OpMul:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, ax*bx, ay*by, az*bz, aw*bw)
+		case OpMad:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			cx, cy, cz, cw := m.fetch(&in.src[2])
+			m.store(d, ax*bx+cx, ay*by+cy, az*bz+cz, aw*bw+cw)
+		case OpMin:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, min(ax, bx), min(ay, by), min(az, bz), min(aw, bw))
+		case OpMax:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, max(ax, bx), max(ay, by), max(az, bz), max(aw, bw))
+		case OpSlt:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, b2f(ax < bx), b2f(ay < by), b2f(az < bz), b2f(aw < bw))
+		case OpSge:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			m.store(d, b2f(ax >= bx), b2f(ay >= by), b2f(az >= bz), b2f(aw >= bw))
+		case OpLrp:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			cx, cy, cz, cw := m.fetch(&in.src[2])
+			m.store(d, ax*(bx-cx)+cx, ay*(by-cy)+cy, az*(bz-cz)+cz, aw*(bw-cw)+cw)
+		case OpCmp:
+			a, b, c := m.fetchVec(&in.src[0]), m.fetchVec(&in.src[1]), m.fetchVec(&in.src[2])
+			for k := 0; k < 4; k++ {
+				if !(a[k] >= 0) {
+					b[k] = c[k]
+				}
 			}
-			return c
-		}), nil
-	case OpFrc:
-		return comp(func(a, _, _ float32) float32 { return a - float32(math.Floor(float64(a))) }), nil
-	case OpAbs:
-		return comp(func(a, _, _ float32) float32 { return abs(a) }), nil
-	case OpDp3:
-		return func(m *Machine) { st(m, splat(dot3(src[0](m), src[1](m)))) }, nil
-	case OpDp4:
-		return func(m *Machine) { st(m, splat(dot4(src[0](m), src[1](m)))) }, nil
-	case OpDp2Add:
-		return func(m *Machine) {
-			a, b, c := src[0](m), src[1](m), src[2](m)
-			st(m, splat(a[0]*b[0]+a[1]*b[1]+c[3]))
-		}, nil
-	case OpRcp:
-		return scalar(rcp), nil
-	case OpRsq:
-		return scalar(func(x float32) float32 { return rcp(float32(math.Sqrt(math.Abs(float64(x))))) }), nil
-	case OpExp:
-		return scalar(func(x float32) float32 { return float32(math.Exp2(float64(x))) }), nil
-	case OpLog:
-		return scalar(func(x float32) float32 {
-			if x == 0 {
-				return float32(math.Inf(-1))
+			m.storeVec(d, b)
+		case OpCnd:
+			a, b, c := m.fetchVec(&in.src[0]), m.fetchVec(&in.src[1]), m.fetchVec(&in.src[2])
+			if in.cnd1 {
+				if !(a[3] > 0.5) {
+					b = c
+				}
+			} else {
+				for k := 0; k < 4; k++ {
+					if !(a[k] > 0.5) {
+						b[k] = c[k]
+					}
+				}
 			}
-			return float32(math.Log2(math.Abs(float64(x))))
-		}), nil
-	case OpExpp:
-		return func(m *Machine) {
-			x := src[0](m)[3]
+			m.storeVec(d, b)
+		case OpFrc:
+			a := m.fetchVec(&in.src[0])
+			for k := 0; k < 4; k++ {
+				a[k] -= float32(math.Floor(float64(a[k])))
+			}
+			m.storeVec(d, a)
+		case OpAbs:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			m.store(d, abs(ax), abs(ay), abs(az), abs(aw))
+		case OpDp3:
+			ax, ay, az, _ := m.fetch(&in.src[0])
+			bx, by, bz, _ := m.fetch(&in.src[1])
+			r := ax*bx + ay*by + az*bz
+			m.store(d, r, r, r, r)
+		case OpDp4:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			bx, by, bz, bw := m.fetch(&in.src[1])
+			r := ax*bx + ay*by + az*bz + aw*bw
+			m.store(d, r, r, r, r)
+		case OpDp2Add:
+			ax, ay, _, _ := m.fetch(&in.src[0])
+			bx, by, _, _ := m.fetch(&in.src[1])
+			_, _, _, cw := m.fetch(&in.src[2])
+			r := ax*bx + ay*by + cw
+			m.store(d, r, r, r, r)
+		case OpRcp:
+			_, _, _, x := m.fetch(&in.src[0])
+			r := rcp(x)
+			m.store(d, r, r, r, r)
+		case OpRsq:
+			_, _, _, x := m.fetch(&in.src[0])
+			r := rcp(float32(math.Sqrt(math.Abs(float64(x)))))
+			m.store(d, r, r, r, r)
+		case OpExp:
+			_, _, _, x := m.fetch(&in.src[0])
+			r := float32(math.Exp2(float64(x)))
+			m.store(d, r, r, r, r)
+		case OpLog:
+			_, _, _, x := m.fetch(&in.src[0])
+			r := float32(math.Inf(-1))
+			if x != 0 {
+				r = float32(math.Log2(math.Abs(float64(x))))
+			}
+			m.store(d, r, r, r, r)
+		case OpExpp:
+			_, _, _, x := m.fetch(&in.src[0])
 			fl := float32(math.Floor(float64(x)))
-			st(m, Vec{float32(math.Exp2(float64(fl))), x - fl, float32(math.Exp2(float64(x))), 1})
-		}, nil
-	case OpLogp:
-		return func(m *Machine) {
-			x := abs(src[0](m)[3])
+			m.store(d, float32(math.Exp2(float64(fl))), x-fl, float32(math.Exp2(float64(x))), 1)
+		case OpLogp:
+			_, _, _, x := m.fetch(&in.src[0])
+			x = abs(x)
 			if x == 0 {
-				st(m, splat(float32(math.Inf(-1))))
-				return
+				r := float32(math.Inf(-1))
+				m.store(d, r, r, r, r)
+				break
 			}
 			e, mant := math.Frexp(float64(x))
-			st(m, Vec{float32(e - 1), float32(mant * 2), float32(math.Log2(float64(x))), 1})
-		}, nil
-	case OpPow:
-		return func(m *Machine) {
-			a, b := src[0](m), src[1](m)
-			st(m, splat(float32(math.Pow(math.Abs(float64(a[3])), float64(b[3])))))
-		}, nil
-	case OpLit:
-		return func(m *Machine) {
-			a := src[0](m)
+			m.store(d, float32(e-1), float32(mant*2), float32(math.Log2(float64(x))), 1)
+		case OpPow:
+			_, _, _, a := m.fetch(&in.src[0])
+			_, _, _, b := m.fetch(&in.src[1])
+			r := float32(math.Pow(math.Abs(float64(a)), float64(b)))
+			m.store(d, r, r, r, r)
+		case OpLit:
+			a := m.fetchVec(&in.src[0])
 			r := Vec{1, 0, 0, 1}
 			if a[0] > 0 {
 				r[1] = a[0]
@@ -412,84 +522,60 @@ func (p *Program) compileInst(in *Inst) (func(m *Machine), error) {
 					r[2] = float32(math.Pow(float64(a[1]), float64(pw)))
 				}
 			}
-			st(m, r)
-		}, nil
-	case OpDst:
-		return func(m *Machine) {
-			a, b := src[0](m), src[1](m)
-			st(m, Vec{1, a[1] * b[1], a[2], b[3]})
-		}, nil
-	case OpNrm:
-		return func(m *Machine) {
-			a := src[0](m)
-			l := rcp(float32(math.Sqrt(float64(dot3(a, a)))))
-			st(m, Vec{a[0] * l, a[1] * l, a[2] * l, a[3] * l})
-		}, nil
-	case OpCrs:
-		return func(m *Machine) {
-			a, b := src[0](m), src[1](m)
-			st(m, Vec{a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0], 0})
-		}, nil
-	case OpSinCos:
-		return func(m *Machine) {
-			x := float64(src[0](m)[3])
-			st(m, Vec{float32(math.Cos(x)), float32(math.Sin(x)), 0, 0})
-		}, nil
-	case OpM4x4:
-		return matrix(4, 4), nil
-	case OpM4x3:
-		return matrix(4, 3), nil
-	case OpM3x4:
-		return matrix(3, 4), nil
-	case OpM3x3:
-		return matrix(3, 3), nil
-	case OpM3x2:
-		return matrix(3, 2), nil
-	case OpTexCoord:
-		if sh.Major == 1 && sh.Minor < 4 {
-			n := in.Dst.Num & 7
-			return func(m *Machine) {
-				t := m.T[n]
-				m.T[n] = Vec{min(max(t[0], 0), 1), min(max(t[1], 0), 1), min(max(t[2], 0), 1), 1}
-			}, nil
-		}
-	case OpTex:
-		switch {
-		case sh.Major >= 2: // texld dst, coord, sampler
-			proj := in.Ctrl&1 != 0
-			stage := in.Src[1].Num
-			return func(m *Machine) {
-				uv := src[0](m)
-				if proj && uv[3] != 0 {
-					uv = Vec{uv[0] / uv[3], uv[1] / uv[3], uv[2] / uv[3], 1}
+			m.storeVec(d, r)
+		case OpDst:
+			_, ay, az, _ := m.fetch(&in.src[0])
+			_, by, _, bw := m.fetch(&in.src[1])
+			m.store(d, 1, ay*by, az, bw)
+		case OpNrm:
+			ax, ay, az, aw := m.fetch(&in.src[0])
+			l := rcp(float32(math.Sqrt(float64(ax*ax + ay*ay + az*az))))
+			m.store(d, ax*l, ay*l, az*l, aw*l)
+		case OpCrs:
+			ax, ay, az, _ := m.fetch(&in.src[0])
+			bx, by, bz, _ := m.fetch(&in.src[1])
+			m.store(d, ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx, 0)
+		case OpSinCos:
+			_, _, _, x := m.fetch(&in.src[0])
+			m.store(d, float32(math.Cos(float64(x))), float32(math.Sin(float64(x))), 0, 0)
+		case OpM4x4, OpM4x3, OpM3x4, OpM3x3, OpM3x2:
+			// mAxB dst, src0, src1: dst.i = dot(src0, src1 + i) for i < rows
+			a := m.fetchVec(&in.src[0])
+			row := in.src[1]
+			var r Vec
+			for i := 0; i < in.n; i++ {
+				b := m.fetchVec(&row)
+				if in.cols == 4 {
+					r[i] = dot4(a, b)
+				} else {
+					r[i] = dot3(a, b)
 				}
-				st(m, m.Sample(stage, uv))
-			}, nil
-		case sh.Minor < 4: // tex t#: sample stage # at texture coordinate t#
-			n := in.Dst.Num & 7
-			return func(m *Machine) { m.T[n] = m.Sample(n, m.T[n]) }, nil
-		}
-	case OpTexKill:
-		r := in.Dst
-		return func(m *Machine) {
-			v := p.reg(m, r.Type, r.Num)
-			n := 4
-			if sh.Major < 2 {
-				n = 3 // ps_1_x: x, y, z of the texture coordinate
+				row.idx++
 			}
-			for i := 0; i < n; i++ {
-				if v[i] < 0 {
+			m.storeVec(d, r)
+		case OpTexCoord:
+			t := &m.F[FileT+in.n]
+			t[0], t[1], t[2], t[3] = min(max(t[0], 0), 1), min(max(t[1], 0), 1), min(max(t[2], 0), 1), 1
+		case OpTex:
+			if p.Shader.Major >= 2 {
+				x, y, z, w := m.fetch(&in.src[0])
+				if in.proj && w != 0 {
+					x, y, z, w = x/w, y/w, z/w, 1
+				}
+				m.storeVec(d, m.Sample(in.n, Vec{x, y, z, w}))
+			} else {
+				m.F[FileT+in.n] = m.Sample(in.n, m.F[FileT+in.n])
+			}
+		case OpTexKill:
+			v := &m.F[in.src[0].idx]
+			for k := 0; k < in.n; k++ {
+				if v[k] < 0 {
 					m.Kill = true
 				}
 			}
-		}, nil
+		}
 	}
-	return nil, fmt.Errorf("d3dsm: unsupported instruction %s", opNames[in.Op])
-}
-
-func b2f(b bool) float32 {
-	if b {
-		return 1
+	if p.ps1 {
+		m.F[FileOC] = m.F[FileR]
 	}
-	return 0
 }
