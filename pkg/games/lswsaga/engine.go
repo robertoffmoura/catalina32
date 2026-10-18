@@ -126,10 +126,10 @@ func nuShaderBindMaterial(s *d3d9.Subsystem, c *cpu.CPU) {
 		tex1 := nuLookupTex(c, int32(c.Read32(mtl+0xbc)))
 		texSurf := nuLookupTex(c, int32(c.Read32(mtl+0x100)))
 		texSurf2 := nuLookupTex(c, int32(c.Read32(mtl+0xec)))
-		s.BoundTextures[0] = tex0
-		s.BoundTextures[1] = tex1
-		s.BoundTextures[2] = texSurf
-		s.BoundTextures[3] = texSurf2
+		s.BindTexture(c, 0, tex0)
+		s.BindTexture(c, 1, tex1)
+		s.BindTexture(c, 2, texSurf)
+		s.BindTexture(c, 3, texSurf2)
 		c.Write32(gBoundLayer0Tex, tex0)
 
 		const inv255 = 1.0 / 255.0

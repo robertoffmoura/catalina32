@@ -74,6 +74,13 @@ func (s *Subsystem) bind(c *cpu.CPU, slot *uint32, obj uint32) {
 	s.release(c, old)
 }
 
+// BindTexture binds obj to texture stage like SetTexture (moving the device's reference), for
+// game hooks that bind textures themselves. Assigning BoundTextures directly would unbalance the
+// reference counts.
+func (s *Subsystem) BindTexture(c *cpu.CPU, stage int, obj uint32) {
+	s.bind(c, &s.BoundTextures[stage], obj)
+}
+
 // child returns the child surface of container cont under key, creating it on first use, and
 // adds a reference to the container for the caller.
 func (s *Subsystem) child(c *cpu.CPU, cont uint32, key uint32, create func() uint32) uint32 {

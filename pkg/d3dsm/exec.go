@@ -275,16 +275,25 @@ func applyMod(v Vec, mod uint8) Vec {
 func abs(f float32) float32 { return float32(math.Abs(float64(f))) }
 
 // store writes a result through the destination's mask, shift and saturate.
+// toA0 converts a rounded value for the address register; NaN and out-of-range values give 0
+// (Go leaves those conversions to the host, so amd64 and arm64 would differ).
+func toA0(f float64) int32 {
+	if f >= -1<<31 && f < 1<<31 {
+		return int32(f)
+	}
+	return 0
+}
+
 func (m *Machine) store(d *dest, x, y, z, w float32) {
 	if d.a0 {
 		v := Vec{x, y, z, w}
 		for i := 0; i < 4; i++ {
 			if d.mask&(1<<i) != 0 {
+				f := math.Floor(float64(v[i]) + 0.5)
 				if d.floor {
-					m.A0[i] = int32(math.Floor(float64(v[i])))
-				} else {
-					m.A0[i] = int32(math.Floor(float64(v[i]) + 0.5))
+					f = math.Floor(float64(v[i]))
 				}
+				m.A0[i] = toA0(f)
 			}
 		}
 		return
