@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"catalina32/pkg/cpu"
+	"catalina32/pkg/journal"
 	"catalina32/pkg/profile"
 )
 
@@ -38,6 +39,7 @@ type Win32Env struct {
 	PerfCounter     uint64
 	TraceLog        bool
 	LiveClock       bool
+	Journal         *journal.Journal    // records or replays clock readings (nil: neither)
 	dirCache        map[string][]string // DataRoot directory listings (ResolvePath)
 	prof            *profile.Profile
 	sched           *scheduler
@@ -470,22 +472,24 @@ func (env *Win32Env) thunkGetLastError(c *cpu.CPU) {
 }
 
 func (env *Win32Env) currentMs(c *cpu.CPU) uint32 {
-	if env.LiveClock {
-		return uint32(time.Since(env.StartTime).Milliseconds())
-	}
-	return uint32(c.Steps / 50000)
+	return uint32(env.Journal.U64(journal.Millis, func() uint64 {
+		if env.LiveClock {
+			return uint64(time.Since(env.StartTime).Milliseconds())
+		}
+		return c.Steps / 50000
+	}))
 }
 
 func (env *Win32Env) thunkQueryPerformanceCounter(c *cpu.CPU) {
 	ptr := c.Arg(0)
-	var ticks uint64
-	if env.LiveClock {
-		ticks = uint64(time.Since(env.StartTime).Nanoseconds())
-	} else {
+	ticks := env.Journal.U64(journal.Perf, func() uint64 {
+		if env.LiveClock {
+			return uint64(time.Since(env.StartTime).Nanoseconds())
+		}
 		// Increment deterministically so game frame delta is smooth (~50-60 FPS) in headless runs
 		env.PerfCounter += 20000000
-		ticks = env.PerfCounter + c.Steps*20
-	}
+		return env.PerfCounter + c.Steps*20
+	})
 	if ptr != 0 {
 		c.Write64(ptr, ticks)
 	}

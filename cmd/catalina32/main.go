@@ -15,6 +15,7 @@ import (
 	"catalina32/pkg/crt"
 	"catalina32/pkg/d3d9"
 	"catalina32/pkg/games"
+	"catalina32/pkg/journal"
 	"catalina32/pkg/macho32"
 	"catalina32/pkg/win32"
 )
@@ -119,6 +120,9 @@ func engineMain(binPath string) {
 	w32.OnCursor = d3d.SetWin32Cursor // the viewer hides the pointer when the game doesn't want it
 	d3d.RegisterIndirectXThunks(vm, prof)
 	game.Install(vm, d3d, prof)
+	// C32_RECORD / C32_REPLAY: record a live session's input, or replay one (pkg/journal).
+	jn := journal.Open(saveRoot, fmt.Sprintf("real_shaders=%v", d3d9.RealShadersEnabled()))
+	w32.Journal, d3d.Journal = jn, jn
 	fmt.Printf("[catalina32] %s\n", prof.Report())
 
 	// 1. Execute all 18 NuEngine static initializers
@@ -196,6 +200,7 @@ func engineMain(binPath string) {
 	ret, err := vm.CallGuest(entry, 0x00001000, 0, w32.CmdLineAddr, 1)
 	pprof.StopCPUProfile()
 	d3d.WaitRender() // let the last submitted frame finish drawing/exporting
+	jn.Close()
 	dumpGuestProfile(vm)
 	d3d.GameEnded()
 	if vm.Exited {

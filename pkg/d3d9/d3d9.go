@@ -14,6 +14,7 @@ import (
 
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/d3dsm"
+	"catalina32/pkg/journal"
 	"catalina32/pkg/profile"
 )
 
@@ -211,6 +212,9 @@ type Subsystem struct {
 	sampSet                                    [16][14]bool
 	shaderErrors                               int
 	loggedConstTableSet                        bool // emulator time blocked on the previous frame's drawing
+
+	// Journal records or replays the outside input the guest reads (nil: neither).
+	Journal *journal.Journal
 
 	KeyMu        sync.Mutex
 	KeyHoldUntil [256]uint64
@@ -757,6 +761,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 17: // Present
 		s.FrameCount++
+		s.Journal.Frame(s.FrameCount)
 		s.publishStatus(c)
 		if s.OnPresent != nil {
 			s.OnPresent(s.FrameCount)
@@ -1477,6 +1482,7 @@ func (s *Subsystem) handleIDirect3DSwapChain9(c *cpu.CPU, winSlot int) {
 			fmt.Printf("[D3D9] IDirect3DSwapChain9::Present(%x) at frame %d\n", c.Arg(0), s.FrameCount)
 		}
 		s.FrameCount++
+		s.Journal.Frame(s.FrameCount)
 		s.publishStatus(c)
 	case 5: // GetBackBuffer(this, iBackBuffer, Type, ppBackBuffer)
 		pp := c.Arg(3)
@@ -1770,6 +1776,7 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 					s.InputScript(s, mode, buf)
 				}
 			}
+			s.Journal.Bytes(journal.Keys, buf)
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 10: // GetDeviceData(this, cbObjectData, rgdod, pdwInOut, dwFlags)
@@ -2079,6 +2086,22 @@ func (s *Subsystem) handleIDirectSoundBuffer8(c *cpu.CPU, winSlot int) {
 // ShmHotplugPads slots always report connected (neutral when empty) so pads can be plugged in
 // later, and any pad reported once stays connected (neutral if it drops, e.g. Bluetooth sleep).
 func (s *Subsystem) readPad(user uint32) ([12]byte, bool) {
+	if s.Journal == nil {
+		return s.readPadLive(user)
+	}
+	var rec [13]byte // the state, then 1 if connected
+	if !s.Journal.Replaying() {
+		pad, ok := s.readPadLive(user)
+		copy(rec[:], pad[:])
+		if ok {
+			rec[12] = 1
+		}
+	}
+	s.Journal.Bytes(journal.Pad, rec[:])
+	return [12]byte(rec[:12]), rec[12] != 0
+}
+
+func (s *Subsystem) readPadLive(user uint32) ([12]byte, bool) {
 	var pad [12]byte
 	if s.shm == nil || user >= ShmPads {
 		return pad, false

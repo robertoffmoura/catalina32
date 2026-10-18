@@ -20,6 +20,7 @@ import (
 	"unsafe"
 
 	"catalina32/pkg/cpu"
+	"catalina32/pkg/journal"
 )
 
 const (
@@ -1757,6 +1758,7 @@ func (s *Subsystem) mixAudioFrame(c *cpu.CPU) {
 		}
 	}
 	s.LastAudioTime = now
+	outFrames = int(s.Journal.U64(journal.Audio, func() uint64 { return uint64(outFrames) }))
 
 	var mixL [maxOutFrames]int32
 	var mixR [maxOutFrames]int32
