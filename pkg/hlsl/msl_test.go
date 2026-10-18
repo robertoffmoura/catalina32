@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"catalina32/pkg/msl"
 )
 
 const mslVectors = 8 // random input sets per shader
@@ -127,6 +129,8 @@ func compileEntry(src, entry string) (*File, *Program, *MSLModule, error) {
 	return file, prog, mod, err
 }
 
+var _ msl.Shader = (*MSLModule)(nil)
+
 func runMSLCase(tc mslCase, dir, stub string) error {
 	_, vprog, vmod, err := compileEntry(tc.src, tc.vsName)
 	if err != nil {
@@ -152,8 +156,8 @@ func runMSLCase(tc mslCase, dir, stub string) error {
 
 	// Fragment inputs present in the vertex outputs (others read as zero).
 	provided := map[string]*Type{}
-	for _, l := range vmod.Outputs {
-		provided[varyingName(l)] = l.Type
+	for _, v := range vmod.Varyings() {
+		provided[v.Name] = varyingType(v)
 	}
 	inputs := make([][][4]float32, mslVectors)
 	for k := range inputs {
@@ -214,7 +218,7 @@ func runMSLCase(tc mslCase, dir, stub string) error {
 	if tc.vertex {
 		src = mod.VertexMSL(nil)
 	} else {
-		src = mod.FragmentMSL(vmod)
+		src = mod.FragmentMSL(vmod.Varyings())
 	}
 	if !strings.Contains(src, mslPrelude) {
 		return fmt.Errorf("prelude not found in generated source")
@@ -229,12 +233,8 @@ func runMSLCase(tc mslCase, dir, stub string) error {
 	h.WriteString("int main() {\n\tfor (int i = 0; i < 256; i++) Cv[i] = float4(REGS[i][0], REGS[i][1], REGS[i][2], REGS[i][3]);\n")
 	h.WriteString("\tSv[0] = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\tSv[0].x = tc_vertex ? 0.0f : 8.0f;\n")
 	texArgs := ""
-	for _, tx := range mod.Textures {
-		kind := "texture2d<float>"
-		if tx.Cube {
-			kind = "texturecube<float>"
-		}
-		texArgs += fmt.Sprintf(", %s{%d}, sampler{}", kind, tx.Unit)
+	for _, tx := range mod.Textures() {
+		texArgs += fmt.Sprintf(", %s{%d}, sampler{}", tx.TypeName(), tx.Unit)
 	}
 	for k := 0; k < mslVectors; k++ {
 		h.WriteString("\t{\n")

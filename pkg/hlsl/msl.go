@@ -26,6 +26,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"catalina32/pkg/msl"
 )
 
 // MSLLeaf is one scalar/vector element of an entry point's inputs or outputs.
@@ -37,32 +39,18 @@ type MSLLeaf struct {
 	param    int   // entry parameter index, or -1 for the return value
 }
 
-// MSLTexture is a sampler register used by the program.
-type MSLTexture struct {
-	Unit int
-	Cube bool
-}
-
 // MSLModule is a translated entry point.
 type MSLModule struct {
 	Vertex   bool
 	Core     string    // prelude, structs, G, user functions
 	Inputs   []MSLLeaf // entry inputs (vertex attributes / fragment varyings)
 	Outputs  []MSLLeaf // entry outputs (varyings / colours)
-	Textures []MSLTexture
+	texUnits []msl.Texture
 	entry    *FuncDecl
 	fnName   string
 	loads    string // statements filling g's uniforms from the register array C
 	inits    string // global initialisers
 }
-
-// AttrClass is how vertex data for an attribute reaches the shader.
-type AttrClass uint8
-
-const (
-	AttrFloat AttrClass = iota // float, normalized or half formats
-	AttrInt                    // non-normalized integer formats (UBYTE4, SHORT2/4)
-)
 
 // TranslateMSL translates entry (already compiled into prog) of file.
 func TranslateMSL(file *File, prog *Program) (mod *MSLModule, err error) {
@@ -76,7 +64,7 @@ func TranslateMSL(file *File, prog *Program) (mod *MSLModule, err error) {
 		}
 	}()
 	g := &mslGen{file: file, prog: prog, funcs: map[string][]*FuncDecl{}, globals: map[string]*VarDecl{},
-		emitted: map[*FuncDecl]bool{}, structsUsed: map[*StructDef]bool{}, samplers: map[string]MSLTexture{}}
+		emitted: map[*FuncDecl]bool{}, structsUsed: map[*StructDef]bool{}, samplers: map[string]msl.Texture{}}
 	for _, f := range file.Funcs {
 		g.funcs[f.Name] = append(g.funcs[f.Name], f)
 	}
@@ -85,7 +73,13 @@ func TranslateMSL(file *File, prog *Program) (mod *MSLModule, err error) {
 	}
 	for _, k := range prog.Constants {
 		if k.RegisterSet == RegSampler {
-			tex := MSLTexture{Unit: k.RegisterIndex, Cube: strings.Contains(strings.ToLower(k.Type.Sampler), "cube")}
+			tex := msl.Texture{Unit: k.RegisterIndex}
+			switch sm := strings.ToLower(k.Type.Sampler); {
+			case strings.Contains(sm, "cube"):
+				tex.Kind = msl.TexCube
+			case strings.Contains(sm, "3d"):
+				tex.Kind = msl.Tex3D
+			}
 			g.samplers[k.Name] = tex
 			g.textures = append(g.textures, tex)
 		}
@@ -96,7 +90,7 @@ func TranslateMSL(file *File, prog *Program) (mod *MSLModule, err error) {
 		return nil, fmt.Errorf("msl: entry %q not found", prog.Entry)
 	}
 	ef := ents[0]
-	mod = &MSLModule{entry: ef, Textures: g.textures}
+	mod = &MSLModule{entry: ef, texUnits: g.textures}
 	mod.fnName = g.function(ef)
 	for i, prm := range ef.Params {
 		if prm.In {
@@ -147,8 +141,8 @@ type mslGen struct {
 	globals     map[string]*VarDecl
 	usedGlobals []*VarDecl // non-sampler globals in first-use order
 	globalSeen  map[string]bool
-	samplers    map[string]MSLTexture
-	textures    []MSLTexture
+	samplers    map[string]msl.Texture
+	textures    []msl.Texture
 	emitted     map[*FuncDecl]bool
 	structsUsed map[*StructDef]bool
 	structOrder []*StructDef
@@ -168,9 +162,9 @@ type mvar struct {
 type mv struct {
 	code        string
 	t           *Type
-	lvalue      bool        // assignable
-	addressable bool        // can bind to a reference (no swizzle or vector component in the path)
-	sampler     *MSLTexture // sampler globals
+	lvalue      bool         // assignable
+	addressable bool         // can bind to a reference (no swizzle or vector component in the path)
+	sampler     *msl.Texture // sampler globals
 }
 
 // Identifier spelling: every user name gets a prefix, so none collides with MSL keywords,
@@ -250,11 +244,7 @@ func (g *mslGen) zero(t *Type, line int) string {
 func (g *mslGen) texParams() string {
 	var b strings.Builder
 	for _, t := range g.textures {
-		kind := "texture2d<float>"
-		if t.Cube {
-			kind = "texturecube<float>"
-		}
-		fmt.Fprintf(&b, ", %s t%d, sampler s%d", kind, t.Unit, t.Unit)
+		fmt.Fprintf(&b, ", %s t%d, sampler s%d", t.TypeName(), t.Unit, t.Unit)
 	}
 	return b.String()
 }
@@ -1009,7 +999,7 @@ func (g *mslGen) intrinsic(e *CallExpr) mv {
 		}
 		v4 := vectorType(BFloat, 4)
 		dim := 2
-		if smp.Cube {
+		if smp.Kind != msl.Tex2D {
 			dim = 3
 		}
 		coordT := vectorType(BFloat, dim)
@@ -1220,13 +1210,13 @@ template <typename T> inline void h_copy(thread T& d, thread T& s) { d = s; }
 // (by index in Inputs; missing entries are float). Buffer 0 holds the float constant registers,
 // buffer 1 the renderer's state (S[0].xy: half-pixel offset in clip units); vertex streams
 // start at buffer 2.
-func (m *MSLModule) VertexMSL(attrs []AttrClass) string {
+func (m *MSLModule) VertexMSL(attrs []msl.AttrClass) string {
 	var b strings.Builder
 	b.WriteString(m.Core)
 	b.WriteString("struct VIn {\n")
 	for i := range m.Inputs {
 		ty := "float4"
-		if i < len(attrs) && attrs[i] == AttrInt {
+		if i < len(attrs) && attrs[i] == msl.AttrInt {
 			ty = "int4"
 		}
 		fmt.Fprintf(&b, "\t%s a%d [[attribute(%d)]];\n", ty, i, i)
@@ -1245,7 +1235,7 @@ func (m *MSLModule) VertexMSL(attrs []AttrClass) string {
 	fmt.Fprintf(&b, "vertex VOut vs_main(VIn vin [[stage_in]], constant float4* C [[buffer(0)]], constant float4* S [[buffer(1)]]%s) {\n", m.stageTexParams())
 	m.entryCall(&b, func(l MSLLeaf, i int) string {
 		v := fmt.Sprintf("vin.a%d", i)
-		if i < len(attrs) && attrs[i] == AttrInt {
+		if i < len(attrs) && attrs[i] == msl.AttrInt {
 			v = "float4(" + v + ")"
 		}
 		return leafConv(v, l.Type)
@@ -1263,18 +1253,16 @@ func (m *MSLModule) VertexMSL(attrs []AttrClass) string {
 	return b.String()
 }
 
-// FragmentMSL builds a complete fragment function source taking its varyings from vs (the
-// paired vertex module; inputs it does not provide read as zero). Buffer 0 holds the float
-// constant registers, buffer 1 the renderer's state (S[0].x: alpha test function, S[0].y:
-// reference).
-func (m *MSLModule) FragmentMSL(vs *MSLModule) string {
+// FragmentMSL builds a complete fragment function source taking its varyings from a vertex
+// function providing the given ones (inputs it does not provide read as zero). Buffer 0 holds
+// the float constant registers, buffer 1 the renderer's state (S[0].x: alpha test function,
+// S[0].y: reference).
+func (m *MSLModule) FragmentMSL(vsOut []msl.Varying) string {
 	var b strings.Builder
 	b.WriteString(m.Core)
-	provided := map[string]MSLLeaf{}
-	if vs != nil {
-		for _, l := range vs.Outputs {
-			provided[varyingName(l)] = l
-		}
+	provided := map[string]msl.Varying{}
+	for _, v := range vsOut {
+		provided[v.Name] = v
 	}
 	b.WriteString("struct PIn {\n\tfloat4 pos [[position]];\n")
 	used := map[string]bool{}
@@ -1282,7 +1270,7 @@ func (m *MSLModule) FragmentMSL(vs *MSLModule) string {
 		n := varyingName(l)
 		if vl, ok := provided[n]; ok && !used[n] && !(l.Semantic == "POSITION" && l.Index == 0) {
 			used[n] = true
-			fmt.Fprintf(&b, "\t%s %s [[user(%s)]];\n", vecDecl(vl.Type), n, n)
+			fmt.Fprintf(&b, "\t%s %s [[user(%s)]];\n", vl.TypeName(), n, n)
 		}
 	}
 	b.WriteString("};\nstruct POut {\n")
@@ -1304,7 +1292,7 @@ func (m *MSLModule) FragmentMSL(vs *MSLModule) string {
 		case l.Semantic == "POSITION" || l.Semantic == "VPOS":
 			return leafConv("pin.pos", l.Type)
 		case used[n]:
-			return leafConv(widen("pin."+n, provided[n].Type), l.Type)
+			return leafConv(widen("pin."+n, varyingType(provided[n])), l.Type)
 		}
 		return "" // not provided: stays zero
 	})
@@ -1335,19 +1323,15 @@ const alphaTestMSL = `	{
 
 func (m *MSLModule) stageTexParams() string {
 	var b strings.Builder
-	for _, t := range m.Textures {
-		kind := "texture2d<float>"
-		if t.Cube {
-			kind = "texturecube<float>"
-		}
-		fmt.Fprintf(&b, ", %s t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", kind, t.Unit, t.Unit, t.Unit, t.Unit)
+	for _, t := range m.texUnits {
+		fmt.Fprintf(&b, ", %s t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", t.TypeName(), t.Unit, t.Unit, t.Unit, t.Unit)
 	}
 	return b.String()
 }
 
 func (m *MSLModule) texArgs() string {
 	var b strings.Builder
-	for _, t := range m.Textures {
+	for _, t := range m.texUnits {
 		fmt.Fprintf(&b, ", t%d, s%d", t.Unit, t.Unit)
 	}
 	return b.String()
@@ -1389,6 +1373,37 @@ func (m *MSLModule) outputRef(l MSLLeaf) string {
 		return "r" + l.Path
 	}
 	return fmt.Sprintf("p%d%s", l.param, l.Path)
+}
+
+// Attributes lists the vertex inputs (msl.Shader).
+func (m *MSLModule) Attributes() []msl.Attribute {
+	var a []msl.Attribute
+	for _, l := range m.Inputs {
+		a = append(a, msl.Attribute{Semantic: l.Semantic, Index: l.Index})
+	}
+	return a
+}
+
+// Varyings lists the outputs other than the position (msl.Shader).
+func (m *MSLModule) Varyings() []msl.Varying {
+	var v []msl.Varying
+	for _, l := range m.Outputs {
+		if l.Semantic == "POSITION" && l.Index == 0 {
+			continue
+		}
+		v = append(v, msl.Varying{Name: varyingName(l), Cols: l.Type.Cols, Int: l.Type.Base == BInt})
+	}
+	return v
+}
+
+// Textures lists the texture units read (msl.Shader).
+func (m *MSLModule) Textures() []msl.Texture { return m.texUnits }
+
+func varyingType(v msl.Varying) *Type {
+	if v.Int {
+		return vectorType(BInt, v.Cols)
+	}
+	return vectorType(BFloat, v.Cols)
 }
 
 // varyingName is the user attribute linking a vertex output to a fragment input.
