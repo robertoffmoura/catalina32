@@ -36,3 +36,21 @@ func TestHeapExhaustionHalts(t *testing.T) {
 		t.Fatalf("overflowing calloc: %#x, halted %v", p, c.Halted)
 	}
 }
+
+// A REP string instruction that runs out of guest memory stops at the fault instead of running
+// out its count (4 billion iterations would take about 20 minutes).
+func TestRepStopsAfterFault(t *testing.T) {
+	c := NewCPU()
+	const code = 0x1000
+	copy(c.Mem[code:], []byte{0xF3, 0xAB}) // rep stosd
+	c.EIP = code
+	c.Regs[RegEDI] = ArenaSize - 8 // two stores fit, the third faults (too long for the bulk path)
+	c.Regs[RegECX] = 0xFFFFFFFF
+	c.Step()
+	if !c.Halted {
+		t.Fatal("not halted")
+	}
+	if c.Regs[RegECX] < 0xFFFFFFF0 {
+		t.Fatalf("ran on after the fault: ECX = %#x", c.Regs[RegECX])
+	}
+}

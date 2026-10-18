@@ -1928,7 +1928,7 @@ func (c *CPU) execStringOp(op uint8, opSize16 bool, repF3 bool, repF2 bool) {
 		return
 	}
 	isScanOrCmp := op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF
-	for c.Regs[RegECX] != 0 {
+	for c.Regs[RegECX] != 0 && !c.Halted { // an out-of-range access halts: stop at once
 		doOne()
 		c.Regs[RegECX]--
 		if isScanOrCmp {
