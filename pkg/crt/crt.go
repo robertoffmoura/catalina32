@@ -879,7 +879,7 @@ func vorbisDecodePackedEntryNumber(c *cpu.CPU, book uint32, b uint32) int32 {
 		entry := int32(c.Read32(firstTable + uint32(lok)*4))
 		if entry >= 0 {
 			codelengths := c.Read32(book + 0x1c)
-			l := int32(int8(c.Mem[codelengths+uint32(entry)-1]))
+			l := int32(int8(c.Read8(codelengths + uint32(entry) - 1)))
 			oggpackAdv(c, b, l)
 			return entry - 1
 		}
@@ -910,7 +910,7 @@ func vorbisDecodePackedEntryNumber(c *cpu.CPU, book uint32, b uint32) int32 {
 		}
 	}
 	codelengths := c.Read32(book + 0x1c)
-	l := int32(int8(c.Mem[codelengths+uint32(lo)]))
+	l := int32(int8(c.Read8(codelengths + uint32(lo))))
 	if l <= read {
 		oggpackAdv(c, b, l)
 		return lo
