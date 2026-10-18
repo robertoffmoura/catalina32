@@ -361,4 +361,3 @@ func (env *Win32Env) fireTimers(c *cpu.CPU) {
 		env.yield(c)
 	}
 }
-

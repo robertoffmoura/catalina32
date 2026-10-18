@@ -55,16 +55,18 @@ func liftedNuMtxMul(c *cpu.CPU) {
 	}
 	for r := 0; r < 3; r++ {
 		for col := 0; col < 3; col++ {
-			out[r*4+col] = m1[r*4+0]*m2[0*4+col] +
-				m1[r*4+1]*m2[1*4+col] +
-				m1[r*4+2]*m2[2*4+col]
+			// float32() around each product prevents fused multiply-adds (arm64), which would
+			// round differently from the guest code.
+			out[r*4+col] = float32(m1[r*4+0]*m2[0*4+col]) +
+				float32(m1[r*4+1]*m2[1*4+col]) +
+				float32(m1[r*4+2]*m2[2*4+col])
 		}
 		out[r*4+3] = 0
 	}
 	for col := 0; col < 3; col++ {
-		out[12+col] = m1[12+0]*m2[0*4+col] +
-			m1[12+1]*m2[1*4+col] +
-			m1[12+2]*m2[2*4+col] +
+		out[12+col] = float32(m1[12+0]*m2[0*4+col]) +
+			float32(m1[12+1]*m2[1*4+col]) +
+			float32(m1[12+2]*m2[2*4+col]) +
 			m2[12+col]
 	}
 	out[15] = 1.0
@@ -965,14 +967,16 @@ func liftedNuHasRenderData(c *cpu.CPU) {
 	c.Ret()
 }
 
+// The float32() conversions around products below keep each product rounded: without them the
+// Go compiler may fuse multiply-adds on arm64, giving different results from amd64 and the guest.
 func liftedNuVecMtxTransform(c *cpu.CPU) {
 	out := c.Arg(0)
 	in := c.Arg(1)
 	mtx := c.Arg(2)
 	ix, iy, iz := c.ReadF32(in), c.ReadF32(in+4), c.ReadF32(in+8)
-	ox := ix*c.ReadF32(mtx+0x00) + iy*c.ReadF32(mtx+0x10) + iz*c.ReadF32(mtx+0x20) + c.ReadF32(mtx+0x30)
-	oy := ix*c.ReadF32(mtx+0x04) + iy*c.ReadF32(mtx+0x14) + iz*c.ReadF32(mtx+0x24) + c.ReadF32(mtx+0x34)
-	oz := ix*c.ReadF32(mtx+0x08) + iy*c.ReadF32(mtx+0x18) + iz*c.ReadF32(mtx+0x28) + c.ReadF32(mtx+0x38)
+	ox := float32(ix*c.ReadF32(mtx+0x00)) + float32(iy*c.ReadF32(mtx+0x10)) + float32(iz*c.ReadF32(mtx+0x20)) + c.ReadF32(mtx+0x30)
+	oy := float32(ix*c.ReadF32(mtx+0x04)) + float32(iy*c.ReadF32(mtx+0x14)) + float32(iz*c.ReadF32(mtx+0x24)) + c.ReadF32(mtx+0x34)
+	oz := float32(ix*c.ReadF32(mtx+0x08)) + float32(iy*c.ReadF32(mtx+0x18)) + float32(iz*c.ReadF32(mtx+0x28)) + c.ReadF32(mtx+0x38)
 	c.WriteF32(out, ox)
 	c.WriteF32(out+4, oy)
 	c.WriteF32(out+8, oz)
@@ -984,9 +988,9 @@ func liftedNuVecMtxRotate(c *cpu.CPU) {
 	in := c.Arg(1)
 	mtx := c.Arg(2)
 	ix, iy, iz := c.ReadF32(in), c.ReadF32(in+4), c.ReadF32(in+8)
-	ox := ix*c.ReadF32(mtx+0x00) + iy*c.ReadF32(mtx+0x10) + iz*c.ReadF32(mtx+0x20)
-	oy := ix*c.ReadF32(mtx+0x04) + iy*c.ReadF32(mtx+0x14) + iz*c.ReadF32(mtx+0x24)
-	oz := ix*c.ReadF32(mtx+0x08) + iy*c.ReadF32(mtx+0x18) + iz*c.ReadF32(mtx+0x28)
+	ox := float32(ix*c.ReadF32(mtx+0x00)) + float32(iy*c.ReadF32(mtx+0x10)) + float32(iz*c.ReadF32(mtx+0x20))
+	oy := float32(ix*c.ReadF32(mtx+0x04)) + float32(iy*c.ReadF32(mtx+0x14)) + float32(iz*c.ReadF32(mtx+0x24))
+	oz := float32(ix*c.ReadF32(mtx+0x08)) + float32(iy*c.ReadF32(mtx+0x18)) + float32(iz*c.ReadF32(mtx+0x28))
 	c.WriteF32(out, ox)
 	c.WriteF32(out+4, oy)
 	c.WriteF32(out+8, oz)

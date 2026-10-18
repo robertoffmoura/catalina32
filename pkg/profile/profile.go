@@ -87,6 +87,16 @@ func (p *Profile) Bind(c *cpu.CPU, name string, fn cpu.ThunkFunc) bool {
 	return true
 }
 
+// Named reports whether addr is one of the profile's well-known functions (Symbols).
+func (p *Profile) Named(addr uint32) bool {
+	for _, a := range p.Symbols {
+		if a == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // Global returns the address of a well-known data location, or 0 if the profile does not define it.
 func (p *Profile) Global(name string) uint32 {
 	return p.Globals[name]

@@ -38,6 +38,7 @@ type Win32Env struct {
 	PerfCounter     uint64
 	TraceLog        bool
 	LiveClock       bool
+	dirCache        map[string][]string // DataRoot directory listings (ResolvePath)
 	prof            *profile.Profile
 	sched           *scheduler
 	WndProc         uint32
@@ -68,7 +69,9 @@ func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
 	}
 }
 
-// Case-insensitive path resolver against DataRoot and SaveRoot
+// ResolvePath maps a guest path to a host path. "SaveData\..." lives under SaveRoot. Everything
+// else is game data, matched case-insensitively inside DataRoot, which is never written: writes go
+// to a copy under SaveRoot/DataOverlay (see openGuestFile), and reads prefer that copy once it exists.
 func (env *Win32Env) ResolvePath(guestPath string, forWrite bool) string {
 	clean := strings.ReplaceAll(guestPath, "\\", "/")
 	clean = strings.TrimSpace(clean)
@@ -77,56 +80,115 @@ func (env *Win32Env) ResolvePath(guestPath string, forWrite bool) string {
 	}
 	clean = strings.TrimLeft(clean, "/")
 
-	// If under SaveRoot prefix
 	if strings.HasPrefix(clean, "SaveData/") {
-		rel := strings.TrimPrefix(clean, "SaveData/")
-		return filepath.Join(env.SaveRoot, rel)
+		return filepath.Join(env.SaveRoot, strings.TrimPrefix(clean, "SaveData/"))
 	}
 	if strings.HasPrefix(clean, strings.TrimLeft(env.SaveRoot, "/")) {
 		return "/" + clean
 	}
+	overlay := filepath.Join(env.SaveRoot, "DataOverlay", filepath.FromSlash(strings.ToLower(clean)))
+	if forWrite {
+		return overlay
+	}
+	if _, err := os.Stat(overlay); err == nil {
+		return overlay
+	}
+	return env.findData(clean)
+}
 
-	// Walk case-insensitively inside DataRoot
+// findData walks DataRoot case-insensitively. DataRoot is read-only, so directory listings are
+// cached.
+func (env *Win32Env) findData(clean string) string {
 	parts := strings.Split(clean, "/")
 	cur := env.DataRoot
 	for i, part := range parts {
 		if part == "" || part == "." {
 			continue
 		}
-		entries, err := os.ReadDir(cur)
-		if err != nil {
-			break
+		names, ok := env.dirCache[cur]
+		if !ok {
+			entries, err := os.ReadDir(cur)
+			if err != nil {
+				break
+			}
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			if env.dirCache == nil {
+				env.dirCache = map[string][]string{}
+			}
+			env.dirCache[cur] = names
 		}
 		matched := ""
-		for _, e := range entries {
-			if strings.EqualFold(e.Name(), part) {
-				matched = e.Name()
+		for _, n := range names {
+			if strings.EqualFold(n, part) {
+				matched = n
 				break
 			}
 		}
-		if matched != "" {
-			cur = filepath.Join(cur, matched)
-			if i == len(parts)-1 {
-				return cur
-			}
-		} else {
-			// Check vfs-config.xml rule: .bik -> .mov
+		if matched == "" {
+			// vfs-config.xml rule: .bik -> .mov
 			if i == len(parts)-1 && strings.HasSuffix(strings.ToLower(part), ".bik") {
 				movPart := part[:len(part)-4] + ".mov"
-				for _, e := range entries {
-					if strings.EqualFold(e.Name(), movPart) {
-						return filepath.Join(cur, e.Name())
+				for _, n := range names {
+					if strings.EqualFold(n, movPart) {
+						return filepath.Join(cur, n)
 					}
 				}
 			}
 			break
 		}
-	}
-
-	if forWrite {
-		return filepath.Join(env.SaveRoot, filepath.Base(clean))
+		cur = filepath.Join(cur, matched)
+		if i == len(parts)-1 {
+			return cur
+		}
 	}
 	return filepath.Join(env.DataRoot, clean)
+}
+
+// openGuestFile opens a guest path with os.OpenFile flags. A write to game data first copies the
+// original into the overlay (unless the open truncates it), so DataRoot is never modified.
+func (env *Win32Env) openGuestFile(guestPath string, flag int) (*os.File, string, error) {
+	if flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+		hostPath := env.ResolvePath(guestPath, false)
+		f, err := os.Open(hostPath)
+		return f, hostPath, err
+	}
+	readPath := env.ResolvePath(guestPath, false)
+	hostPath := env.ResolvePath(guestPath, true)
+	if flag&os.O_EXCL != 0 {
+		if _, err := os.Stat(readPath); err == nil {
+			return nil, hostPath, os.ErrExist
+		}
+	}
+	_ = os.MkdirAll(filepath.Dir(hostPath), 0755)
+	if readPath != hostPath && flag&os.O_TRUNC == 0 {
+		if err := copyFile(readPath, hostPath); err != nil && !os.IsNotExist(err) {
+			return nil, hostPath, err
+		}
+	}
+	f, err := os.OpenFile(hostPath, flag, 0644)
+	return f, hostPath, err
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if st, err := in.Stat(); err != nil || st.IsDir() {
+		return os.ErrNotExist
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // RegisterBoundaryThunks binds the MacDoze (Win32) shims to the functions the game profile names,
@@ -135,6 +197,9 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, prof *profile.Profile) {
 	env.prof = prof
 	env.initScheduler(c)
 	for _, addr := range prof.UnmappedStubs {
+		if prof.Named(addr) {
+			continue // bound to a real shim by name
+		}
 		fnAddr := addr
 		c.RegisterIntercept(fnAddr, fmt.Sprintf("boundary_0x%08x", fnAddr), func(vm *cpu.CPU) {
 			vm.UnmappedCalls[fnAddr]++
@@ -403,25 +468,45 @@ func (env *Win32Env) thunkCreateFileA(c *cpu.CPU) {
 	access := c.Arg(1)
 	creation := c.Arg(4)
 	guestPath := c.ReadCString(namePtr)
-	forWrite := (access&0x40000000) != 0 || creation == 2 || creation == 4
-	hostPath := env.ResolvePath(guestPath, forWrite)
-
-	var f *os.File
-	var err error
-	if forWrite {
-		_ = os.MkdirAll(filepath.Dir(hostPath), 0755)
-		f, err = os.OpenFile(hostPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-	} else {
-		f, err = os.Open(hostPath)
+	flag := os.O_RDONLY
+	switch write := access&0x40000000 != 0; {
+	case write && access&0x80000000 != 0:
+		flag = os.O_RDWR
+	case write:
+		flag = os.O_WRONLY
 	}
+	switch creation {
+	case 1: // CREATE_NEW
+		flag |= os.O_CREATE | os.O_EXCL
+	case 2: // CREATE_ALWAYS
+		flag |= os.O_CREATE | os.O_TRUNC
+	case 4: // OPEN_ALWAYS
+		flag |= os.O_CREATE
+	case 5: // TRUNCATE_EXISTING
+		flag |= os.O_TRUNC
+	}
+	if flag&(os.O_CREATE|os.O_TRUNC) != 0 && flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+		flag |= os.O_RDWR // creating or truncating needs write access on the host
+	}
+	existed := false
+	if _, err := os.Stat(env.ResolvePath(guestPath, false)); err == nil {
+		existed = true
+	}
+	f, hostPath, err := env.openGuestFile(guestPath, flag)
 	if err != nil {
 		if env.TraceLog {
 			fmt.Printf("[Win32] CreateFileA(%q -> %q) -> NOT FOUND\n", guestPath, hostPath)
 		}
 		env.LastError = 2 // ERROR_FILE_NOT_FOUND
+		if os.IsExist(err) {
+			env.LastError = 80 // ERROR_FILE_EXISTS
+		}
 		c.Regs[cpu.RegEAX] = InvalidHandleValue
 		c.Ret()
 		return
+	}
+	if existed && (creation == 2 || creation == 4) {
+		env.LastError = 183 // ERROR_ALREADY_EXISTS
 	}
 	st, _ := f.Stat()
 	sz := int64(0)
@@ -547,10 +632,14 @@ func (env *Win32Env) thunkGetFileSize(c *cpu.CPU) {
 		c.Ret()
 		return
 	}
-	if highPtr != 0 {
-		c.Write32(highPtr, uint32(uint64(of.Size)>>32))
+	size := of.Size
+	if st, err := of.File.Stat(); err == nil {
+		size = st.Size() // the guest may have written to it since it was opened
 	}
-	c.Regs[cpu.RegEAX] = uint32(of.Size)
+	if highPtr != 0 {
+		c.Write32(highPtr, uint32(uint64(size)>>32))
+	}
+	c.Regs[cpu.RegEAX] = uint32(size)
 	c.Ret()
 }
 
@@ -603,20 +692,28 @@ func (env *Win32Env) thunkSHGetFolderPathA(c *cpu.CPU) {
 	c.Ret()
 }
 
+// fopenFlags maps a C fopen mode ("r", "w+b", "ab", ...) to os.OpenFile flags.
+func fopenFlags(mode string) int {
+	plus := strings.Contains(mode, "+")
+	var flag int
+	switch {
+	case strings.HasPrefix(mode, "w"):
+		flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	case strings.HasPrefix(mode, "a"):
+		flag = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+	default:
+		flag = os.O_RDONLY
+	}
+	if plus {
+		flag = flag&^os.O_WRONLY | os.O_RDWR
+	}
+	return flag
+}
+
 func (env *Win32Env) thunkFopen(c *cpu.CPU) {
 	path := c.ReadCString(c.Arg(0))
 	mode := c.ReadCString(c.Arg(1))
-	forWrite := strings.ContainsAny(mode, "wa+")
-	hostPath := env.ResolvePath(path, forWrite)
-
-	var f *os.File
-	var err error
-	if forWrite {
-		_ = os.MkdirAll(filepath.Dir(hostPath), 0755)
-		f, err = os.OpenFile(hostPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-	} else {
-		f, err = os.Open(hostPath)
-	}
+	f, hostPath, err := env.openGuestFile(path, fopenFlags(mode))
 	if err != nil {
 		if env.TraceLog {
 			fmt.Printf("[stdio] fopen(%q, %q) -> NULL\n", path, mode)
@@ -772,7 +869,6 @@ func (env *Win32Env) thunkRegReadDword(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = val
 	c.Ret()
 }
-
 
 // thunkRegisterClassExA records the window procedure so synthetic input messages can be dispatched to it.
 func (env *Win32Env) thunkRegisterClassExA(c *cpu.CPU) {

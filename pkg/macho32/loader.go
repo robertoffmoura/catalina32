@@ -7,11 +7,11 @@ import (
 )
 
 const (
-	MhMagic32   = 0xFEEDFACE
-	LcSegment32 = 0x1
-	LcSymtab    = 0x2
+	MhMagic32    = 0xFEEDFACE
+	LcSegment32  = 0x1
+	LcSymtab     = 0x2
 	LcUnixThread = 0x5
-	LcDysymtab  = 0xB
+	LcDysymtab   = 0xB
 )
 
 type SegmentInfo struct {
@@ -36,25 +36,25 @@ type SectionInfo struct {
 }
 
 type SymbolInfo struct {
-	Name   string
-	Type   uint8
-	Sect   uint8
-	Desc   uint16
-	Value  uint32
+	Name  string
+	Type  uint8
+	Sect  uint8
+	Desc  uint16
+	Value uint32
 }
 
 type Image struct {
-	Raw          []byte
-	EntryEIP     uint32
-	Segments     []SegmentInfo
-	Sections     []SectionInfo
-	Symbols      []SymbolInfo
+	Raw           []byte
+	EntryEIP      uint32
+	Segments      []SegmentInfo
+	Sections      []SectionInfo
+	Symbols       []SymbolInfo
 	SymbolsByAddr map[uint32]string
-	StubsByAddr  map[uint32]string
-	LaPtrByAddr  map[uint32]string
-	NlPtrByAddr  map[uint32]string
-	FDEs         map[uint32]uint32
-	ModInitFuncs []uint32
+	StubsByAddr   map[uint32]string
+	LaPtrByAddr   map[uint32]string
+	NlPtrByAddr   map[uint32]string
+	FDEs          map[uint32]uint32
+	ModInitFuncs  []uint32
 }
 
 func readCString(b []byte, off int) string {
