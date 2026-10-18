@@ -52,6 +52,57 @@ func (c *CPU) fpuCompare(a, b float64) {
 	}
 }
 
+// FPU status word condition codes.
+const (
+	fpuC0 = 1 << 8
+	fpuC1 = 1 << 9
+	fpuC2 = 1 << 10
+	fpuC3 = 1 << 14
+)
+
+// fxam classifies v into C3/C2/C0 (zero, normal, infinity, NaN) with its sign in C1. Registers
+// hold float64 values, so nothing is empty, unsupported or denormal in extended precision.
+func (c *CPU) fxam(v float64) {
+	sw := c.FPUSW &^ (fpuC0 | fpuC1 | fpuC2 | fpuC3)
+	if math.Signbit(v) {
+		sw |= fpuC1
+	}
+	switch {
+	case math.IsNaN(v):
+		sw |= fpuC0
+	case math.IsInf(v, 0):
+		sw |= fpuC2 | fpuC0
+	case v == 0:
+		sw |= fpuC3
+	default:
+		sw |= fpuC2
+	}
+	c.FPUSW = sw
+}
+
+// fprem sets ST(0) to the remainder of ST(0)/ST(1) (FPREM: truncated quotient, FPREM1: rounded)
+// in one step (C2 clear: complete) and reports the low three quotient bits in C0, C3 and C1,
+// which trigonometric argument reduction uses to pick the octant.
+func (c *CPU) fprem(rem func(float64, float64) float64, quot func(float64) float64) {
+	a, b := c.FPUGet(0), c.FPUGet(1)
+	q := uint64(0)
+	if v := math.Abs(quot(a / b)); v < 1<<63 {
+		q = uint64(v)
+	}
+	sw := c.FPUSW &^ (fpuC0 | fpuC1 | fpuC2 | fpuC3)
+	if q&4 != 0 {
+		sw |= fpuC0
+	}
+	if q&2 != 0 {
+		sw |= fpuC3
+	}
+	if q&1 != 0 {
+		sw |= fpuC1
+	}
+	c.FPUSW = sw
+	c.FPUSet(0, rem(a, b))
+}
+
 func (c *CPU) fpuCompareEFlags(a, b float64) {
 	c.SetFlag(FlagOF|FlagSF|FlagAF, false)
 	if math.IsNaN(a) || math.IsNaN(b) {
@@ -137,7 +188,7 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 				case 4: // FTST
 					c.fpuCompare(c.FPUGet(0), 0.0)
 				case 5: // FXAM
-					c.fpuCompare(c.FPUGet(0), 0.0)
+					c.fxam(c.FPUGet(0))
 				}
 			case 5:
 				switch rm {
@@ -178,8 +229,7 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 					c.FPUSet(0, float64(exp-1))
 					c.FPUPush(frac * 2.0)
 				case 5: // FPREM1
-					c.FPUSet(0, math.Mod(c.FPUGet(0), c.FPUGet(1)))
-					c.FPUSW &^= (1 << 10)
+					c.fprem(math.Remainder, math.RoundToEven)
 				case 6: // FDECSTP
 					c.FPUTop = (c.FPUTop - 1) & 7
 				case 7: // FINCSTP
@@ -188,8 +238,7 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 			case 7:
 				switch rm {
 				case 0: // FPREM
-					c.FPUSet(0, math.Mod(c.FPUGet(0), c.FPUGet(1)))
-					c.FPUSW &^= (1 << 10)
+					c.fprem(math.Mod, math.Trunc)
 				case 1: // FYL2XP1
 					x := c.FPUPop()
 					y := c.FPUGet(0)
@@ -428,15 +477,19 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		case 0: // FILD m32int
 			c.FPUPush(float64(int32(c.Read32(addr))))
 		case 1: // FISTTP m32int (SSE3 truncate)
-			c.Write32(addr, uint32(int32(math.Trunc(c.FPUPop()))))
+			c.Write32(addr, uint32(ToInt32(math.Trunc(c.FPUPop()))))
 		case 2: // FIST m32int
-			c.Write32(addr, uint32(int32(c.fpuRound(c.FPUGet(0)))))
+			c.Write32(addr, uint32(ToInt32(c.fpuRound(c.FPUGet(0)))))
 		case 3: // FISTP m32int
-			c.Write32(addr, uint32(int32(c.fpuRound(c.FPUPop()))))
+			c.Write32(addr, uint32(ToInt32(c.fpuRound(c.FPUPop()))))
 		case 5: // FLD m80fp (approximate via 80-bit IEEE 754 extended precision)
-			c.FPUPush(readFloat80(c.Mem[addr : addr+10]))
+			if b := c.Bytes(addr, 10); b != nil {
+				c.FPUPush(readFloat80(b))
+			}
 		case 7: // FSTP m80fp
-			writeFloat80(c.Mem[addr:addr+10], c.FPUPop())
+			if b := c.WBytes(addr, 10); b != nil {
+				writeFloat80(b, c.FPUPop())
+			}
 		}
 	case 0xDC: // float64 memory
 		m := c.ReadF64(addr)
@@ -465,7 +518,7 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		case 0: // FLD m64fp
 			c.FPUPush(c.ReadF64(addr))
 		case 1: // FISTTP m64int
-			c.Write64(addr, uint64(int64(math.Trunc(c.FPUPop()))))
+			c.Write64(addr, uint64(ToInt64(math.Trunc(c.FPUPop()))))
 		case 2: // FST m64fp
 			c.WriteF64(addr, c.FPUGet(0))
 		case 3: // FSTP m64fp
@@ -503,15 +556,15 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		case 0: // FILD m16int
 			c.FPUPush(float64(int16(c.Read16(addr))))
 		case 1: // FISTTP m16int
-			c.Write16(addr, uint16(int16(math.Trunc(c.FPUPop()))))
+			c.Write16(addr, uint16(ToInt16(math.Trunc(c.FPUPop()))))
 		case 2: // FIST m16int
-			c.Write16(addr, uint16(int16(c.fpuRound(c.FPUGet(0)))))
+			c.Write16(addr, uint16(ToInt16(c.fpuRound(c.FPUGet(0)))))
 		case 3: // FISTP m16int
-			c.Write16(addr, uint16(int16(c.fpuRound(c.FPUPop()))))
+			c.Write16(addr, uint16(ToInt16(c.fpuRound(c.FPUPop()))))
 		case 5: // FILD m64int
 			c.FPUPush(float64(int64(c.Read64(addr))))
 		case 7: // FISTP m64int
-			c.Write64(addr, uint64(int64(c.fpuRound(c.FPUPop()))))
+			c.Write64(addr, uint64(ToInt64(c.fpuRound(c.FPUPop()))))
 		}
 	}
 }
@@ -622,8 +675,7 @@ func (c *CPU) readXMMOrMem128(modrm uint8, segOverride uint32, hasSeg bool) [16]
 	if (modrm >> 6) == 3 {
 		out = c.XMM[modrm&7]
 	} else {
-		addr := c.calcModRMAddr(modrm, segOverride, hasSeg)
-		copy(out[:], c.Mem[addr:addr+16])
+		out = c.Read128(c.calcModRMAddr(modrm, segOverride, hasSeg))
 	}
 	return out
 }
@@ -632,8 +684,7 @@ func (c *CPU) writeXMMOrMem128(modrm uint8, segOverride uint32, hasSeg bool, val
 	if (modrm >> 6) == 3 {
 		c.XMM[modrm&7] = val
 	} else {
-		addr := c.calcModRMAddr(modrm, segOverride, hasSeg)
-		copy(c.Mem[addr:addr+16], val[:])
+		c.Write128(c.calcModRMAddr(modrm, segOverride, hasSeg), val)
 	}
 }
 
@@ -724,7 +775,7 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 			copy(c.XMM[reg][0:8], c.XMM[modrm&7][8:16])
 		} else { // MOVLPS / MOVLPD
 			addr := c.calcModRMAddr(modrm, segOverride, hasSeg)
-			copy(c.XMM[reg][0:8], c.Mem[addr:addr+8])
+			binary.LittleEndian.PutUint64(c.XMM[reg][0:8], c.Read64(addr))
 		}
 		return true
 
@@ -732,7 +783,7 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 		modrm := c.Fetch8()
 		reg := int((modrm >> 3) & 7)
 		addr := c.calcModRMAddr(modrm, segOverride, hasSeg)
-		copy(c.Mem[addr:addr+8], c.XMM[reg][0:8])
+		c.Write64(addr, binary.LittleEndian.Uint64(c.XMM[reg][0:8]))
 		return true
 
 	case 0x14: // UNPCKLPS / UNPCKLPD
@@ -780,7 +831,7 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 			copy(c.XMM[reg][8:16], c.XMM[modrm&7][0:8])
 		} else { // MOVHPS / MOVHPD
 			addr := c.calcModRMAddr(modrm, segOverride, hasSeg)
-			copy(c.XMM[reg][8:16], c.Mem[addr:addr+8])
+			binary.LittleEndian.PutUint64(c.XMM[reg][8:16], c.Read64(addr))
 		}
 		return true
 
@@ -788,7 +839,7 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 		modrm := c.Fetch8()
 		reg := int((modrm >> 3) & 7)
 		addr := c.calcModRMAddr(modrm, segOverride, hasSeg)
-		copy(c.Mem[addr:addr+8], c.XMM[reg][8:16])
+		c.Write64(addr, binary.LittleEndian.Uint64(c.XMM[reg][8:16]))
 		return true
 
 	case 0x28: // MOVAPS / MOVAPD (load)
@@ -821,10 +872,10 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 		reg := int((modrm >> 3) & 7)
 		if repF2 {
 			v := c.readXMMOrMemF64(modrm, segOverride, hasSeg)
-			c.Regs[reg] = uint32(int32(math.Trunc(v)))
+			c.Regs[reg] = uint32(ToInt32(math.Trunc(v)))
 		} else {
 			v := c.readXMMOrMemF32(modrm, segOverride, hasSeg)
-			c.Regs[reg] = uint32(int32(math.Trunc(float64(v))))
+			c.Regs[reg] = uint32(ToInt32(math.Trunc(float64(v))))
 		}
 		return true
 
@@ -833,10 +884,10 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 		reg := int((modrm >> 3) & 7)
 		if repF2 {
 			v := c.readXMMOrMemF64(modrm, segOverride, hasSeg)
-			c.Regs[reg] = uint32(int32(math.RoundToEven(v)))
+			c.Regs[reg] = uint32(ToInt32(math.RoundToEven(v)))
 		} else {
 			v := c.readXMMOrMemF32(modrm, segOverride, hasSeg)
-			c.Regs[reg] = uint32(int32(math.RoundToEven(float64(v))))
+			c.Regs[reg] = uint32(ToInt32(math.RoundToEven(float64(v))))
 		}
 		return true
 
@@ -1071,12 +1122,12 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 		if repF3 { // CVTTPS2DQ
 			for i := 0; i < 4; i++ {
 				f := math.Float32frombits(binary.LittleEndian.Uint32(src[i*4 : i*4+4]))
-				c.setXMMU32(reg, i, uint32(int32(math.Trunc(float64(f)))))
+				c.setXMMU32(reg, i, uint32(ToInt32(math.Trunc(float64(f)))))
 			}
 		} else if opSize16 { // CVTPS2DQ
 			for i := 0; i < 4; i++ {
 				f := math.Float32frombits(binary.LittleEndian.Uint32(src[i*4 : i*4+4]))
-				c.setXMMU32(reg, i, uint32(int32(math.RoundToEven(float64(f)))))
+				c.setXMMU32(reg, i, uint32(ToInt32(math.RoundToEven(float64(f)))))
 			}
 		} else { // CVTDQ2PS
 			for i := 0; i < 4; i++ {
@@ -1594,14 +1645,14 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 			f0 := math.Float64frombits(binary.LittleEndian.Uint64(src[0:8]))
 			f1 := math.Float64frombits(binary.LittleEndian.Uint64(src[8:16]))
 			clear(c.XMM[reg][:])
-			c.setXMMU32(reg, 0, uint32(int32(math.Trunc(f0))))
-			c.setXMMU32(reg, 1, uint32(int32(math.Trunc(f1))))
+			c.setXMMU32(reg, 0, uint32(ToInt32(math.Trunc(f0))))
+			c.setXMMU32(reg, 1, uint32(ToInt32(math.Trunc(f1))))
 		} else if opSize16 { // CVTPD2DQ
 			f0 := math.Float64frombits(binary.LittleEndian.Uint64(src[0:8]))
 			f1 := math.Float64frombits(binary.LittleEndian.Uint64(src[8:16]))
 			clear(c.XMM[reg][:])
-			c.setXMMU32(reg, 0, uint32(int32(math.RoundToEven(f0))))
-			c.setXMMU32(reg, 1, uint32(int32(math.RoundToEven(f1))))
+			c.setXMMU32(reg, 0, uint32(ToInt32(math.RoundToEven(f0))))
+			c.setXMMU32(reg, 1, uint32(ToInt32(math.RoundToEven(f1))))
 		}
 		return true
 	}
@@ -1644,4 +1695,3 @@ func (c *CPU) DumpState() string {
 		c.EIP, c.Regs[0], c.Regs[1], c.Regs[2], c.Regs[3], c.Regs[4], c.Regs[5], c.Regs[6], c.Regs[7], c.Flags, c.Steps,
 	)
 }
-

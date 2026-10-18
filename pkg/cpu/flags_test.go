@@ -88,3 +88,58 @@ func TestFlagHelpersMatchReference(t *testing.T) {
 		check("logic8")
 	}
 }
+
+// ADC/SBB against the per-flag reference (the carry in changes CF only).
+func TestCarryOpsMatchReference(t *testing.T) {
+	r := rand.New(rand.NewSource(2))
+	edge := []uint32{0, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff, 0x7fffffff, 0x80000000, 0xffffffff}
+	pick := func() uint32 {
+		if r.Intn(3) == 0 {
+			return edge[r.Intn(len(edge))]
+		}
+		return r.Uint32()
+	}
+	for i := 0; i < 200000; i++ {
+		a, b, cin := pick(), pick(), uint64(r.Intn(2))
+		for _, w := range []struct {
+			bits uint
+			sign uint32
+		}{{8, 0x80}, {16, 0x8000}, {32, 0x80000000}} {
+			mask := uint64(1)<<w.bits - 1
+			A, B := uint64(a)&mask, uint64(b)&mask
+			for _, sbb := range []bool{false, true} {
+				got, want := NewCPUForFlags(), NewCPUForFlags()
+				got.SetFlag(FlagCF, cin == 1)
+				var res uint32
+				switch w.bits {
+				case 8:
+					v, _ := got.aluOp8(map[bool]int{false: 2, true: 3}[sbb], uint8(A), uint8(B))
+					res = uint32(v)
+				case 16:
+					v, _ := got.aluOp16(map[bool]int{false: 2, true: 3}[sbb], uint16(A), uint16(B))
+					res = uint32(v)
+				default:
+					v, _ := got.aluOp32(map[bool]int{false: 2, true: 3}[sbb], uint32(A), uint32(B))
+					res = v
+				}
+				var wantRes uint64
+				var carry bool
+				if sbb {
+					wantRes = (A - B - cin) & mask
+					carry = A < B+cin
+				} else {
+					wantRes = (A + B + cin) & mask
+					carry = A+B+cin > mask
+				}
+				refAddSub(want, uint32(A), uint32(B), uint32(wantRes), w.sign, sbb)
+				want.SetFlag(FlagCF, carry)
+				if uint64(res) != wantRes || got.Flags != want.Flags {
+					t.Fatalf("%d-bit sbb=%v %#x,%#x cf=%d: res %#x flags %#x, want %#x %#x", w.bits, sbb, A, B, cin, res, got.Flags, wantRes, want.Flags)
+				}
+			}
+		}
+	}
+}
+
+// NewCPUForFlags is a CPU with no guest memory, enough for flag computations.
+func NewCPUForFlags() *CPU { return &CPU{} }

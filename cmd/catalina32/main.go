@@ -7,6 +7,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"catalina32/pkg/cpu"
@@ -93,7 +94,12 @@ func main() {
 
 	// 2. Call the entry point: WinMain(hInstance=0x00001000, hPrevInstance=0, lpCmdLine=w32.CmdLineAddr, nCmdShow=1)
 	fmt.Printf("[catalina32] Launching %s(0x00001000, 0, 0x%08x, 1) @ 0x%08x...\n", prof.EntryPoint, w32.CmdLineAddr, entry)
+	// Headless runs stop after a fixed budget (C32_MAX_STEPS overrides it; 0 = no limit); a live
+	// session runs until the game quits.
 	vm.MaxSteps = 1_100_000_000
+	if os.Getenv("C32_LIVE") == "1" {
+		vm.MaxSteps = 0
+	}
 	vm.TraceCalls = os.Getenv("C32_TRACE_CALLS") == "1"
 	if v := os.Getenv("C32_GUEST_PROF"); v != "" { // value = first step to sample from
 		from, _ := strconv.ParseUint(v, 10, 64)
@@ -130,15 +136,20 @@ func main() {
 			vm.MaxSteps = n
 		}
 	}
-	if os.Getenv("C32_WATCH_KEYS") != "" {
-		seen := map[uint32]bool{}
-		vm.WatchLo, vm.WatchHi = 0x02C317E8, 0x02C319EA
-		vm.WatchFn = func(c *cpu.CPU, addr uint32, size int, write bool) {
-			if seen[c.EIP] {
-				return
-			}
-			seen[c.EIP] = true
-			fmt.Printf("[WATCH] write=%v size=%d addr=0x%08x EIP=0x%08x steps=%d\n", write, size, addr, c.EIP, c.Steps)
+	// C32_WATCH=lo-hi (guest addresses, e.g. 0x2c317e8-0x2c319ea) logs the first access to that range from each EIP.
+	if w := os.Getenv("C32_WATCH"); w != "" {
+		l, h, _ := strings.Cut(w, "-")
+		lo, err1 := strconv.ParseUint(l, 0, 32)
+		hi, err2 := strconv.ParseUint(h, 0, 32)
+		if err1 == nil && err2 == nil {
+			seen := map[uint32]bool{}
+			vm.SetWatch(uint32(lo), uint32(hi), func(c *cpu.CPU, addr uint32, size int, write bool) {
+				if seen[c.EIP] {
+					return
+				}
+				seen[c.EIP] = true
+				fmt.Printf("[WATCH] write=%v size=%d addr=0x%08x EIP=0x%08x steps=%d\n", write, size, addr, c.EIP, c.Steps)
+			})
 		}
 	}
 	vm.NestDepth = -1 // WinMain is the top-level thread; keep depth 0 inside it so the scheduler may preempt

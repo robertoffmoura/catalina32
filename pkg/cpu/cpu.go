@@ -1,9 +1,11 @@
 package cpu
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
 )
 
 const (
@@ -74,9 +76,11 @@ type CPU struct {
 	MXCSR uint32
 
 	// Heap allocator state
-	HeapPtr    uint32
-	AllocSize  map[uint32]uint32
-	FreeBlocks map[uint32][]uint32 // size class -> free list
+	HeapPtr     uint32
+	AllocSize   map[uint32]uint32
+	FreeBlocks  map[uint32][]uint32 // size class -> free list
+	freeExtents []extent            // free blocks above smallBlock, by address
+	heapInUse   uint64
 
 	// Intercept table (stubs, MacDoze, IndirectX, COM vtables, Lifted functions)
 	Intercepts map[uint32]ThunkFunc
@@ -103,7 +107,9 @@ type CPU struct {
 	CodeLo, CodeHi   uint32
 	CodeCacheFlushes uint64
 	dcacheUsed       bool // something was decoded; only then do intercept changes need a flush
-	// Stores with addr-CodeHi <= writeSpan are in bounds and above guest code (the inlined fast path).
+	// The inlined fast paths: loads with addr < readLimit and stores with addr-CodeHi < writeSpan
+	// are in bounds, above guest code (stores) and not watched. SetWatch zeroes both.
+	readLimit uint32
 	writeSpan uint32
 
 	// Guest sampling profiler (enabled when ProfEvery > 0; needs TraceCalls for function attribution).
@@ -114,6 +120,7 @@ type CPU struct {
 	ProfSamples uint64
 	ProfSelf    map[uint32]uint64
 	ProfIncl    map[uint32]uint64
+	profSeen    map[uint32]bool
 
 	// Green-thread scheduling support. NestDepth counts host-initiated nested guest calls
 	// (CallGuest/CallGuestNested); thread switches are only legal at depth 0.
@@ -122,9 +129,16 @@ type CPU struct {
 	PreemptInterval uint64
 	nextPreempt     uint64
 
-	// Debug: optional read watchpoint over [WatchLo, WatchHi).
-	WatchLo, WatchHi uint32
-	WatchFn          func(c *CPU, addr uint32, size int, write bool)
+	// Debug: optional watchpoint over [watchLo, watchHi) (SetWatch).
+	watchLo, watchHi uint32
+	watchFn          func(c *CPU, addr uint32, size int, write bool)
+}
+
+// SetWatch calls fn for every guest load and store that touches [lo, hi). Accesses then all take
+// the slow path, so this is for debugging only.
+func (c *CPU) SetWatch(lo, hi uint32, fn func(c *CPU, addr uint32, size int, write bool)) {
+	c.watchLo, c.watchHi, c.watchFn = lo, hi, fn
+	c.readLimit, c.writeSpan = 0, 0
 }
 
 func (c *CPU) SetPreemptInterval(interval uint64) {
@@ -146,7 +160,8 @@ func NewCPU() *CPU {
 		UnmappedCalls: make(map[uint32]uint64),
 		VisitedFuncs:  make(map[uint32]uint64),
 		icept:         make([]uint64, ArenaSize/64),
-		writeSpan:     ArenaSize - 8,
+		readLimit:     ArenaSize - 8,
+		writeSpan:     ArenaSize - 7,
 		FSBase:        0x03004000,
 		GSBase:        0x03008000,
 	}
@@ -199,57 +214,91 @@ func (c *CPU) checkAddr(addr uint32, sz uint32) bool {
 	return true
 }
 
-// Each accessor has an inlinable fast path for in-bounds accesses with no watchpoint armed;
-// everything else goes through the *Slow variant, which halts on OOB and reports to WatchFn.
+// Each accessor has an inlinable fast path (one compare) for in-bounds accesses with no watchpoint
+// armed; everything else goes through access, which halts on OOB and reports to the watchpoint.
 
-func (c *CPU) Read8(addr uint32) uint8 {
-	if addr < ArenaSize && c.WatchFn == nil {
-		return c.Mem[addr]
+// access checks a slow-path access and reports it to the watchpoint; false means out of range.
+func (c *CPU) access(addr, size uint32, write bool) bool {
+	if !c.checkAddr(addr, size) {
+		return false
 	}
-	return c.read8Slow(addr)
+	if write {
+		c.noteCodeWrite(addr, size)
+	}
+	if c.watchFn != nil && addr+size > c.watchLo && addr < c.watchHi {
+		c.watchFn(c, addr, int(size), write)
+	}
+	return true
 }
 
-func (c *CPU) read8Slow(addr uint32) uint8 {
-	if !c.checkAddr(addr, 1) {
-		return 0
+func (c *CPU) Read8(addr uint32) uint8 {
+	if addr < c.readLimit {
+		return c.Mem[addr]
 	}
-	if c.WatchFn != nil && addr >= c.WatchLo && addr < c.WatchHi {
-		c.WatchFn(c, addr, 1, false)
+	if !c.access(addr, 1, false) {
+		return 0
 	}
 	return c.Mem[addr]
 }
 
 func (c *CPU) Read16(addr uint32) uint16 {
-	if addr <= ArenaSize-2 {
+	if addr < c.readLimit {
 		return binary.LittleEndian.Uint16(c.Mem[addr : addr+2])
 	}
-	c.checkAddr(addr, 2)
-	return 0
+	return c.read16Slow(addr)
+}
+
+func (c *CPU) read16Slow(addr uint32) uint16 {
+	if !c.access(addr, 2, false) {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(c.Mem[addr : addr+2])
 }
 
 func (c *CPU) Read32(addr uint32) uint32 {
-	if addr <= ArenaSize-4 && c.WatchFn == nil {
+	if addr < c.readLimit {
 		return binary.LittleEndian.Uint32(c.Mem[addr : addr+4])
 	}
 	return c.read32Slow(addr)
 }
 
 func (c *CPU) read32Slow(addr uint32) uint32 {
-	if !c.checkAddr(addr, 4) {
+	if !c.access(addr, 4, false) {
 		return 0
-	}
-	if c.WatchFn != nil && addr+4 > c.WatchLo && addr < c.WatchHi {
-		c.WatchFn(c, addr, 4, false)
 	}
 	return binary.LittleEndian.Uint32(c.Mem[addr : addr+4])
 }
 
 func (c *CPU) Read64(addr uint32) uint64 {
-	if addr <= ArenaSize-8 {
+	if addr < c.readLimit {
 		return binary.LittleEndian.Uint64(c.Mem[addr : addr+8])
 	}
-	c.checkAddr(addr, 8)
-	return 0
+	return c.read64Slow(addr)
+}
+
+func (c *CPU) read64Slow(addr uint32) uint64 {
+	if !c.access(addr, 8, false) {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(c.Mem[addr : addr+8])
+}
+
+// Read128 and Write128 move 16 bytes (SSE loads and stores).
+func (c *CPU) Read128(addr uint32) (v [16]byte) {
+	if uint64(addr)+16 <= uint64(c.readLimit) {
+		copy(v[:], c.Mem[addr:addr+16])
+	} else if c.access(addr, 16, false) {
+		copy(v[:], c.Mem[addr:addr+16])
+	}
+	return v
+}
+
+func (c *CPU) Write128(addr uint32, v [16]byte) {
+	if addr-c.CodeHi < c.writeSpan && addr <= ArenaSize-16 {
+		copy(c.Mem[addr:addr+16], v[:])
+	} else if c.access(addr, 16, true) {
+		copy(c.Mem[addr:addr+16], v[:])
+	}
 }
 
 func (c *CPU) ReadF32(addr uint32) float32 {
@@ -261,7 +310,7 @@ func (c *CPU) ReadF64(addr uint32) float64 {
 }
 
 func (c *CPU) Write8(addr uint32, val uint8) {
-	if addr-c.CodeHi <= c.writeSpan && c.WatchFn == nil {
+	if addr-c.CodeHi < c.writeSpan {
 		c.Mem[addr] = val
 		return
 	}
@@ -269,18 +318,13 @@ func (c *CPU) Write8(addr uint32, val uint8) {
 }
 
 func (c *CPU) write8Slow(addr uint32, val uint8) {
-	if !c.checkAddr(addr, 1) {
-		return
+	if c.access(addr, 1, true) {
+		c.Mem[addr] = val
 	}
-	c.noteCodeWrite(addr, 1)
-	if c.WatchFn != nil && addr >= c.WatchLo && addr < c.WatchHi {
-		c.WatchFn(c, addr, 1, true)
-	}
-	c.Mem[addr] = val
 }
 
 func (c *CPU) Write16(addr uint32, val uint16) {
-	if addr-c.CodeHi <= c.writeSpan {
+	if addr-c.CodeHi < c.writeSpan {
 		binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
 		return
 	}
@@ -288,15 +332,13 @@ func (c *CPU) Write16(addr uint32, val uint16) {
 }
 
 func (c *CPU) write16Slow(addr uint32, val uint16) {
-	if !c.checkAddr(addr, 2) {
-		return
+	if c.access(addr, 2, true) {
+		binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
 	}
-	c.noteCodeWrite(addr, 2)
-	binary.LittleEndian.PutUint16(c.Mem[addr:addr+2], val)
 }
 
 func (c *CPU) Write32(addr uint32, val uint32) {
-	if addr-c.CodeHi <= c.writeSpan {
+	if addr-c.CodeHi < c.writeSpan {
 		binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
 		return
 	}
@@ -304,15 +346,13 @@ func (c *CPU) Write32(addr uint32, val uint32) {
 }
 
 func (c *CPU) write32Slow(addr uint32, val uint32) {
-	if !c.checkAddr(addr, 4) {
-		return
+	if c.access(addr, 4, true) {
+		binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
 	}
-	c.noteCodeWrite(addr, 4)
-	binary.LittleEndian.PutUint32(c.Mem[addr:addr+4], val)
 }
 
 func (c *CPU) Write64(addr uint32, val uint64) {
-	if addr-c.CodeHi <= c.writeSpan {
+	if addr-c.CodeHi < c.writeSpan {
 		binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
 		return
 	}
@@ -320,11 +360,9 @@ func (c *CPU) Write64(addr uint32, val uint64) {
 }
 
 func (c *CPU) write64Slow(addr uint32, val uint64) {
-	if !c.checkAddr(addr, 8) {
-		return
+	if c.access(addr, 8, true) {
+		binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
 	}
-	c.noteCodeWrite(addr, 8)
-	binary.LittleEndian.PutUint64(c.Mem[addr:addr+8], val)
 }
 
 // noteCodeWrite flushes the decoded-instruction cache when a guest store touches cached code.
@@ -342,20 +380,51 @@ func (c *CPU) WriteF64(addr uint32, val float64) {
 	c.Write64(addr, math.Float64bits(val))
 }
 
+// Host shims access guest memory in bulk through Bytes, WBytes and CBytes rather than slicing
+// c.Mem: an out-of-range range halts the guest (instead of a Go panic), and writes that touch
+// guest code flush the decoded-instruction cache.
+
+// Bytes returns guest memory [addr, addr+n) for reading, or nil (halting the guest) when the
+// range does not fit.
+func (c *CPU) Bytes(addr, n uint32) []byte {
+	if uint64(addr)+uint64(n) > ArenaSize {
+		c.checkAddr(addr, n)
+		return nil
+	}
+	return c.Mem[addr : addr+n : addr+n]
+}
+
+// WBytes is Bytes for a range the caller is about to write.
+func (c *CPU) WBytes(addr, n uint32) []byte {
+	b := c.Bytes(addr, n)
+	if b != nil {
+		c.noteCodeWrite(addr, n)
+	}
+	return b
+}
+
+// CBytes returns the NUL-terminated string at addr without the terminator (nil for a null or
+// out-of-range pointer). The slice aliases guest memory.
+func (c *CPU) CBytes(addr uint32) []byte {
+	if addr == 0 || addr >= ArenaSize {
+		return nil
+	}
+	m := c.Mem[addr:ArenaSize]
+	if n := bytes.IndexByte(m, 0); n >= 0 {
+		return m[:n:n]
+	}
+	return m
+}
+
 func (c *CPU) ReadCString(addr uint32) string {
-	if addr == 0 || int(addr) >= len(c.Mem) {
-		return ""
-	}
-	end := int(addr)
-	for end < len(c.Mem) && c.Mem[end] != 0 {
-		end++
-	}
-	return string(c.Mem[addr:end])
+	return string(c.CBytes(addr))
 }
 
 func (c *CPU) WriteCString(addr uint32, s string) {
-	copy(c.Mem[addr:], s)
-	c.Mem[int(addr)+len(s)] = 0
+	if b := c.WBytes(addr, uint32(len(s))+1); b != nil {
+		copy(b, s)
+		b[len(s)] = 0
+	}
 }
 
 // 8-bit & 16-bit register accessors
@@ -421,15 +490,13 @@ func (c *CPU) sampleProfile() {
 		return
 	}
 	c.ProfSelf[c.CallStack[len(c.CallStack)-1].TargetEIP]++
-	for i, f := range c.CallStack {
-		dup := false
-		for _, g := range c.CallStack[i+1:] {
-			if g.TargetEIP == f.TargetEIP {
-				dup = true
-				break
-			}
-		}
-		if !dup {
+	if c.profSeen == nil {
+		c.profSeen = map[uint32]bool{}
+	}
+	clear(c.profSeen)
+	for _, f := range c.CallStack { // each function once per sample, however deep the recursion
+		if !c.profSeen[f.TargetEIP] {
+			c.profSeen[f.TargetEIP] = true
 			c.ProfIncl[f.TargetEIP]++
 		}
 	}
@@ -450,34 +517,106 @@ func (c *CPU) RetN(popBytes uint32) {
 	}
 }
 
-// Guest Heap Allocator
+// Guest heap allocator. Blocks are 16-byte aligned. Freed blocks up to 64 KB go to exact-size
+// free lists; larger ones go to an address-ordered list of free extents (coalesced with their
+// neighbours), which large requests search first-fit before the bump pointer, and every request
+// falls back to when the bump region is used up.
+
+// smallBlock is the largest block size kept on the exact-size free lists.
+const smallBlock = 65536
+
+type extent struct{ addr, size uint32 }
+
+// HeapInUse returns the bytes currently allocated.
+func (c *CPU) HeapInUse() uint64 { return c.heapInUse }
+
+// HeapPeak returns the bump pointer's distance from the heap start (the high-water mark).
+func (c *CPU) HeapPeak() uint32 { return c.HeapPtr - HeapStartAddr }
+
 func (c *CPU) Malloc(size uint32) uint32 {
 	if size == 0 {
 		size = 16
 	}
+	if size > HeapEndAddr {
+		return c.heapExhausted(size)
+	}
 	aligned := (size + 15) & ^uint32(15)
+	ptr := uint32(0)
 	if list := c.FreeBlocks[aligned]; len(list) > 0 {
-		ptr := list[len(list)-1]
+		ptr = list[len(list)-1]
 		c.FreeBlocks[aligned] = list[:len(list)-1]
-		c.AllocSize[ptr] = aligned
-		return ptr
+	} else if aligned > smallBlock {
+		ptr = c.takeExtent(aligned)
 	}
-	if c.HeapPtr < ReservedHi && c.HeapPtr+aligned > ReservedLo {
-		c.HeapPtr = ReservedHi // skip the host-reserved region
+	if ptr == 0 {
+		if c.HeapPtr < ReservedHi && c.HeapPtr+aligned > ReservedLo {
+			c.HeapPtr = ReservedHi // skip the host-reserved region
+		}
+		if c.HeapPtr+aligned <= HeapEndAddr {
+			ptr = c.HeapPtr
+			c.HeapPtr += aligned
+		} else if ptr = c.takeExtent(aligned); ptr == 0 {
+			return c.heapExhausted(size)
+		}
 	}
-	if c.HeapPtr+aligned > HeapEndAddr {
-		panic(fmt.Sprintf("guest heap exhausted (HeapPtr=0x%08x, req=%d)", c.HeapPtr, aligned))
-	}
-	ptr := c.HeapPtr
-	c.HeapPtr += aligned
 	c.AllocSize[ptr] = aligned
+	c.heapInUse += uint64(aligned)
 	return ptr
 }
 
+// heapExhausted stops the guest (the alternative is handing out memory that is in use) and
+// returns NULL.
+func (c *CPU) heapExhausted(size uint32) uint32 {
+	c.Halted = true
+	c.HaltReason = fmt.Sprintf("guest heap exhausted (request %d bytes, %d MB in use) at EIP=0x%08x",
+		size, c.heapInUse>>20, c.EIP)
+	return 0
+}
+
+// takeExtent carves size bytes from the first free extent large enough, or returns 0.
+func (c *CPU) takeExtent(size uint32) uint32 {
+	for i, e := range c.freeExtents {
+		if e.size >= size {
+			if e.size == size {
+				c.freeExtents = append(c.freeExtents[:i], c.freeExtents[i+1:]...)
+			} else {
+				c.freeExtents[i] = extent{e.addr + size, e.size - size}
+			}
+			return e.addr
+		}
+	}
+	return 0
+}
+
+// putExtent returns a block to the extent list, merging it with adjacent free extents.
+func (c *CPU) putExtent(addr, size uint32) {
+	l := c.freeExtents
+	i := sort.Search(len(l), func(i int) bool { return l[i].addr > addr })
+	if i > 0 && l[i-1].addr+l[i-1].size == addr {
+		l[i-1].size += size
+		if i < len(l) && addr+size == l[i].addr {
+			l[i-1].size += l[i].size
+			l = append(l[:i], l[i+1:]...)
+		}
+	} else if i < len(l) && addr+size == l[i].addr {
+		l[i] = extent{addr, size + l[i].size}
+	} else {
+		l = append(l, extent{})
+		copy(l[i+1:], l[i:])
+		l[i] = extent{addr, size}
+	}
+	c.freeExtents = l
+}
+
 func (c *CPU) Calloc(num, size uint32) uint32 {
-	total := num * size
-	ptr := c.Malloc(total)
-	clear(c.Mem[ptr : ptr+total])
+	total := uint64(num) * uint64(size)
+	if total > HeapEndAddr {
+		return c.heapExhausted(uint32(min(total, 1<<32-1)))
+	}
+	ptr := c.Malloc(uint32(total))
+	if ptr != 0 {
+		clear(c.Mem[ptr : ptr+uint32(total)])
+	}
 	return ptr
 }
 
@@ -487,8 +626,11 @@ func (c *CPU) Free(ptr uint32) {
 	}
 	if sz, ok := c.AllocSize[ptr]; ok {
 		delete(c.AllocSize, ptr)
-		if sz <= 65536 {
+		c.heapInUse -= uint64(sz)
+		if sz <= smallBlock {
 			c.FreeBlocks[sz] = append(c.FreeBlocks[sz], ptr)
+		} else {
+			c.putExtent(ptr, sz)
 		}
 	}
 }
@@ -506,6 +648,9 @@ func (c *CPU) Realloc(ptr, newSize uint32) uint32 {
 		return ptr
 	}
 	newPtr := c.Malloc(newSize)
+	if newPtr == 0 {
+		return 0
+	}
 	if oldSize > 0 {
 		copy(c.Mem[newPtr:newPtr+oldSize], c.Mem[ptr:ptr+oldSize])
 	}

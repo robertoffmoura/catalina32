@@ -205,7 +205,9 @@ func (c *CPU) buildBlock(b *dBlock, eip uint32) {
 // SetCodeRange enables the decoded-instruction cache for guest code in [lo, hi).
 func (c *CPU) SetCodeRange(lo, hi uint32) {
 	c.CodeLo, c.CodeHi = lo, hi
-	c.writeSpan = ArenaSize - 8 - hi
+	if c.watchFn == nil {
+		c.writeSpan = ArenaSize - 7 - hi
+	}
 	if c.dcache == nil {
 		c.dcache = newDCache()
 		c.blocks = make([]dBlock, 1<<blockBits)
@@ -730,15 +732,14 @@ func (c *CPU) execBlock(insts []dInst) {
 			c.setXMMF32(int(d.reg), 0, r)
 		case dMovapsLoad:
 			if d.isMem {
-				addr := c.ea(d)
-				copy(c.XMM[d.reg][:], c.Mem[addr:addr+16])
+				c.XMM[d.reg] = c.Read128(c.ea(d))
 			} else {
 				c.XMM[d.reg] = c.XMM[d.rm]
 			}
 		case dMovapsStore:
 			if d.isMem {
 				addr := c.ea(d)
-				c.storeCode128(addr, c.XMM[d.reg])
+				c.Write128(addr, c.XMM[d.reg])
 			} else {
 				c.XMM[d.rm] = c.XMM[d.reg]
 			}
@@ -882,8 +883,7 @@ func (c *CPU) execBlock(insts []dInst) {
 		case dXorps:
 			var src [16]byte
 			if d.isMem {
-				addr := c.ea(d)
-				copy(src[:], c.Mem[addr:addr+16])
+				src = c.Read128(c.ea(d))
 			} else {
 				src = c.XMM[d.rm]
 			}
@@ -909,12 +909,4 @@ func (c *CPU) rm8(d *dInst) uint8 {
 		return c.Read8(c.ea(d))
 	}
 	return c.GetReg8(int(d.rm))
-}
-
-// storeCode128 writes 16 bytes like writeXMMOrMem128, flushing the cache if it lands in guest code.
-func (c *CPU) storeCode128(addr uint32, v [16]byte) {
-	copy(c.Mem[addr:addr+16], v[:])
-	if addr < c.CodeHi && addr+16 > c.CodeLo {
-		c.FlushCodeCache()
-	}
 }

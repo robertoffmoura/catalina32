@@ -3,8 +3,13 @@ package cpu
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/bits"
 )
+
+// maxInstLen is the longest x86 instruction; stepFull refuses to decode closer than this to the
+// end of guest memory, so the Fetch helpers never index past it.
+const maxInstLen = 15
 
 func (c *CPU) Fetch8() uint8 {
 	v := c.Mem[c.EIP]
@@ -156,12 +161,8 @@ func (c *CPU) aluOp8(op int, a, b uint8) (uint8, bool) {
 			cf = 1
 		}
 		res := a + b + cf
-		c.SetFlag(FlagCF, uint16(a)+uint16(b)+uint16(cf) > 0xFF)
-		c.SetFlag(FlagZF, res == 0)
-		c.SetFlag(FlagSF, (res&0x80) != 0)
-		c.SetFlag(FlagPF, parity8(res))
-		c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-		c.SetFlag(FlagOF, ((^(a ^ b) & (a ^ res)) & 0x80) != 0)
+		c.UpdateFlagsAdd8(a, b, res)
+		c.Flags = c.Flags&^FlagCF | flagIf(uint16(a)+uint16(b)+uint16(cf) > 0xFF, FlagCF) // the carry includes CF in
 		return res, true
 	case 3: // SBB
 		cf := uint8(0)
@@ -169,12 +170,8 @@ func (c *CPU) aluOp8(op int, a, b uint8) (uint8, bool) {
 			cf = 1
 		}
 		res := a - b - cf
-		c.SetFlag(FlagCF, uint16(a) < uint16(b)+uint16(cf))
-		c.SetFlag(FlagZF, res == 0)
-		c.SetFlag(FlagSF, (res&0x80) != 0)
-		c.SetFlag(FlagPF, parity8(res))
-		c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-		c.SetFlag(FlagOF, (((a ^ b) & (a ^ res)) & 0x80) != 0)
+		c.UpdateFlagsSub8(a, b, res)
+		c.Flags = c.Flags&^FlagCF | flagIf(uint16(a) < uint16(b)+uint16(cf), FlagCF) // the carry includes CF in
 		return res, true
 	case 4: // AND
 		res := a & b
@@ -213,12 +210,8 @@ func (c *CPU) aluOp16(op int, a, b uint16) (uint16, bool) {
 		}
 		full := uint32(a) + uint32(b) + cf
 		res := uint16(full)
-		c.SetFlag(FlagCF, full > 0xFFFF)
-		c.SetFlag(FlagZF, res == 0)
-		c.SetFlag(FlagSF, (res&0x8000) != 0)
-		c.SetFlag(FlagPF, parity8(uint8(res)))
-		c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-		c.SetFlag(FlagOF, ((^(a ^ b) & (a ^ res)) & 0x8000) != 0)
+		c.UpdateFlagsAdd16(a, b, res)
+		c.Flags = c.Flags&^FlagCF | flagIf(full > 0xFFFF, FlagCF) // the carry includes CF in
 		return res, true
 	case 3: // SBB
 		cf := uint32(0)
@@ -226,12 +219,8 @@ func (c *CPU) aluOp16(op int, a, b uint16) (uint16, bool) {
 			cf = 1
 		}
 		res := uint16(uint32(a) - uint32(b) - cf)
-		c.SetFlag(FlagCF, uint32(a) < uint32(b)+cf)
-		c.SetFlag(FlagZF, res == 0)
-		c.SetFlag(FlagSF, (res&0x8000) != 0)
-		c.SetFlag(FlagPF, parity8(uint8(res)))
-		c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-		c.SetFlag(FlagOF, (((a ^ b) & (a ^ res)) & 0x8000) != 0)
+		c.UpdateFlagsSub16(a, b, res)
+		c.Flags = c.Flags&^FlagCF | flagIf(uint32(a) < uint32(b)+cf, FlagCF) // the carry includes CF in
 		return res, true
 	case 4: // AND
 		res := a & b
@@ -270,12 +259,8 @@ func (c *CPU) aluOp32(op int, a, b uint32) (uint32, bool) {
 		}
 		full := uint64(a) + uint64(b) + cf
 		res := uint32(full)
-		c.SetFlag(FlagCF, full > 0xFFFFFFFF)
-		c.SetFlag(FlagZF, res == 0)
-		c.SetFlag(FlagSF, (res&0x80000000) != 0)
-		c.SetFlag(FlagPF, parity8(uint8(res)))
-		c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-		c.SetFlag(FlagOF, ((^(a ^ b) & (a ^ res)) & 0x80000000) != 0)
+		c.UpdateFlagsAdd32(a, b, res)
+		c.Flags = c.Flags&^FlagCF | flagIf(full > 0xFFFFFFFF, FlagCF) // the carry includes CF in
 		return res, true
 	case 3: // SBB
 		cf := uint64(0)
@@ -283,12 +268,8 @@ func (c *CPU) aluOp32(op int, a, b uint32) (uint32, bool) {
 			cf = 1
 		}
 		res := uint32(uint64(a) - uint64(b) - cf)
-		c.SetFlag(FlagCF, uint64(a) < uint64(b)+cf)
-		c.SetFlag(FlagZF, res == 0)
-		c.SetFlag(FlagSF, (res&0x80000000) != 0)
-		c.SetFlag(FlagPF, parity8(uint8(res)))
-		c.SetFlag(FlagAF, ((a^b^res)&0x10) != 0)
-		c.SetFlag(FlagOF, (((a ^ b) & (a ^ res)) & 0x80000000) != 0)
+		c.UpdateFlagsSub32(a, b, res)
+		c.Flags = c.Flags&^FlagCF | flagIf(uint64(a) < uint64(b)+cf, FlagCF) // the carry includes CF in
 		return res, true
 	case 4: // AND
 		res := a & b
@@ -399,6 +380,30 @@ func (c *CPU) shiftOp16(op int, val uint16, count uint8) uint16 {
 	case 1: // ROR
 		res := bits.RotateLeft16(val, -int(cnt))
 		c.SetFlag(FlagCF, (res&0x8000) != 0)
+		return res
+	case 2: // RCL (17-bit rotate through CF)
+		res := val
+		for i := uint8(0); i < cnt; i++ {
+			cf := uint16(0)
+			if c.GetFlag(FlagCF) {
+				cf = 1
+			}
+			newCF := (res & 0x8000) != 0
+			res = (res << 1) | cf
+			c.SetFlag(FlagCF, newCF)
+		}
+		return res
+	case 3: // RCR
+		res := val
+		for i := uint8(0); i < cnt; i++ {
+			cf := uint16(0)
+			if c.GetFlag(FlagCF) {
+				cf = 0x8000
+			}
+			newCF := (res & 1) != 0
+			res = (res >> 1) | cf
+			c.SetFlag(FlagCF, newCF)
+		}
 		return res
 	case 4, 6: // SHL / SAL
 		var cf bool
@@ -557,6 +562,11 @@ func (c *CPU) StepRaw() {
 
 func (c *CPU) stepFull() {
 	startEIP := c.EIP
+	if startEIP > ArenaSize-maxInstLen {
+		c.Halted = true
+		c.HaltReason = fmt.Sprintf("instruction fetch outside guest memory at EIP=0x%08x", startEIP)
+		return
+	}
 	c.Steps++
 
 	opSize16 := false
@@ -1599,13 +1609,21 @@ func (c *CPU) stepFull() {
 			c.SetFlag(FlagCF|FlagOF, prod != int16(int8(prod)))
 		case 6: // DIV r/m8
 			ax := c.GetReg16(RegEAX)
+			if val == 0 || ax/uint16(val) > 0xFF {
+				c.divideError(startEIP)
+				return
+			}
 			q := ax / uint16(val)
 			r := ax % uint16(val)
 			c.SetReg8(RegEAX, uint8(q))
 			c.SetReg8(4, uint8(r)) // AH
 		case 7: // IDIV r/m8
-			ax := int16(c.GetReg16(RegEAX))
-			d := int16(int8(val))
+			ax := int32(int16(c.GetReg16(RegEAX)))
+			d := int32(int8(val))
+			if d == 0 || ax/d != int32(int8(ax/d)) {
+				c.divideError(startEIP)
+				return
+			}
 			q := ax / d
 			r := ax % d
 			c.SetReg8(RegEAX, uint8(int8(q)))
@@ -1641,6 +1659,10 @@ func (c *CPU) stepFull() {
 				c.SetFlag(FlagCF|FlagOF, prod != int32(int16(prod)))
 			case 6: // DIV r/m16
 				num := (uint32(c.GetReg16(RegEDX)) << 16) | uint32(c.GetReg16(RegEAX))
+				if val == 0 || num/uint32(val) > 0xFFFF {
+					c.divideError(startEIP)
+					return
+				}
 				q := num / uint32(val)
 				r := num % uint32(val)
 				c.SetReg16(RegEAX, uint16(q))
@@ -1648,6 +1670,10 @@ func (c *CPU) stepFull() {
 			case 7: // IDIV r/m16
 				num := int32((uint32(c.GetReg16(RegEDX)) << 16) | uint32(c.GetReg16(RegEAX)))
 				d := int32(int16(val))
+				if d == 0 || num == math.MinInt32 && d == -1 || num/d != int32(int16(num/d)) {
+					c.divideError(startEIP)
+					return
+				}
 				q := num / d
 				r := num % d
 				c.SetReg16(RegEAX, uint16(int16(q)))
@@ -1677,28 +1703,24 @@ func (c *CPU) stepFull() {
 				c.Regs[RegEDX] = uint32(uint64(prod) >> 32)
 				c.SetFlag(FlagCF|FlagOF, prod != int64(int32(prod)))
 			case 6: // DIV r/m32
-				if val == 0 {
-					fmt.Printf("[CPU-WARN] DIV32 by zero at EIP=0x%08x\n", c.EIP)
-					c.Regs[RegEAX] = 0
-					c.Regs[RegEDX] = 0
-				} else {
-					q, r := bits.Div32(c.Regs[RegEDX], c.Regs[RegEAX], val)
-					c.Regs[RegEAX] = q
-					c.Regs[RegEDX] = r
+				if val == 0 || c.Regs[RegEDX] >= val {
+					c.divideError(startEIP)
+					return
 				}
+				q, r := bits.Div32(c.Regs[RegEDX], c.Regs[RegEAX], val)
+				c.Regs[RegEAX] = q
+				c.Regs[RegEDX] = r
 			case 7: // IDIV r/m32
 				d := int64(int32(val))
-				if d == 0 {
-					fmt.Printf("[CPU-WARN] IDIV32 by zero at EIP=0x%08x\n", c.EIP)
-					c.Regs[RegEAX] = 0
-					c.Regs[RegEDX] = 0
-				} else {
-					num := int64((uint64(c.Regs[RegEDX]) << 32) | uint64(c.Regs[RegEAX]))
-					q := num / d
-					r := num % d
-					c.Regs[RegEAX] = uint32(int32(q))
-					c.Regs[RegEDX] = uint32(int32(r))
+				num := int64((uint64(c.Regs[RegEDX]) << 32) | uint64(c.Regs[RegEAX]))
+				if d == 0 || num == math.MinInt64 && d == -1 || num/d != int64(int32(num/d)) {
+					c.divideError(startEIP)
+					return
 				}
+				q := num / d
+				r := num % d
+				c.Regs[RegEAX] = uint32(int32(q))
+				c.Regs[RegEDX] = uint32(int32(r))
 			}
 		}
 		return
@@ -1732,6 +1754,10 @@ func (c *CPU) stepFull() {
 			res := val - 1
 			c.UpdateFlagsSub8(val, 1, res)
 			c.writeRM8(modrm, addr, isReg, res)
+		} else {
+			c.Halted = true
+			c.HaltReason = fmt.Sprintf("invalid opcode 0xFE /%d at EIP=0x%08x", subop, startEIP)
+			return
 		}
 		c.SetFlag(FlagCF, cf)
 		return
@@ -1791,12 +1817,22 @@ func (c *CPU) stepFull() {
 				val := c.readRM32(modrm, segOverride, hasSeg)
 				c.Push32(val)
 			}
+		default: // far CALL/JMP (3, 5) and the invalid /7
+			c.Halted = true
+			c.HaltReason = fmt.Sprintf("unimplemented opcode 0xFF /%d at EIP=0x%08x", subop, startEIP)
 		}
 		return
 	}
 
 	c.Halted = true
 	c.HaltReason = fmt.Sprintf("unimplemented opcode 0x%02x at EIP=0x%08x", op, startEIP)
+}
+
+// divideError stops the guest on a #DE fault (divisor zero or quotient out of range), which would
+// kill the process on real hardware.
+func (c *CPU) divideError(eip uint32) {
+	c.Halted = true
+	c.HaltReason = fmt.Sprintf("divide error (#DE) at EIP=0x%08x", eip)
 }
 
 func (c *CPU) execStringOp(op uint8, opSize16 bool, repF3 bool, repF2 bool) {
@@ -1888,6 +1924,9 @@ func (c *CPU) execStringOp(op uint8, opSize16 bool, repF3 bool, repF2 bool) {
 		return
 	}
 
+	if step > 0 && c.repBulk(op, uint32(step)) {
+		return
+	}
 	isScanOrCmp := op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF
 	for c.Regs[RegECX] != 0 {
 		doOne()
@@ -1901,6 +1940,40 @@ func (c *CPU) execStringOp(op uint8, opSize16 bool, repF3 bool, repF2 bool) {
 			}
 		}
 	}
+}
+
+// repBulk runs a forward REP MOVS or REP STOS as one copy or fill when every element is in
+// guest memory and no watchpoint is armed, with the same result as the element loop (a MOVS
+// whose destination starts inside its source replicates the pattern, so it takes the loop).
+func (c *CPU) repBulk(op uint8, size uint32) bool {
+	if op != 0xA4 && op != 0xA5 && op != 0xAA && op != 0xAB || c.watchFn != nil {
+		return false
+	}
+	n := uint64(c.Regs[RegECX]) * uint64(size)
+	src, dst := c.Regs[RegESI], c.Regs[RegEDI]
+	if uint64(dst)+n > ArenaSize {
+		return false
+	}
+	if op <= 0xA5 {
+		if uint64(src)+n > ArenaSize || dst > src && uint64(dst) < uint64(src)+n {
+			return false
+		}
+		copy(c.WBytes(dst, uint32(n)), c.Mem[src:uint64(src)+n])
+		c.Regs[RegESI] += uint32(n)
+	} else {
+		b := c.WBytes(dst, uint32(n))
+		var pat [4]byte
+		binary.LittleEndian.PutUint32(pat[:], c.Regs[RegEAX])
+		for i := 0; i < len(b) && i < int(size); i++ {
+			b[i] = pat[i]
+		}
+		for i := int(size); i < len(b); i *= 2 {
+			copy(b[i:], b[:i])
+		}
+	}
+	c.Regs[RegEDI] += uint32(n)
+	c.Regs[RegECX] = 0
+	return true
 }
 
 func (c *CPU) RunUntil(stopEIP uint32) error {
@@ -2030,4 +2103,3 @@ func (c *CPU) CallGuestNested(fnAddr uint32, args ...uint32) (uint32, error) {
 	c.EIP = savedEIP
 	return retVal, nil
 }
-

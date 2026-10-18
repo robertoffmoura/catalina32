@@ -708,7 +708,9 @@ func emitNative(it *inst) string {
 		y, ok2 := xmmSrcF32(in, a1)
 		if ok && ok2 {
 			sym := map[x86asm.Op]string{x86asm.ADDSS: "+", x86asm.SUBSS: "-", x86asm.MULSS: "*", x86asm.DIVSS: "/"}[in.Op]
-			return line("c.SetXmmF32(%d, c.XmmF32(%d) %s %s)", r, r, sym, y)
+			// The explicit float32 rounds the result, so the Go compiler cannot fuse it into a
+			// following add (arm64 FMA): every instruction rounds like SSE.
+			return line("c.SetXmmF32(%d, float32(c.XmmF32(%d) %s %s))", r, r, sym, y)
 		}
 	case x86asm.MAXSS, x86asm.MINSS:
 		r, ok := xmm(a0)
@@ -736,7 +738,7 @@ func emitNative(it *inst) string {
 			}
 			if m, ok := a1.(x86asm.Mem); ok {
 				if e, ok := ea(m); ok {
-					return line("{\n\t\t\t\taddr := %s\n\t\t\t\tcopy(c.XMM[%d][:], c.Mem[addr:addr+16])\n\t\t\t}", e, r)
+					return line("c.XMM[%d] = c.Read128(%s)", r, e)
 				}
 			}
 			return ""
@@ -744,8 +746,7 @@ func emitNative(it *inst) string {
 		if s, ok := xmm(a1); ok {
 			if m, ok := a0.(x86asm.Mem); ok {
 				if e, ok := ea(m); ok {
-					// Same as the interpreter's 128-bit store (no code-cache check needed for data).
-					return line("{\n\t\t\t\taddr := %s\n\t\t\t\tcopy(c.Mem[addr:addr+16], c.XMM[%d][:])\n\t\t\t}", e, s)
+					return line("c.Write128(%s, c.XMM[%d])", e, s)
 				}
 			}
 		}
@@ -783,7 +784,7 @@ func emitNative(it *inst) string {
 		d, ok := reg32[asReg(a0)]
 		y, ok2 := xmmSrcF32(in, a1)
 		if ok && ok2 {
-			return line("c.Regs[%d] = uint32(int32(math.Trunc(float64(%s))))", d, y)
+			return line("c.Regs[%d] = uint32(cpu.ToInt32(math.Trunc(float64(%s))))", d, y)
 		}
 	}
 	if code, ok := cmovOps[in.Op]; ok {
