@@ -199,6 +199,9 @@ type Subsystem struct {
 	CantinaFirstFrame uint64
 	CantinaDIPLogged  int
 
+	// OnPresent, when set, is called with the new frame number at each device Present.
+	OnPresent func(frame uint64)
+
 	FrameCount     uint64
 	DrawCallCount  uint64
 	TriangleCount  uint64
@@ -641,6 +644,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 17: // Present
 		s.FrameCount++
+		if s.OnPresent != nil {
+			s.OnPresent(s.FrameCount)
+		}
 		if s.TitleFirstFrame == 0 && s.CubeTexCount >= 5 && s.FrameDrawCalls >= 10 {
 			s.TitleFirstFrame = s.FrameCount
 			fmt.Printf("[D3D9] Title screen detected at Frame #%d (CubeTexCount=%d, FrameDrawCalls=%d)\n", s.FrameCount, s.CubeTexCount, s.FrameDrawCalls)

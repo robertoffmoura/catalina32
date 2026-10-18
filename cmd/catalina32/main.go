@@ -103,8 +103,21 @@ func main() {
 	}
 	if pf := os.Getenv("C32_CPUPROF"); pf != "" {
 		if f, err := os.Create(pf); err == nil {
-			// C32_CPUPROF_AFTER=<seconds> starts the profile later (e.g. once a level is running).
-			if d, err := time.ParseDuration(os.Getenv("C32_CPUPROF_AFTER") + "s"); err == nil && d > 0 {
+			// C32_CPUPROF_AFTER=<seconds> starts the profile later (e.g. once a level is running);
+			// C32_CPUPROF_FRAMES=<first>-<last> profiles only those frames (one scene).
+			var first, last uint64
+			if _, err := fmt.Sscanf(os.Getenv("C32_CPUPROF_FRAMES"), "%d-%d", &first, &last); err == nil {
+				d3d.OnPresent = func(frame uint64) {
+					switch frame {
+					case first:
+						_ = pprof.StartCPUProfile(f)
+					case last:
+						d3d.WaitRender()
+						pprof.StopCPUProfile()
+						fmt.Printf("[catalina32] CPU profile of frames %d-%d written\n", first, last)
+					}
+				}
+			} else if d, err := time.ParseDuration(os.Getenv("C32_CPUPROF_AFTER") + "s"); err == nil && d > 0 {
 				time.AfterFunc(d, func() { _ = pprof.StartCPUProfile(f) })
 			} else {
 				_ = pprof.StartCPUProfile(f)

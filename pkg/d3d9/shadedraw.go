@@ -3,7 +3,6 @@ package d3d9
 import (
 	"encoding/binary"
 	"math"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -177,6 +176,8 @@ func (w *shadeWorker) state(cs *compiledShader) *hlsl.State {
 	return st
 }
 
+// shade runs the draw's vertex shader (and, per vertex, its pixel shader) over the vertices the
+// primitives use, hlsl.Lanes vertices at a time.
 func (w *shadeWorker) shade(cmd *drawCmd) {
 	vs, ps := cmd.vs, cmd.ps
 	vst := w.state(vs)
@@ -186,76 +187,116 @@ func (w *shadeWorker) shade(cmd *drawCmd) {
 		pst = w.state(ps)
 		pst.LoadConstants(cmd.psRegs)
 	}
+	// Each vertex element feeds the vertex shader inputs with its semantic.
+	type binding struct {
+		e     VertexElement
+		slots []*hlsl.Varying
+	}
+	var binds []binding
+	for _, e := range cmd.elems {
+		if int(e.Usage) >= len(usageSemantic) || e.Stream > 15 || cmd.streams[e.Stream].data == nil {
+			continue
+		}
+		b := binding{e: e}
+		for _, in := range vs.prog.Inputs {
+			if in.Semantic == usageSemantic[e.Usage] && in.Index == int(e.UIdx) {
+				b.slots = append(b.slots, in)
+			}
+		}
+		if len(b.slots) > 0 {
+			binds = append(binds, b)
+		}
+	}
+	// Pixel shader inputs come from the vertex shader outputs with the same semantic.
+	type link struct{ from, to, n int }
+	var links []link
+	if ps != nil {
+		for _, in := range ps.prog.Inputs {
+			if out := vs.prog.Output(in.Semantic, in.Index); out != nil {
+				links = append(links, link{out.Offset, in.Offset, min(in.Components, out.Components)})
+			}
+		}
+	}
 	pos := vs.prog.Output("POSITION", 0)
+	var lanes [hlsl.Lanes]int // vertex index per lane
+	n := 0
+	flush := func() {
+		vst.Run(n)
+		if ps != nil {
+			for _, k := range links {
+				copy(pst.M[k.to:k.to+k.n], vst.M[k.from:k.from+k.n])
+			}
+			pst.Run(n)
+		}
+		for l, i := range lanes[:n] {
+			cmd.verts[i], cmd.colors[i] = finishVertex(vs, ps, vst, pst, pos, l)
+			for _, c := range cmd.colors[i] {
+				if c > 1.001 {
+					cmd.over = true
+				}
+			}
+		}
+		n = 0
+	}
 	for i := range cmd.verts {
 		if !cmd.need[i] {
 			continue
 		}
-		for _, e := range cmd.elems {
-			if int(e.Usage) >= len(usageSemantic) || e.Stream > 15 {
+		for _, b := range binds {
+			sn := &cmd.streams[b.e.Stream]
+			off := uint32(i)*sn.stride + uint32(b.e.Offset)
+			if int(off)+16 > len(sn.data) {
 				continue
 			}
-			sn := &cmd.streams[e.Stream]
-			off := uint32(i)*sn.stride + uint32(e.Offset)
-			if sn.data == nil || int(off)+16 > len(sn.data) {
-				continue
-			}
-			v := decodeElementBytes(sn.data[off:], e.Type)
-			sem, si := usageSemantic[e.Usage], int(e.UIdx)
-			for _, in := range vs.prog.Inputs {
-				if in.Semantic == sem && in.Index == si {
-					copy(vst.M[in.Offset:in.Offset+min(in.Components, 4)], v[:])
+			v := decodeElementBytes(sn.data[off:], b.e.Type)
+			for _, in := range b.slots {
+				for k := 0; k < min(in.Components, 4); k++ {
+					vst.M[in.Offset+k][n] = v[k]
 				}
 			}
 		}
-		vst.Run()
-		cmd.verts[i], cmd.colors[i] = finishVertex(vs, ps, vst, pst, pos)
-		for _, c := range cmd.colors[i] {
-			if c > 1.001 {
-				cmd.over = true
-			}
+		lanes[n] = i
+		n++
+		if n == hlsl.Lanes {
+			flush()
 		}
+	}
+	if n > 0 {
+		flush()
 	}
 }
 
-// finishVertex turns the vertex shader outputs (and the per-vertex pixel shader result) into a
-// clip-space screen vertex.
-func finishVertex(vs, ps *compiledShader, vst, pst *hlsl.State, pos *hlsl.Varying) (screenVertex, [4]float32) {
+// finishVertex turns lane l's vertex shader outputs (and pixel shader result) into a clip-space
+// screen vertex.
+func finishVertex(vs, ps *compiledShader, vst, pst *hlsl.State, pos *hlsl.Varying, l int) (screenVertex, [4]float32) {
 	raw := [4]float32{1, 1, 1, 1}
 	if pos == nil || pos.Components < 4 {
 		return screenVertex{}, raw
 	}
-	p := vst.M[pos.Offset : pos.Offset+4]
-	sv := screenVertex{cx: p[0], cy: p[1], cz: p[2], cw: p[3], clip: true, valid: true, r: 255, g: 255, b: 255, a: 255}
+	m := vst.M
+	sv := screenVertex{cx: m[pos.Offset][l], cy: m[pos.Offset+1][l], cz: m[pos.Offset+2][l], cw: m[pos.Offset+3][l],
+		clip: true, valid: true, r: 255, g: 255, b: 255, a: 255}
 	if sv.cx != sv.cx || sv.cy != sv.cy || sv.cz != sv.cz || sv.cw != sv.cw {
 		return screenVertex{}, raw
 	}
-	var color []float32
+	var color *hlsl.Varying
+	cm := m
 	if ps != nil {
-		for _, in := range ps.prog.Inputs {
-			if out := vs.prog.Output(in.Semantic, in.Index); out != nil {
-				n := min(in.Components, out.Components)
-				copy(pst.M[in.Offset:in.Offset+n], vst.M[out.Offset:out.Offset+n])
-			}
-		}
-		pst.Run()
-		if tc, ok := pst.TexCoord(ps.texUnit); ok && len(tc) >= 2 {
+		if tc, n, ok := pst.TexCoord(ps.texUnit, l); ok && n >= 2 {
 			sv.u, sv.v = tc[0], tc[1]
 		}
-		if out := ps.prog.Output("COLOR", 0); out != nil && out.Components >= 4 {
-			color = pst.M[out.Offset : out.Offset+4]
-		}
+		color, cm = ps.prog.Output("COLOR", 0), pst.M
 	} else {
-		if out := vs.prog.Output("COLOR", 0); out != nil && out.Components >= 4 {
-			color = vst.M[out.Offset : out.Offset+4]
-		}
+		color = vs.prog.Output("COLOR", 0)
 		if out := vs.prog.Output("TEXCOORD", 0); out != nil && out.Components >= 2 {
-			sv.u, sv.v = vst.M[out.Offset], vst.M[out.Offset+1]
+			sv.u, sv.v = m[out.Offset][l], m[out.Offset+1][l]
 		}
 	}
-	if color != nil {
-		copy(raw[:], color)
-		sv.r, sv.g, sv.b, sv.a = clampByte(color[0]), clampByte(color[1]), clampByte(color[2]), clampByte(color[3])
+	if color != nil && color.Components >= 4 {
+		for k := range raw {
+			raw[k] = cm[color.Offset+k][l]
+		}
+		sv.r, sv.g, sv.b, sv.a = clampByte(raw[0]), clampByte(raw[1]), clampByte(raw[2]), clampByte(raw[3])
 	}
 	if sv.cw > nearW {
 		projectClip(&sv)
@@ -276,7 +317,7 @@ func (s *Subsystem) expandDraws(ops []queuedTri) []queuedTri {
 		return ops
 	}
 	if len(s.shadeWorkers) == 0 {
-		for i := 0; i < runtime.GOMAXPROCS(0); i++ {
+		for i := 0; i < renderWorkers; i++ {
 			s.shadeWorkers = append(s.shadeWorkers, &shadeWorker{states: map[*compiledShader]*hlsl.State{}})
 		}
 	}

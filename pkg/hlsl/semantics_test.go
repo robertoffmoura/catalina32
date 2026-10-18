@@ -74,23 +74,33 @@ func TestSemantics(t *testing.T) {
 
 	s := p.NewState()
 	s.LoadConstants(regs)
-	in := func(sem string, idx int, v ...float32) {
+	// Lane 0 takes the if branch, lane 1 the else branch, in the same run.
+	in := func(lane int, sem string, idx int, v ...float32) {
 		vy := p.Input(sem, idx)
 		if vy == nil {
 			t.Fatalf("no input %s%d", sem, idx)
 		}
-		copy(s.M[vy.Offset:], v)
+		for i, f := range v {
+			s.M[vy.Offset+i][lane] = f
+		}
 	}
-	in("POSITION", 0, 1, 2, 3, 1)
-	in("COLOR", 0, 0.1, 0.2, 0.3, 0.4)
-	in("TEXCOORD", 0, 1.7, 0.9) // bone index int(1.7) = 1; uv.y > 0.5
-	s.Run()
-	out := func(sem string, idx int) []float32 {
+	for lane := 0; lane < 2; lane++ {
+		in(lane, "POSITION", 0, 1, 2, 3, 1)
+		in(lane, "COLOR", 0, 0.1, 0.2, 0.3, 0.4)
+	}
+	in(0, "TEXCOORD", 0, 1.7, 0.9) // bone index int(1.7) = 1; uv.y > 0.5
+	in(1, "TEXCOORD", 0, 0, 0.1)
+	s.Run(2)
+	out := func(lane int, sem string, idx int) []float32 {
 		vy := p.Output(sem, idx)
 		if vy == nil {
 			t.Fatalf("no output %s%d", sem, idx)
 		}
-		return s.M[vy.Offset : vy.Offset+vy.Components]
+		var r []float32
+		for i := 0; i < vy.Components; i++ {
+			r = append(r, s.M[vy.Offset+i][lane])
+		}
+		return r
 	}
 	want := map[string][]float32{
 		"POSITION": {2 + 10, 4 + 20, 6 + 30, 1},           // scaled by bone 1, then translated
@@ -102,7 +112,7 @@ func TestSemantics(t *testing.T) {
 		if sem == "TEXCOORD" {
 			idx = 1
 		}
-		g := out(sem, idx)
+		g := out(0, sem, idx)
 		for i := range w {
 			if !near(g[i], w[i]) {
 				t.Errorf("%s = %v, want %v", sem, g, w)
@@ -110,10 +120,11 @@ func TestSemantics(t *testing.T) {
 			}
 		}
 	}
-	// Else branch and float4 overload.
-	in("TEXCOORD", 0, 0, 0.1)
-	s.Run()
-	if g := out("TEXCOORD", 1); !near(g[2], 3) {
+	// Else branch (lane 1, bone 0 = identity) and float4 overload.
+	if g := out(1, "TEXCOORD", 1); !near(g[2], 3) {
 		t.Errorf("else branch: n.z = %v, want 3", g[2])
+	}
+	if g := out(1, "POSITION", 0); !near(g[0], 1+10) {
+		t.Errorf("lane 1 position = %v, want x = 11", g)
 	}
 }

@@ -28,6 +28,6 @@ func TestCompileDumpedShaders(t *testing.T) {
 		}
 		s := p.NewState()
 		s.LoadConstants(make([][4]float32, 256))
-		s.Run()
+		s.Run(Lanes)
 	}
 }

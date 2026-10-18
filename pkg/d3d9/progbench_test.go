@@ -2,6 +2,7 @@ package d3d9
 
 import (
 	"encoding/binary"
+	"math"
 	"math/rand"
 	"os"
 	"syscall"
@@ -189,6 +190,9 @@ func TestWideMatchesScalar(t *testing.T) {
 				if k < 10 {
 					for j := 0; j < 4; j++ {
 						wm.F[reg][j][l] = in[l][k][j]
+						if ps.InputComps(reg)&(1<<j) == 0 {
+							wm.F[reg][j][l] = float32(math.NaN()) // unread: must not matter
+						}
 					}
 				}
 			}

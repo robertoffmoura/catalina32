@@ -81,8 +81,10 @@ type Program struct {
 	// ReadsV and ReadsT are bit masks of the input (v#) and texture (t#) registers read: for a
 	// pixel shader, the interpolated colours and texture coordinates it needs.
 	ReadsV, ReadsT uint32
-	ps1            bool // ps_1_x: r0 is the colour output
-	wide           bool // RunWide supports it
+	ps1            bool           // ps_1_x: r0 is the colour output
+	wide           bool           // RunWide supports it
+	need           [][3]uint8     // RunWide: source components each instruction reads
+	inComps        [fileLen]uint8 // RunWide: input register components read
 }
 
 // Decl is a dcl'd input register.

@@ -3,7 +3,6 @@ package d3d9
 import (
 	"fmt"
 	"math"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -315,7 +314,7 @@ func (s *Subsystem) expandProg(ops []queuedTri) []queuedTri {
 	}
 	var next atomic.Int64
 	var wg sync.WaitGroup
-	for w := 0; w < runtime.GOMAXPROCS(0); w++ {
+	for w := 0; w < renderWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -427,12 +426,13 @@ func sampleLanes(o *outState, st int, uv *[4]d3dsm.Lane, n int, out *[4]d3dsm.La
 		} else {
 			fu, fv = fu-0.5, fv-0.5
 			x0, y0 := floorInt(fu), floorInt(fv)
-			ax, ay := filterWeight(fu-float32(x0)), filterWeight(fv-float32(y0))
+			// 8-bit weights as filterWeight and bilerp use them.
+			wx, wy := uint32(int((fu-float32(x0))*256+0.5)), uint32(int((fv-float32(y0))*256+0.5))
 			xa, ya := texAddr(x0, w, clampU), texAddr(y0, h, clampV)
 			p00 = px[ya*w+xa]
-			if ax != 0 || ay != 0 {
+			if wx != 0 || wy != 0 {
 				xb, yb := texAddr(x0+1, w, clampU), texAddr(y0+1, h, clampV)
-				p00 = bilerp(p00, px[ya*w+xb], px[yb*w+xa], px[yb*w+xb], ax, ay)
+				p00 = lerp8(lerp8(p00, px[ya*w+xb], wx), lerp8(px[yb*w+xa], px[yb*w+xb], wx), wy)
 			}
 		}
 		out[0][i], out[1][i], out[2][i], out[3][i] = unorm8[uint8(p00)], unorm8[uint8(p00>>8)], unorm8[uint8(p00>>16)], unorm8[uint8(p00>>24)]
@@ -607,9 +607,15 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, sh *progShader, ids []int32, pi
 		if used&(1<<k) == 0 {
 			continue
 		}
+		comps := uint8(15)
+		if wide {
+			comps = d.ps.InputComps(regs[k]) // components the batched shader never reads stay unset
+		}
 		for j := 0; j < 4; j++ {
-			attrs[na] = varyAttr{&wm.F[regs[k]][j], attr(pw[0][k][j], pw[1][k][j], pw[2][k][j])}
-			na++
+			if comps&(1<<j) != 0 {
+				attrs[na] = varyAttr{&wm.F[regs[k]][j], attr(pw[0][k][j], pw[1][k][j], pw[2][k][j])}
+				na++
+			}
 		}
 	}
 	aq := attr(v0.inW, v1.inW, v2.inW)
@@ -693,13 +699,15 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, sh *progShader, ids []int32, pi
 		q0 := aq.row(rw0, rw1)
 		iw := 1 / q0
 		for x := x0; x <= x1; x, e[0], e[1], e[2] = x+1, e[0]+step[0], e[1]+step[1], e[2]+step[2] {
-			w0 := float32(e[0]) * te.inv
-			w1 := float32(e[1]) * te.inv
-			w2 := 1 - w0 - w1
 			idx := row + x
-			z := w0*v0.sz + w1*v1.sz + w2*v2.sz
-			if o.zTest && !cmpFunc(o.zFunc, z, zbuf[idx]) {
-				continue
+			var z float32 // only used with depth testing
+			if o.zTest {
+				w0 := float32(e[0]) * te.inv
+				w1 := float32(e[1]) * te.inv
+				w2 := 1 - w0 - w1
+				if z = w0*v0.sz + w1*v1.sz + w2*v2.sz; !cmpFunc(o.zFunc, z, zbuf[idx]) {
+					continue
+				}
 			}
 			k := float32(x - x0)
 			if persp {
@@ -713,9 +721,11 @@ func (s *Subsystem) rasterizeProg(qt *queuedTri, sh *progShader, ids []int32, pi
 				flush()
 			}
 		}
-		if n > 0 {
-			flush()
-		}
+	}
+	// A batch may span rows: a triangle covers each pixel once, so its pending pixels never
+	// interact through the depth buffer.
+	if n > 0 {
+		flush()
 	}
 }
 

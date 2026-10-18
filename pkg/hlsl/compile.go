@@ -15,10 +15,11 @@ type Program struct {
 	Outputs   []*Varying  // return value (flattened struct fields) by semantic
 	MemSize   int         // float slots per invocation (see NewState)
 
-	run    func(m []float32)
+	run    evalFn
 	retOff int
-	inits  []func(m []float32) // static/global initialisers, run once per State
-	pre    []func(m []float32) // uniform-only function bodies, run after each constant load
+	inits  []evalFn // static/global initialisers, run at the start of each Run
+	pre    []evalFn // uniform-only function bodies, run after each constant load
+	lits   []literal
 	consts []*Constant
 	// Sampler, if set, performs texture lookups (otherwise they return white). It is shared by
 	// all States of the program, so it must not be set while States run concurrently.
@@ -46,6 +47,12 @@ type Constant struct {
 	RegisterCount int
 	Explicit      bool // register(...) given in source
 	off           int  // evaluator slot
+}
+
+// literal is a slot holding a constant, filled once per State (no operation writes it).
+type literal struct {
+	off int
+	v   float32
 }
 
 // TexCall is one texture lookup site: its sampler unit, coordinate and executed-flag slots.
@@ -130,7 +137,7 @@ type cfunc struct {
 	decl     *FuncDecl
 	paramOff []int
 	retOff   int
-	body     func(m []float32)
+	body     evalFn
 	locals   []map[string]*local
 	impure   bool // reads/writes non-uniform globals, samples textures, or calls impure code
 	memo     bool // pure, parameterless: body runs once per constant load (Program.pre)
@@ -224,9 +231,9 @@ func (c *compiler) global(name string, line int) *gvar {
 			init := c.convertTo(c.expr(d.Init), d.Type, line)
 			off := g.off
 			size := d.Type.Size()
-			c.prog.inits = append(c.prog.inits, func(m []float32) {
-				init.eval(m)
-				copy(m[off:off+size], m[init.off:init.off+size])
+			c.prog.inits = append(c.prog.inits, func(x *ctx) {
+				init.eval(x)
+				copy(x.m[off:off+size], x.m[init.off:init.off+size])
 			})
 		}
 	}
@@ -330,52 +337,42 @@ func (c *compiler) function(fd *FuncDecl) *cfunc {
 	c.cur, c.scopes = cf, []map[string]*local{scope}
 	body := c.block(fd.Body)
 	c.cur, c.scopes = savedCur, savedScopes
-	cf.body = func(m []float32) { body(m) }
+	cf.body = func(x *ctx) {
+		if x.mask == 0 {
+			return
+		}
+		mask, retd := x.mask, x.retd
+		x.retd = 0
+		body(x)
+		x.mask, x.retd = mask, retd
+	}
 	return cf
 }
 
-// Statement execution returns true when a return statement ran.
-type stmtFn func(m []float32) bool
-
-func (c *compiler) block(b *BlockStmt) func(m []float32) {
+// A block stops once none of its lanes is still executing (they all returned).
+func (c *compiler) block(b *BlockStmt) evalFn {
 	c.scopes = append(c.scopes, map[string]*local{})
-	var list []stmtFn
+	var list []evalFn
 	for _, s := range b.List {
 		list = append(list, c.stmt(s))
 	}
 	c.scopes = c.scopes[:len(c.scopes)-1]
-	return func(m []float32) {
+	return func(x *ctx) {
 		for _, s := range list {
-			if s(m) {
+			s(x)
+			if x.mask == 0 {
 				return
 			}
 		}
 	}
 }
 
-func (c *compiler) blockStmt(b *BlockStmt) stmtFn {
-	c.scopes = append(c.scopes, map[string]*local{})
-	var list []stmtFn
-	for _, s := range b.List {
-		list = append(list, c.stmt(s))
-	}
-	c.scopes = c.scopes[:len(c.scopes)-1]
-	return func(m []float32) bool {
-		for _, s := range list {
-			if s(m) {
-				return true
-			}
-		}
-		return false
-	}
-}
-
-func (c *compiler) stmt(s Stmt) stmtFn {
+func (c *compiler) stmt(s Stmt) evalFn {
 	switch s := s.(type) {
 	case *BlockStmt:
-		return c.blockStmt(s)
+		return c.block(s)
 	case *DeclStmt:
-		var fns []func(m []float32)
+		var fns []evalFn
 		for _, v := range s.Vars {
 			off := c.alloc(v.Type.Size())
 			if v.Init != nil {
@@ -386,50 +383,57 @@ func (c *compiler) stmt(s Stmt) stmtFn {
 					init = c.convertTo(c.expr(v.Init), v.Type, s.Line)
 				}
 				size := v.Type.Size()
-				fns = append(fns, func(m []float32) {
-					init.eval(m)
-					copy(m[off:off+size], m[init.off:init.off+size])
+				fns = append(fns, func(x *ctx) {
+					init.eval(x)
+					storeMasked(x.m, off, init.off, size, x.mask)
 				})
 			}
 			c.scopes[len(c.scopes)-1][v.Name] = &local{t: v.Type, off: off}
 		}
-		return func(m []float32) bool {
+		return func(x *ctx) {
 			for _, f := range fns {
-				f(m)
+				f(x)
 			}
-			return false
 		}
 	case *ExprStmt:
-		e := c.expr(s.X)
-		return func(m []float32) bool { e.eval(m); return false }
+		return c.expr(s.X).eval
 	case *IfStmt:
 		cond := c.convertTo(c.expr(s.Cond), tyBool, s.Line)
 		then := c.stmt(s.Then)
-		var els stmtFn
+		var els evalFn
 		if s.Else != nil {
 			els = c.stmt(s.Else)
 		}
 		co := cond.off
-		return func(m []float32) bool {
-			cond.eval(m)
-			if m[co] != 0 {
-				return then(m)
-			} else if els != nil {
-				return els(m)
+		return func(x *ctx) {
+			cond.eval(x)
+			t := laneBits(&x.m[co])
+			mask := x.mask
+			if tm := mask & t; tm != 0 {
+				x.mask = tm
+				then(x)
 			}
-			return false
+			if em := mask &^ t; em != 0 && els != nil {
+				x.mask = em
+				els(x)
+			}
+			x.mask = mask &^ x.retd
 		}
 	case *ReturnStmt:
 		ret := c.cur.decl.Ret
 		if s.X == nil {
-			return func(m []float32) bool { return true }
+			return func(x *ctx) {
+				x.retd |= x.mask
+				x.mask = 0
+			}
 		}
 		v := c.convertTo(c.expr(s.X), ret, s.Line)
 		off, size := c.cur.retOff, ret.Size()
-		return func(m []float32) bool {
-			v.eval(m)
-			copy(m[off:off+size], m[v.off:v.off+size])
-			return true
+		return func(x *ctx) {
+			v.eval(x)
+			storeMasked(x.m, off, v.off, size, x.mask)
+			x.retd |= x.mask
+			x.mask = 0
 		}
 	}
 	failf(s.stmtLine(), "unsupported statement %T", s)
@@ -439,27 +443,35 @@ func (c *compiler) stmt(s Stmt) stmtFn {
 // ---------------------------------------------------------------------------------------------
 // Expressions
 
-// cval is a compiled expression: after eval(m), its value is in m[off : off+t.Size()]
-// (contiguous). Lvalues additionally carry store information.
+// cval is a compiled expression: after eval(x), its value is in slots off : off+t.Size()
+// (contiguous) of every lane. Expressions compute all lanes; only stores are masked.
+// Lvalues additionally carry store information.
 type cval struct {
 	t     *Type
-	eval  func(m []float32) // never nil; no-op for values already in storage
+	eval  evalFn // never nil; no-op for values already in storage
 	off   int
 	lv    *lvalue
 	konst *Constant // set when the value is a uniform read directly
 }
 
-// lvalue describes an assignable location: base slot (static or dynamic) plus an optional
-// component map (swizzle) relative to the base.
+// lvalue describes an assignable location: slot base, plus (when dyn is set) a per-lane offset
+// that dyn computes into slot dynOff (dynamic array indices), and an optional component map
+// (swizzle) relative to that.
 type lvalue struct {
-	base  int
-	dyn   func(m []float32) int // runtime base (dynamic array index); nil = static
-	comps []int
+	base   int
+	dyn    evalFn
+	dynOff int
+	comps  []int
 }
 
-func noop(m []float32) {}
-
 func (c *compiler) temp(t *Type) int { return c.alloc(t.Size()) }
+
+// literal allocates a slot holding the constant v.
+func (c *compiler) literal(t *Type, v float32) *cval {
+	off := c.temp(t)
+	c.prog.lits = append(c.prog.lits, literal{off, v})
+	return &cval{t: t, off: off, eval: noop}
+}
 
 func (c *compiler) lookup(name string, line int) *cval {
 	for i := len(c.scopes) - 1; i >= 0; i-- {
@@ -484,20 +496,12 @@ func (c *compiler) lookup(name string, line int) *cval {
 func (c *compiler) expr(e Expr) *cval {
 	switch e := e.(type) {
 	case *NumberExpr:
-		t := tyFloat
 		if e.IsInt {
-			t = tyInt
+			return c.literal(tyInt, float32(e.Value))
 		}
-		off := c.temp(t)
-		v := float32(e.Value)
-		return &cval{t: t, off: off, eval: func(m []float32) { m[off] = v }}
+		return c.literal(tyFloat, float32(e.Value))
 	case *BoolExpr:
-		off := c.temp(tyBool)
-		v := float32(0)
-		if e.Value {
-			v = 1
-		}
-		return &cval{t: tyBool, off: off, eval: func(m []float32) { m[off] = v }}
+		return c.literal(tyBool, b2f(e.Value))
 	case *IdentExpr:
 		return c.lookup(e.Name, e.Line)
 	case *MemberExpr:
@@ -580,7 +584,7 @@ func (c *compiler) subvalue(x *cval, t *Type, off int, comps []int) *cval {
 	tmp := c.temp(t)
 	var lv *lvalue
 	if x.lv != nil {
-		lv = &lvalue{base: x.lv.base + off, dyn: x.lv.dyn}
+		lv = &lvalue{base: x.lv.base + off, dyn: x.lv.dyn, dynOff: x.lv.dynOff}
 		if x.lv.comps != nil {
 			// swizzle of a swizzle
 			if comps == nil {
@@ -598,15 +602,15 @@ func (c *compiler) subvalue(x *cval, t *Type, off int, comps []int) *cval {
 	src := x.off + off
 	ev := x.eval
 	if comps == nil {
-		return &cval{t: t, off: tmp, lv: lv, eval: func(m []float32) {
-			ev(m)
-			copy(m[tmp:tmp+size], m[src:src+size])
+		return &cval{t: t, off: tmp, lv: lv, eval: func(x *ctx) {
+			ev(x)
+			copy(x.m[tmp:tmp+size], x.m[src:src+size])
 		}}
 	}
-	return &cval{t: t, off: tmp, lv: lv, eval: func(m []float32) {
-		ev(m)
+	return &cval{t: t, off: tmp, lv: lv, eval: func(x *ctx) {
+		ev(x)
 		for i, k := range comps {
-			m[tmp+i] = m[src+k]
+			x.m[tmp+i] = x.m[src+k]
 		}
 	}}
 }
@@ -628,57 +632,86 @@ func (c *compiler) index(e *IndexExpr) *cval {
 	}
 	size := elem.Size()
 	tmp := c.temp(elem)
+	at := c.alloc(1) // per-lane slot offset of the element (clamped index * stride)
 	xev, iev, xoff, ioff := x.eval, idx.eval, x.off, idx.off
-	at := func(m []float32) int {
-		i := int(m[ioff])
-		if i < 0 {
-			i = 0
-		} else if i >= n {
-			i = n - 1
+	offsets := func(x *ctx) {
+		iv, d := &x.m[ioff], &x.m[at]
+		for l := range d {
+			i := int(iv[l])
+			if i < 0 {
+				i = 0
+			} else if i >= n {
+				i = n - 1
+			}
+			d[l] = float32(i * stride)
 		}
-		return i * stride
 	}
 	var lv *lvalue
 	if x.lv != nil && x.lv.comps == nil {
-		base, xd := x.lv.base, x.lv.dyn
-		lv = &lvalue{dyn: func(m []float32) int {
-			iev(m)
-			b := base
-			if xd != nil {
-				b = xd(m)
+		xd, xdOff := x.lv.dyn, x.lv.dynOff
+		dynOff := c.alloc(1)
+		lv = &lvalue{base: x.lv.base, dynOff: dynOff, dyn: func(x *ctx) {
+			iev(x)
+			offsets(x)
+			d, a := &x.m[dynOff], &x.m[at]
+			if xd == nil {
+				*d = *a
+				return
 			}
-			return b + at(m)
+			xd(x)
+			p := &x.m[xdOff]
+			for l := range d {
+				d[l] = p[l] + a[l]
+			}
 		}}
 	}
-	return &cval{t: elem, off: tmp, lv: lv, eval: func(m []float32) {
-		xev(m)
-		iev(m)
-		src := xoff + at(m)
-		copy(m[tmp:tmp+size], m[src:src+size])
+	return &cval{t: elem, off: tmp, lv: lv, eval: func(x *ctx) {
+		xev(x)
+		iev(x)
+		offsets(x)
+		m := x.m
+		a := &m[at]
+		for l := range a {
+			src := xoff + int(a[l])
+			for k := 0; k < size; k++ {
+				m[tmp+k][l] = m[src+k][l]
+			}
+		}
 	}}
 }
 
-// store writes the value at m[src:] (type t, already converted) to lvalue lv.
-func storeFn(lv *lvalue, size int) func(m []float32, src int) {
-	if lv.comps == nil {
-		if lv.dyn == nil {
-			base := lv.base
-			return func(m []float32, src int) { copy(m[base:base+size], m[src:src+size]) }
+// storeFn returns a function writing the value at slots src.. (type of size slots, already
+// converted) to lvalue lv, in the executing lanes.
+func storeFn(lv *lvalue, size int) func(x *ctx, src int) {
+	base, dyn, dynOff, comps := lv.base, lv.dyn, lv.dynOff, lv.comps
+	if dyn == nil {
+		if comps == nil {
+			return func(x *ctx, src int) { storeMasked(x.m, base, src, size, x.mask) }
 		}
-		dyn := lv.dyn
-		return func(m []float32, src int) {
-			b := dyn(m)
-			copy(m[b:b+size], m[src:src+size])
+		return func(x *ctx, src int) {
+			for i, k := range comps {
+				storeMasked(x.m, base+k, src+i, 1, x.mask)
+			}
 		}
 	}
-	comps, base, dyn := lv.comps, lv.base, lv.dyn
-	return func(m []float32, src int) {
-		b := base
-		if dyn != nil {
-			b = dyn(m)
+	if comps == nil {
+		comps = make([]int, size)
+		for i := range comps {
+			comps[i] = i
 		}
-		for i, k := range comps {
-			m[b+k] = m[src+i]
+	}
+	return func(x *ctx, src int) {
+		dyn(x)
+		m := x.m
+		d := &m[dynOff]
+		for l := range d {
+			if x.mask>>l&1 == 0 {
+				continue
+			}
+			b := base + int(d[l])
+			for i, k := range comps {
+				m[b+k][l] = m[src+i][l]
+			}
 		}
 	}
 }
@@ -706,9 +739,9 @@ func (c *compiler) assign(e *AssignExpr) *cval {
 	}
 	st := storeFn(lhs.lv, lhs.t.Size())
 	rev, roff := rhs.eval, rhs.off
-	return &cval{t: lhs.t, off: roff, eval: func(m []float32) {
-		rev(m)
-		st(m, roff)
+	return &cval{t: lhs.t, off: roff, eval: func(x *ctx) {
+		rev(x)
+		st(x, roff)
 	}}
 }
 
@@ -728,10 +761,13 @@ func (c *compiler) unary(e *UnaryExpr) *cval {
 		n := t.Size()
 		tmp := c.temp(t)
 		xe, xo := x.eval, x.off
-		return &cval{t: t, off: tmp, eval: func(m []float32) {
-			xe(m)
+		return &cval{t: t, off: tmp, eval: func(x *ctx) {
+			xe(x)
 			for i := 0; i < n; i++ {
-				m[tmp+i] = -m[xo+i]
+				d, a := &x.m[tmp+i], &x.m[xo+i]
+				for l := range d {
+					d[l] = -a[l]
+				}
 			}
 		}}
 	case "!":
@@ -739,10 +775,13 @@ func (c *compiler) unary(e *UnaryExpr) *cval {
 		n := t.Size()
 		tmp := c.temp(t)
 		xe, xo := x.eval, x.off
-		return &cval{t: t, off: tmp, eval: func(m []float32) {
-			xe(m)
+		return &cval{t: t, off: tmp, eval: func(x *ctx) {
+			xe(x)
 			for i := 0; i < n; i++ {
-				m[tmp+i] = b2f(m[xo+i] == 0)
+				d, a := &x.m[tmp+i], &x.m[xo+i]
+				for l := range d {
+					d[l] = b2f(a[l] == 0)
+				}
 			}
 		}}
 	}
@@ -765,13 +804,16 @@ func (c *compiler) binaryExpr(e *BinaryExpr) *cval {
 		tmp := c.temp(tyBool)
 		xe, ye, xo, yo := x.eval, y.eval, x.off, y.off
 		and := e.Op == "&&"
-		return &cval{t: tyBool, off: tmp, eval: func(m []float32) {
-			xe(m)
-			ye(m) // HLSL evaluates both operands
-			if and {
-				m[tmp] = b2f(m[xo] != 0 && m[yo] != 0)
-			} else {
-				m[tmp] = b2f(m[xo] != 0 || m[yo] != 0)
+		return &cval{t: tyBool, off: tmp, eval: func(x *ctx) {
+			xe(x)
+			ye(x) // HLSL evaluates both operands
+			d, a, b := &x.m[tmp], &x.m[xo], &x.m[yo]
+			for l := range d {
+				if and {
+					d[l] = b2f(a[l] != 0 && b[l] != 0)
+				} else {
+					d[l] = b2f(a[l] != 0 || b[l] != 0)
+				}
 			}
 		}}
 	case "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=":
@@ -807,6 +849,92 @@ func promote(a, b Base) Base {
 	return BInt
 }
 
+// laneOp2 computes d = f(a, b) in every lane.
+type laneOp2 func(d, a, b *Lane)
+
+func arithOp(op string, isInt bool) laneOp2 {
+	switch op {
+	case "+":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = a[l] + b[l]
+			}
+		}
+	case "-":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = a[l] - b[l]
+			}
+		}
+	case "*":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = a[l] * b[l]
+			}
+		}
+	case "/":
+		if isInt {
+			return func(d, a, b *Lane) {
+				for l := range d {
+					if b[l] == 0 {
+						d[l] = 0
+					} else {
+						d[l] = float32(int32(a[l]) / int32(b[l]))
+					}
+				}
+			}
+		}
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = a[l] / b[l]
+			}
+		}
+	case "%":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = float32(math.Mod(float64(a[l]), float64(b[l])))
+			}
+		}
+	case "<":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] < b[l])
+			}
+		}
+	case ">":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] > b[l])
+			}
+		}
+	case "<=":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] <= b[l])
+			}
+		}
+	case ">=":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] >= b[l])
+			}
+		}
+	case "==":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] == b[l])
+			}
+		}
+	case "!=":
+		return func(d, a, b *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] != b[l])
+			}
+		}
+	}
+	return nil
+}
+
 func (c *compiler) arith(op string, x, y *cval, line int) *cval {
 	if !x.t.IsNumeric() || !y.t.IsNumeric() {
 		failf(line, "operator %s needs numeric operands, got %s and %s", op, x.t, y.t)
@@ -817,87 +945,25 @@ func (c *compiler) arith(op string, x, y *cval, line int) *cval {
 	x = c.convertTo(x, shape, line)
 	y = c.convertTo(y, shape, line)
 	rt := shape
-	cmp := false
 	switch op {
 	case "<", ">", "<=", ">=", "==", "!=":
 		rt = &Type{Base: BBool, Rows: rows, Cols: cols}
-		cmp = true
 	}
 	n := shape.Size()
 	tmp := c.temp(rt)
 	xe, ye, xo, yo := x.eval, y.eval, x.off, y.off
-	isInt := base == BInt
-	var f func(a, b float32) float32
-	switch op {
-	case "+":
-		f = func(a, b float32) float32 { return a + b }
-	case "-":
-		f = func(a, b float32) float32 { return a - b }
-	case "*":
-		f = func(a, b float32) float32 { return a * b }
-	case "/":
-		if isInt {
-			f = func(a, b float32) float32 {
-				if b == 0 {
-					return 0
-				}
-				return float32(int32(a) / int32(b))
-			}
-		} else {
-			f = func(a, b float32) float32 { return a / b }
-		}
-	case "%":
-		f = func(a, b float32) float32 { return float32(math.Mod(float64(a), float64(b))) }
-	case "<":
-		f = func(a, b float32) float32 { return b2f(a < b) }
-	case ">":
-		f = func(a, b float32) float32 { return b2f(a > b) }
-	case "<=":
-		f = func(a, b float32) float32 { return b2f(a <= b) }
-	case ">=":
-		f = func(a, b float32) float32 { return b2f(a >= b) }
-	case "==":
-		f = func(a, b float32) float32 { return b2f(a == b) }
-	case "!=":
-		f = func(a, b float32) float32 { return b2f(a != b) }
-	}
-	_ = cmp
-	// Specialise the common float ops to avoid an indirect call per component.
-	switch op {
-	case "+":
-		return &cval{t: rt, off: tmp, eval: func(m []float32) {
-			xe(m)
-			ye(m)
-			for i := 0; i < n; i++ {
-				m[tmp+i] = m[xo+i] + m[yo+i]
-			}
-		}}
-	case "-":
-		return &cval{t: rt, off: tmp, eval: func(m []float32) {
-			xe(m)
-			ye(m)
-			for i := 0; i < n; i++ {
-				m[tmp+i] = m[xo+i] - m[yo+i]
-			}
-		}}
-	case "*":
-		return &cval{t: rt, off: tmp, eval: func(m []float32) {
-			xe(m)
-			ye(m)
-			for i := 0; i < n; i++ {
-				m[tmp+i] = m[xo+i] * m[yo+i]
-			}
-		}}
-	}
-	return &cval{t: rt, off: tmp, eval: func(m []float32) {
-		xe(m)
-		ye(m)
+	f := arithOp(op, base == BInt)
+	return &cval{t: rt, off: tmp, eval: func(x *ctx) {
+		xe(x)
+		ye(x)
+		m := x.m
 		for i := 0; i < n; i++ {
-			m[tmp+i] = f(m[xo+i], m[yo+i])
+			f(&m[tmp+i], &m[xo+i], &m[yo+i])
 		}
 	}}
 }
 
+// condExpr evaluates each side for the executing lanes that select it.
 func (c *compiler) condExpr(e *CondExpr) *cval {
 	cond := c.convertTo(c.expr(e.Cond), tyBool, e.Line)
 	x, y := c.expr(e.X), c.expr(e.Y)
@@ -907,14 +973,29 @@ func (c *compiler) condExpr(e *CondExpr) *cval {
 	n := t.Size()
 	tmp := c.temp(t)
 	ce, xe, ye, co, xo, yo := cond.eval, x.eval, y.eval, cond.off, x.off, y.off
-	return &cval{t: t, off: tmp, eval: func(m []float32) {
-		ce(m)
-		if m[co] != 0 {
-			xe(m)
-			copy(m[tmp:tmp+n], m[xo:xo+n])
-		} else {
-			ye(m)
-			copy(m[tmp:tmp+n], m[yo:yo+n])
+	return &cval{t: t, off: tmp, eval: func(x *ctx) {
+		ce(x)
+		sel := laneBits(&x.m[co])
+		mask := x.mask
+		if mask&sel != 0 {
+			x.mask = mask & sel
+			xe(x)
+		}
+		if mask&^sel != 0 {
+			x.mask = mask &^ sel
+			ye(x)
+		}
+		x.mask = mask
+		m := x.m
+		for i := 0; i < n; i++ {
+			d, a, b := &m[tmp+i], &m[xo+i], &m[yo+i]
+			for l := range d {
+				if sel>>l&1 != 0 {
+					d[l] = a[l]
+				} else {
+					d[l] = b[l]
+				}
+			}
 		}
 	}}
 }
@@ -943,7 +1024,7 @@ func (c *compiler) convertTo(x *cval, t *Type, line int) *cval {
 		failf(line, "cannot convert %s to %s", x.t, t)
 	}
 	n := t.Size()
-	var idx []int // source component for each destination component (-1 = broadcast slot 0)
+	var idx []int // source component for each destination component
 	switch {
 	case x.t.IsScalar():
 		idx = make([]int, n)
@@ -971,19 +1052,33 @@ func (c *compiler) convertTo(x *cval, t *Type, line int) *cval {
 	}
 	tmp := c.temp(t)
 	xe, xo := x.eval, x.off
-	conv := func(v float32) float32 { return v }
-	switch t.Base {
-	case BInt:
-		if x.t.Base == BFloat {
-			conv = func(v float32) float32 { return float32(math.Trunc(float64(v))) }
+	var conv func(d, a *Lane)
+	switch {
+	case t.Base == BInt && x.t.Base == BFloat:
+		conv = func(d, a *Lane) {
+			for l := range d {
+				d[l] = float32(math.Trunc(float64(a[l])))
+			}
 		}
-	case BBool:
-		conv = func(v float32) float32 { return b2f(v != 0) }
+	case t.Base == BBool:
+		conv = func(d, a *Lane) {
+			for l := range d {
+				d[l] = b2f(a[l] != 0)
+			}
+		}
 	}
-	return &cval{t: t, off: tmp, eval: func(m []float32) {
-		xe(m)
+	if conv == nil {
+		return &cval{t: t, off: tmp, eval: func(x *ctx) {
+			xe(x)
+			for i, k := range idx {
+				x.m[tmp+i] = x.m[xo+k]
+			}
+		}}
+	}
+	return &cval{t: t, off: tmp, eval: func(x *ctx) {
+		xe(x)
 		for i, k := range idx {
-			m[tmp+i] = conv(m[xo+k])
+			conv(&x.m[tmp+i], &x.m[xo+k])
 		}
 	}}
 }
@@ -1011,7 +1106,7 @@ func (c *compiler) initList(il *InitListExpr, t *Type) *cval {
 	tmp := c.temp(t)
 	n := t.Size()
 	type part struct {
-		eval     func(m []float32)
+		eval     evalFn
 		off, len int
 	}
 	var parts []part
@@ -1026,11 +1121,11 @@ func (c *compiler) initList(il *InitListExpr, t *Type) *cval {
 	if total != n {
 		failf(il.Line, "initializer has %d components, %s needs %d", total, t, n)
 	}
-	return &cval{t: t, off: tmp, eval: func(m []float32) {
+	return &cval{t: t, off: tmp, eval: func(x *ctx) {
 		o := tmp
 		for _, p := range parts {
-			p.eval(m)
-			copy(m[o:o+p.len], m[p.off:p.off+p.len])
+			p.eval(x)
+			copy(x.m[o:o+p.len], x.m[p.off:p.off+p.len])
 			o += p.len
 		}
 	}}

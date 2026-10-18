@@ -960,6 +960,15 @@ func (s *Subsystem) drawOps(ops []queuedTri, ids []int32) {
 	s.drawSegment(ops[start:], ids)
 }
 
+// renderWorkers is the number of goroutines that shade and rasterize a frame. By default one
+// core is left to the emulator, which runs the next frame meanwhile; C32_RENDER_THREADS overrides.
+var renderWorkers = func() int {
+	if v, err := strconv.Atoi(os.Getenv("C32_RENDER_THREADS")); err == nil && v > 0 {
+		return v
+	}
+	return max(runtime.GOMAXPROCS(0)-1, 1)
+}()
+
 // Rasterization splits the target into bands of bandH rows. Each operation is binned into the
 // bands it touches; workers take bands as they free up, so uneven bands keep every core busy.
 const (
@@ -985,7 +994,7 @@ func (s *Subsystem) drawSegment(ops []queuedTri, ids []int32) {
 			s.bins[b] = append(s.bins[b], int32(i))
 		}
 	}
-	workers := min(runtime.GOMAXPROCS(0), numBands)
+	workers := min(renderWorkers, numBands)
 	for len(s.bandShaders) < workers {
 		s.bandShaders = append(s.bandShaders, new(progShader))
 	}
@@ -1118,6 +1127,7 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, list []int32, ids []int32, pi
 		x2, additive := qt.x2, qt.additive
 		zWrite := is3D && !additive
 		markIDs := ids != nil && !qt.tex0.fromRT
+		addBlack := additive && !sampleTex1 && !markIDs
 
 		for y := yStart; y <= yEnd; y++ {
 			rowIdx := y * ScreenWidth
@@ -1173,6 +1183,11 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, list []int32, ids []int32, pi
 					}
 					tp := texPixels[ty*texW+tx]
 					if tp == 0 && !isDXT1 && !sampleTex1 {
+						continue
+					}
+					if addBlack && tp&0xFFFFFF == 0 {
+						// Adding a black texel changes nothing (starfield layers are ~all black).
+						pix[zIdx*4+3] = 255
 						continue
 					}
 					tr, tg, tb = uint8(tp), uint8(tp>>8), uint8(tp>>16)
