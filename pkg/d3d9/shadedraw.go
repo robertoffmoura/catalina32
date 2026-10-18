@@ -113,7 +113,6 @@ func (s *Subsystem) queueRealDraw(c *cpu.CPU, primType, primCount uint32, order 
 	for _, i := range cmd.order {
 		cmd.need[i] = true
 	}
-	s.fbDirty = true
 	s.frameTris = append(s.frameTris, queuedTri{draw: cmd})
 }
 

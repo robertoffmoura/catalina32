@@ -166,7 +166,6 @@ func (s *Subsystem) queueProgDraw(c *cpu.CPU, primType uint32, order []uint32, b
 		d.need[i-minI] = true
 	}
 	d.verts = make([]progVertex, n)
-	s.fbDirty = true
 	s.frameTris = append(s.frameTris, queuedTri{pdraw: d})
 }
 

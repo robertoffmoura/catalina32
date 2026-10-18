@@ -223,7 +223,6 @@ type Subsystem struct {
 	TriangleCount  uint64
 	ClearCount     uint64
 	LastClearColor uint32
-	fbDirty        bool
 	TraceLog       bool
 	frameTris      []queuedTri
 	spareTris      []queuedTri    // buffer returned by the render goroutine for reuse
@@ -881,13 +880,17 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 43: // Clear(this, Count, pRects, Flags, Color, Z, Stencil)
 		s.ClearCount++
-		flags := c.Arg(3)
-		col := c.Arg(4)
+		count, pRects, flags, col, z := c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4), c.ArgF32(5)
 		s.LastClearColor = col
-		if s.rendering && s.fbDirty && s.FrameDrawCalls == 0 {
-			s.frameTris = s.frameTris[:0]
-			s.queueClear(col, flags&3)
-			s.fbDirty = false
+		if s.rendering {
+			if count == 0 || pRects == 0 {
+				s.queueClear(col, flags, z, 0, 0, ScreenWidth-1, ScreenHeight-1)
+			}
+			for i := uint32(0); i < count && pRects != 0 && i < 1024; i++ { // D3DRECT{x1, y1, x2, y2}, x2/y2 exclusive
+				r := pRects + i*16
+				s.queueClear(col, flags, z, int(int32(c.Read32(r))), int(int32(c.Read32(r+4))),
+					int(int32(c.Read32(r+8)))-1, int(int32(c.Read32(r+12)))-1)
+			}
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 48: // GetViewport(this, pViewport)
@@ -990,7 +993,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 				// Gameplay starts: draw this frame from here on.
 				s.rendering = true
 				s.frameTris = s.frameTris[:0]
-				s.queueClear(0xFF000000, 3)
+				s.queueClear(0xFF000000, 3, 1, 0, 0, ScreenWidth-1, ScreenHeight-1)
 			}
 		}
 		if s.rendering {

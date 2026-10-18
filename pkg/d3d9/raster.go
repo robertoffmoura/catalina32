@@ -83,8 +83,9 @@ type queuedTri struct {
 	draw         *drawCmd  // real-shader draw, expanded into triangles on the render goroutine
 	pdraw        *progDraw // bytecode-shader draw, expanded into prog triangles on the render goroutine
 	prog         *progTri  // bytecode-shader triangle (rasterized with its pixel shader)
-	clearFlags   uint32
+	clearFlags   uint32    // clearOp: D3DCLEAR_TARGET (1) | D3DCLEAR_ZBUFFER (2), over minX..maxX, minY..maxY
 	clearColor   uint32
+	clearZ       float32
 	minX, maxX   int
 	minY, maxY   int
 	invArea      float32
@@ -179,19 +180,24 @@ func (s *Subsystem) clearFramebuffer(argb uint32) {
 	}
 }
 
-// clearRows applies a Clear to framebuffer/Z rows y0..y1.
-func (s *Subsystem) clearRows(target []byte, argb, flags uint32, y0, y1 int) {
-	if flags&1 != 0 {
-		r, g, b := uint8(argb>>16), uint8(argb>>8), uint8(argb)
-		pix := target[y0*ScreenWidth*4 : (y1+1)*ScreenWidth*4]
-		for i := 0; i < len(pix); i += 4 {
-			pix[i+0], pix[i+1], pix[i+2], pix[i+3] = r, g, b, 0xFF
+// clearRows applies a clear operation to rows y0..y1 of the target and the depth buffer.
+func (s *Subsystem) clearRows(target []byte, op *queuedTri, y0, y1 int) {
+	x0, x1 := op.minX, op.maxX
+	for y := y0; y <= y1; y++ {
+		row := y * ScreenWidth
+		if op.clearFlags&1 != 0 {
+			argb := op.clearColor
+			r, g, b := uint8(argb>>16), uint8(argb>>8), uint8(argb)
+			pix := target[(row+x0)*4 : (row+x1+1)*4]
+			for i := 0; i < len(pix); i += 4 {
+				pix[i+0], pix[i+1], pix[i+2], pix[i+3] = r, g, b, 0xFF
+			}
 		}
-	}
-	if flags&2 != 0 {
-		z := s.ZBuffer[y0*ScreenWidth : (y1+1)*ScreenWidth]
-		for i := range z {
-			z[i] = 1.0
+		if op.clearFlags&2 != 0 {
+			z := s.ZBuffer[row+x0 : row+x1+1]
+			for i := range z {
+				z[i] = op.clearZ
+			}
 		}
 	}
 }
@@ -854,9 +860,22 @@ type frameInfo struct {
 }
 
 // queueClear records a Clear (D3DCLEAR_TARGET = 1, D3DCLEAR_ZBUFFER = 2) in draw order.
-func (s *Subsystem) queueClear(color, flags uint32) {
-	s.frameTris = append(s.frameTris, queuedTri{clearOp: true, clearFlags: flags, clearColor: color,
-		minY: 0, maxY: ScreenHeight - 1})
+// queueClear queues a clear of the current target's colour and/or depth over a rectangle
+// (inclusive bounds), in order with the draws. A full colour+depth clear makes clears queued just
+// before it (with nothing drawn in between) redundant; they are dropped so frames without draws
+// (loading screens) do not pile up clears. Target switches and copies are never dropped.
+func (s *Subsystem) queueClear(color, flags uint32, z float32, x0, y0, x1, y1 int) {
+	x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, ScreenWidth-1), min(y1, ScreenHeight-1)
+	if flags&3 == 0 || x0 > x1 || y0 > y1 {
+		return
+	}
+	if flags&3 == 3 && x0 == 0 && y0 == 0 && x1 == ScreenWidth-1 && y1 == ScreenHeight-1 {
+		for n := len(s.frameTris); n > 0 && s.frameTris[n-1].clearOp; n-- {
+			s.frameTris = s.frameTris[:n-1]
+		}
+	}
+	s.frameTris = append(s.frameTris, queuedTri{clearOp: true, clearFlags: flags & 3, clearColor: color, clearZ: z,
+		minX: x0, maxX: x1, minY: y0, maxY: y1})
 }
 
 // submitFrame hands the frame's queued operations to the render goroutine, which draws and exports
@@ -1018,7 +1037,7 @@ func (s *Subsystem) rasterizeBand(ops []queuedTri, list []int32, ids []int32, pi
 	for _, i := range list {
 		qt := &ops[i]
 		if qt.clearOp {
-			s.clearRows(pix, qt.clearColor, qt.clearFlags, bandMinY, bandMaxY)
+			s.clearRows(pix, qt, max(bandMinY, qt.minY), min(bandMaxY, qt.maxY))
 			continue
 		}
 		if qt.maxY < bandMinY || qt.minY > bandMaxY {
@@ -1298,7 +1317,6 @@ func (s *Subsystem) rasterizePrimitiveBatch(c *cpu.CPU, primType uint32, primCou
 	if s.drawLogging() {
 		defer s.logEmitted(c, len(s.frameTris), pVerts, stride, isUP)
 	}
-	s.fbDirty = true
 	if primCount > 1<<20 {
 		primCount = 1 << 20
 	}
@@ -1373,7 +1391,6 @@ func (s *Subsystem) rasterizeIndexedBatch(c *cpu.CPU, primType uint32, baseV int
 	if s.drawLogging() {
 		defer s.logEmitted(c, len(s.frameTris), pVerts, stride, isUP)
 	}
-	s.fbDirty = true
 	if primCount > 1<<20 {
 		primCount = 1 << 20
 	}
