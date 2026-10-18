@@ -6,3 +6,5 @@ bin/
 /catalina32
 .DS_Store
 /pkg/games/lswsaga/aot_gen.go
+/dist/
+/cmd/c32aot/testdata/

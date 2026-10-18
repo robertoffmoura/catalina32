@@ -73,6 +73,7 @@ func liftedNuMtxMul(c *cpu.CPU) {
 	for i := 0; i < 16; i++ {
 		c.WriteF32(pOut+uint32(i*4), out[i])
 	}
+	c.Regs[cpu.RegEAX] = pOut // as the guest code leaves it
 	c.Ret()
 }
 
@@ -980,6 +981,7 @@ func liftedNuVecMtxTransform(c *cpu.CPU) {
 	c.WriteF32(out, ox)
 	c.WriteF32(out+4, oy)
 	c.WriteF32(out+8, oz)
+	c.Regs[cpu.RegEAX] = out // as the guest code leaves it
 	c.Ret()
 }
 
@@ -994,6 +996,7 @@ func liftedNuVecMtxRotate(c *cpu.CPU) {
 	c.WriteF32(out, ox)
 	c.WriteF32(out+4, oy)
 	c.WriteF32(out+8, oz)
+	c.Regs[cpu.RegEAX] = out // as the guest code leaves it
 	c.Ret()
 }
 
@@ -1002,7 +1005,7 @@ func liftedNuSqrt(c *cpu.CPU) {
 	if x <= 0 {
 		c.FPUPush(0)
 	} else {
-		c.FPUPush(math.Sqrt(float64(x)))
+		c.FPUPush(float64(float32(math.Sqrt(float64(x))))) // the guest uses sqrtss: a float32 result
 	}
 	c.Ret()
 }
