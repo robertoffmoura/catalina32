@@ -2066,12 +2066,32 @@ func (c *CPU) CallGuest(fnAddr uint32, args ...uint32) (uint32, error) {
 	c.Push32(SentinelReturnEIP)
 	c.EIP = fnAddr
 
+	depth := c.traceHostCall(fnAddr, savedEIP)
 	c.NestDepth++
 	err := c.RunUntil(SentinelReturnEIP)
 	c.NestDepth--
+	c.endHostCall(depth)
 	c.Regs[RegESP] = savedESP
 	c.EIP = savedEIP
 	return c.Regs[RegEAX], err
+}
+
+// traceHostCall records a call frame for a host-initiated guest call (when tracing calls), so the
+// callee's RET pops its own frame rather than its caller's. It returns the depth to restore.
+func (c *CPU) traceHostCall(fnAddr, callerEIP uint32) int {
+	depth := len(c.CallStack)
+	if c.TraceCalls {
+		c.CallStack = append(c.CallStack, CallFrame{CallerEIP: callerEIP, TargetEIP: fnAddr, ESP: c.Regs[RegESP]})
+		c.VisitedFuncs[fnAddr]++
+	}
+	return depth
+}
+
+// endHostCall drops frames a host-initiated call left behind (e.g. it stopped early).
+func (c *CPU) endHostCall(depth int) {
+	if len(c.CallStack) > depth {
+		c.CallStack = c.CallStack[:depth]
+	}
 }
 
 func (c *CPU) CallGuestNested(fnAddr uint32, args ...uint32) (uint32, error) {
@@ -2089,9 +2109,11 @@ func (c *CPU) CallGuestNested(fnAddr uint32, args ...uint32) (uint32, error) {
 	c.Push32(stopEIP)
 	c.EIP = fnAddr
 
+	depth := c.traceHostCall(fnAddr, savedEIP)
 	c.NestDepth++
 	err := c.RunUntil(stopEIP)
 	c.NestDepth--
+	c.endHostCall(depth)
 	if err != nil {
 		return 0, err
 	}
