@@ -28,6 +28,7 @@ type BufferDesc struct {
 	Width         uint32
 	Height        uint32
 	Pitch         uint32
+	Depth         uint32 // volume textures
 	Pixels        []uint32
 	Channels      uint16
 	SampleRate    uint32
@@ -409,7 +410,7 @@ func (s *Subsystem) allocSurface(c *cpu.CPU, width, height, format uint32) uint3
 		height = 64
 	}
 	obj := s.allocCOMObject(c, s.vtSurface9, 32)
-	pitch := width * 4
+	pitch := texPitch(width, format)
 	bufSize := lockSize(pitch, height, format)
 	// Guest backing store is allocated lazily (guestBuf on LockRect): GetSurfaceLevel is called every frame and
 	// eagerly reserving a 3.6MB buffer each time exhausted the guest heap after ~2800 frames.
@@ -437,10 +438,44 @@ func (s *Subsystem) allocTextureLazy(c *cpu.CPU, width, height, format uint32) u
 		height = 64
 	}
 	obj := s.allocCOMObject(c, s.vtTexture9, 32)
-	pitch := width * 4
+	pitch := texPitch(width, format)
 	bufSize := lockSize(pitch, height, format)
 	s.Resources[obj] = &BufferDesc{Length: bufSize, Format: format, Width: width, Height: height, Pitch: pitch}
 	return obj
+}
+
+// texPitch is the row pitch LockRect reports for a level w texels wide: the layout
+// decodeTexturePixels reads (rows of 4x4 blocks for DXT, one byte per texel for L8/A8/P8, four
+// bytes otherwise).
+func texPitch(w, format uint32) uint32 {
+	switch {
+	case format == 0x31545844: // DXT1: 8 bytes per block
+		return max((w+3)/4, 1) * 8
+	case isDXT(format):
+		return max((w+3)/4, 1) * 16
+	case format == 50 || format == 28 || format == 41: // L8, A8, P8
+		return w
+	}
+	return w * 4
+}
+
+// texRows is the number of pitch-sized rows in a level h texels high.
+func texRows(h, format uint32) uint32 {
+	if isDXT(format) {
+		return (h + 3) / 4
+	}
+	return h
+}
+
+// mipScratch returns the shared buffer that locks of lower mip levels write into (those levels
+// are not sampled), grown to at least need bytes.
+func (s *Subsystem) mipScratch(c *cpu.CPU, need uint32) uint32 {
+	need = max(need, 1<<20)
+	if need > s.mipScratchLen {
+		c.Free(s.mipScratchBuf)
+		s.mipScratchBuf, s.mipScratchLen = c.Malloc(need), need
+	}
+	return s.mipScratchBuf
 }
 
 // isDXT reports whether format is a block-compressed FourCC format (DXT1..DXT5).
@@ -452,11 +487,7 @@ func isDXT(format uint32) bool {
 // LockRect with the pitch we report (rows of 4x4 blocks for DXT formats). Sizes up to 4 MB keep
 // the historical rounding (pitch*height, capped), so guest heap layout is unchanged for them.
 func lockSize(pitch, height, format uint32) uint32 {
-	rows := height
-	if isDXT(format) {
-		rows = (height + 3) / 4
-	}
-	return max(min(pitch*height, 4<<20), pitch*rows)
+	return max(min(pitch*height, 4<<20), pitch*texRows(height, format))
 }
 
 // guestBuf returns the resource's guest-memory backing store, allocating it on first use.
@@ -766,9 +797,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		fmtCode := c.Arg(6)
 		pp := c.Arg(8)
 		tex := s.allocCOMObject(c, s.vtVolTex9, 32)
-		size := max(65536, lockSize(w*4, h, fmtCode)*max(c.Arg(3), 1))
+		pitch := texPitch(w, fmtCode)
+		size := max(65536, lockSize(pitch, h, fmtCode)*max(c.Arg(3), 1))
 		buf := c.Malloc(size)
-		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: w, Height: h, Pitch: w * 4}
+		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: w, Height: h, Depth: max(c.Arg(3), 1), Pitch: pitch}
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -778,9 +810,10 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		fmtCode := c.Arg(4)
 		pp := c.Arg(6)
 		tex := s.allocCOMObject(c, s.vtCubeTex9, 32)
-		size := max(65536, lockSize(edge*4, edge, fmtCode)) // all faces share one buffer
+		pitch := texPitch(edge, fmtCode)
+		size := max(65536, 6*lockSize(pitch, edge, fmtCode)) // six faces, one after another
 		buf := c.Malloc(size)
-		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: edge, Height: edge, Pitch: edge * 4}
+		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: edge, Height: edge, Pitch: pitch}
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -1223,21 +1256,14 @@ func (s *Subsystem) handleIDirect3DTexture9(c *cpu.CPU, winSlot int) {
 		pLock := c.Arg(2)
 		res := s.Resources[thisPtr]
 		if pLock != 0 && res != nil {
-			var buf uint32
 			if lvl == 0 {
-				buf = s.guestBuf(c, res)
+				c.Write32(pLock+0, res.Pitch)
+				c.Write32(pLock+4, s.guestBuf(c, res))
 			} else {
-				// Lower mip levels are not sampled: they all go to one scratch buffer, grown to
-				// the largest level locked so far.
-				need := max(lockSize(res.Pitch, max(res.Height>>lvl, 1), res.Format), 1<<20)
-				if need > s.mipScratchLen {
-					c.Free(s.mipScratchBuf)
-					s.mipScratchBuf, s.mipScratchLen = c.Malloc(need), need
-				}
-				buf = s.mipScratchBuf
+				pitch := texPitch(max(res.Width>>lvl, 1), res.Format)
+				c.Write32(pLock+0, pitch)
+				c.Write32(pLock+4, s.mipScratch(c, lockSize(pitch, max(res.Height>>lvl, 1), res.Format)))
 			}
-			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, buf)
 		}
 	case 20: // UnlockRect(this, Level)
 		if c.Arg(1) == 0 {
@@ -1264,11 +1290,17 @@ func (s *Subsystem) handleIDirect3DCubeTexture9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, s.child(c, thisPtr, face<<16|lvl, func() uint32 { return s.allocSurface(c, 64, 64, 21) }))
 		}
 	case 19: // LockRect(this, FaceType, Level, pLockedRect, pRect, Flags)
-		pLock := c.Arg(3)
+		face, lvl, pLock := min(c.Arg(1), 5), c.Arg(2), c.Arg(3)
 		res := s.Resources[thisPtr]
 		if pLock != 0 && res != nil {
-			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, s.guestBuf(c, res))
+			if lvl == 0 { // each face has its own slice of the buffer
+				c.Write32(pLock+0, res.Pitch)
+				c.Write32(pLock+4, s.guestBuf(c, res)+face*lockSize(res.Pitch, res.Height, res.Format))
+			} else {
+				pitch := texPitch(max(res.Width>>lvl, 1), res.Format)
+				c.Write32(pLock+0, pitch)
+				c.Write32(pLock+4, s.mipScratch(c, lockSize(pitch, max(res.Height>>lvl, 1), res.Format)))
+			}
 		}
 	case 20: // UnlockRect(this, FaceType, Level)
 		if c.Arg(2) == 0 {
@@ -1289,10 +1321,17 @@ func (s *Subsystem) handleIDirect3DVolumeTexture9(c *cpu.CPU, winSlot int) {
 	case 19: // LockBox(this, Level, pLockedVolume, pBox, Flags)
 		pLock := c.Arg(2)
 		res := s.Resources[thisPtr]
-		if pLock != 0 && res != nil {
-			c.Write32(pLock+0, res.Pitch)
-			c.Write32(pLock+4, res.Pitch*res.Height)
-			c.Write32(pLock+8, s.guestBuf(c, res))
+		if lvl := c.Arg(1); pLock != 0 && res != nil {
+			w, h := max(res.Width>>lvl, 1), max(res.Height>>lvl, 1)
+			pitch := texPitch(w, res.Format)
+			slice := pitch * texRows(h, res.Format)
+			c.Write32(pLock+0, pitch)
+			c.Write32(pLock+4, slice)
+			if lvl == 0 {
+				c.Write32(pLock+8, s.guestBuf(c, res))
+			} else { // lower levels are not sampled
+				c.Write32(pLock+8, s.mipScratch(c, slice*max(res.Depth>>lvl, 1)))
+			}
 		}
 	case 20: // UnlockBox(this, Level)
 		if c.Arg(1) == 0 {
