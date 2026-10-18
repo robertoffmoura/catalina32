@@ -1,7 +1,6 @@
 package crt
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -159,8 +158,10 @@ func lookupCRTThunk(sym string) cpu.ThunkFunc {
 		return thunkAtoi
 	case "_atof":
 		return thunkAtof
-	case "_strtol", "_strtoul":
+	case "_strtol":
 		return thunkStrtol
+	case "_strtoul":
+		return thunkStrtoul
 	case "_qsort":
 		return thunkQsort
 	case "_rand", "_random":
@@ -306,227 +307,6 @@ func thunkCalloc(c *cpu.CPU) {
 
 func thunkRealloc(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = c.Realloc(c.Arg(0), c.Arg(1))
-	c.Ret()
-}
-
-func thunkBzero(c *cpu.CPU) {
-	dst := c.Arg(0)
-	sz := c.Arg(1)
-	if dst != 0 && sz > 0 {
-		clear(c.Mem[dst : dst+sz])
-	}
-	c.Ret()
-}
-
-func thunkMemset(c *cpu.CPU) {
-	dst := c.Arg(0)
-	val := uint8(c.Arg(1))
-	sz := c.Arg(2)
-	if dst != 0 && sz > 0 {
-		s := c.Mem[dst : dst+sz]
-		for i := range s {
-			s[i] = val
-		}
-	}
-	c.Regs[cpu.RegEAX] = dst
-	c.Ret()
-}
-
-func thunkMemsetPattern16(c *cpu.CPU) {
-	dst := c.Arg(0)
-	pat := c.Arg(1)
-	sz := c.Arg(2)
-	if dst != 0 && pat != 0 && sz > 0 {
-		p := c.Mem[pat : pat+16]
-		for off := uint32(0); off < sz; off += 16 {
-			rem := sz - off
-			if rem > 16 {
-				rem = 16
-			}
-			copy(c.Mem[dst+off:dst+off+rem], p[:rem])
-		}
-	}
-	c.Ret()
-}
-
-func thunkMemcpy(c *cpu.CPU) {
-	dst := c.Arg(0)
-	src := c.Arg(1)
-	sz := c.Arg(2)
-	if dst != 0 && src != 0 && sz > 0 {
-		copy(c.Mem[dst:dst+sz], c.Mem[src:src+sz])
-	}
-	c.Regs[cpu.RegEAX] = dst
-	c.Ret()
-}
-
-func thunkMemcmp(c *cpu.CPU) {
-	s1 := c.Arg(0)
-	s2 := c.Arg(1)
-	sz := c.Arg(2)
-	cmp := bytes.Compare(c.Mem[s1:s1+sz], c.Mem[s2:s2+sz])
-	c.Regs[cpu.RegEAX] = uint32(int32(cmp))
-	c.Ret()
-}
-
-func thunkMemchr(c *cpu.CPU) {
-	s := c.Arg(0)
-	ch := byte(c.Arg(1))
-	sz := c.Arg(2)
-	idx := bytes.IndexByte(c.Mem[s:s+sz], ch)
-	if idx < 0 {
-		c.Regs[cpu.RegEAX] = 0
-	} else {
-		c.Regs[cpu.RegEAX] = s + uint32(idx)
-	}
-	c.Ret()
-}
-
-func thunkStrlen(c *cpu.CPU) {
-	s := c.ReadCString(c.Arg(0))
-	c.Regs[cpu.RegEAX] = uint32(len(s))
-	c.Ret()
-}
-
-func thunkStrcpy(c *cpu.CPU) {
-	dst := c.Arg(0)
-	src := c.ReadCString(c.Arg(1))
-	c.WriteCString(dst, src)
-	c.Regs[cpu.RegEAX] = dst
-	c.Ret()
-}
-
-func thunkStrncpy(c *cpu.CPU) {
-	dst := c.Arg(0)
-	src := c.ReadCString(c.Arg(1))
-	n := int(c.Arg(2))
-	for i := 0; i < n; i++ {
-		if i < len(src) {
-			c.Mem[dst+uint32(i)] = src[i]
-		} else {
-			c.Mem[dst+uint32(i)] = 0
-		}
-	}
-	c.Regs[cpu.RegEAX] = dst
-	c.Ret()
-}
-
-func thunkStrcat(c *cpu.CPU) {
-	dst := c.Arg(0)
-	s1 := c.ReadCString(dst)
-	s2 := c.ReadCString(c.Arg(1))
-	c.WriteCString(dst, s1+s2)
-	c.Regs[cpu.RegEAX] = dst
-	c.Ret()
-}
-
-func thunkStrncat(c *cpu.CPU) {
-	dst := c.Arg(0)
-	s1 := c.ReadCString(dst)
-	s2 := c.ReadCString(c.Arg(1))
-	n := int(c.Arg(2))
-	if len(s2) > n {
-		s2 = s2[:n]
-	}
-	c.WriteCString(dst, s1+s2)
-	c.Regs[cpu.RegEAX] = dst
-	c.Ret()
-}
-
-func thunkStrcmp(c *cpu.CPU) {
-	s1 := c.ReadCString(c.Arg(0))
-	s2 := c.ReadCString(c.Arg(1))
-	c.Regs[cpu.RegEAX] = uint32(int32(strings.Compare(s1, s2)))
-	c.Ret()
-}
-
-func thunkStrncmp(c *cpu.CPU) {
-	s1 := c.ReadCString(c.Arg(0))
-	s2 := c.ReadCString(c.Arg(1))
-	n := int(c.Arg(2))
-	if len(s1) > n {
-		s1 = s1[:n]
-	}
-	if len(s2) > n {
-		s2 = s2[:n]
-	}
-	c.Regs[cpu.RegEAX] = uint32(int32(strings.Compare(s1, s2)))
-	c.Ret()
-}
-
-func thunkStrcasecmp(c *cpu.CPU) {
-	s1 := strings.ToLower(c.ReadCString(c.Arg(0)))
-	s2 := strings.ToLower(c.ReadCString(c.Arg(1)))
-	c.Regs[cpu.RegEAX] = uint32(int32(strings.Compare(s1, s2)))
-	c.Ret()
-}
-
-func thunkStrncasecmp(c *cpu.CPU) {
-	s1 := c.ReadCString(c.Arg(0))
-	s2 := c.ReadCString(c.Arg(1))
-	n := int(c.Arg(2))
-	if len(s1) > n {
-		s1 = s1[:n]
-	}
-	if len(s2) > n {
-		s2 = s2[:n]
-	}
-	c.Regs[cpu.RegEAX] = uint32(int32(strings.Compare(strings.ToLower(s1), strings.ToLower(s2))))
-	c.Ret()
-}
-
-func thunkStrstr(c *cpu.CPU) {
-	hAddr := c.Arg(0)
-	h := c.ReadCString(hAddr)
-	n := c.ReadCString(c.Arg(1))
-	idx := strings.Index(h, n)
-	if idx < 0 {
-		c.Regs[cpu.RegEAX] = 0
-	} else {
-		c.Regs[cpu.RegEAX] = hAddr + uint32(idx)
-	}
-	c.Ret()
-}
-
-func thunkStrchr(c *cpu.CPU) {
-	sAddr := c.Arg(0)
-	s := c.ReadCString(sAddr)
-	ch := byte(c.Arg(1))
-	if ch == 0 {
-		c.Regs[cpu.RegEAX] = sAddr + uint32(len(s))
-	} else {
-		idx := strings.IndexByte(s, ch)
-		if idx < 0 {
-			c.Regs[cpu.RegEAX] = 0
-		} else {
-			c.Regs[cpu.RegEAX] = sAddr + uint32(idx)
-		}
-	}
-	c.Ret()
-}
-
-func thunkStrrchr(c *cpu.CPU) {
-	sAddr := c.Arg(0)
-	s := c.ReadCString(sAddr)
-	ch := byte(c.Arg(1))
-	if ch == 0 {
-		c.Regs[cpu.RegEAX] = sAddr + uint32(len(s))
-	} else {
-		idx := strings.LastIndexByte(s, ch)
-		if idx < 0 {
-			c.Regs[cpu.RegEAX] = 0
-		} else {
-			c.Regs[cpu.RegEAX] = sAddr + uint32(idx)
-		}
-	}
-	c.Ret()
-}
-
-func thunkStrdup(c *cpu.CPU) {
-	s := c.ReadCString(c.Arg(0))
-	ptr := c.Malloc(uint32(len(s) + 1))
-	c.WriteCString(ptr, s)
-	c.Regs[cpu.RegEAX] = ptr
 	c.Ret()
 }
 
@@ -728,86 +508,6 @@ func thunkPrintf(c *cpu.CPU) {
 	c.Ret()
 }
 
-func thunkSscanf(c *cpu.CPU) {
-	input := c.ReadCString(c.Arg(0))
-	format := c.ReadCString(c.Arg(1))
-	vaPtr := c.Regs[cpu.RegESP] + 12
-	matched := 0
-	fields := strings.Fields(input)
-	fIdx := 0
-	for i := 0; i < len(format) && fIdx < len(fields); i++ {
-		if format[i] != '%' {
-			continue
-		}
-		i++
-		if i >= len(format) || format[i] == '%' {
-			continue
-		}
-		for i < len(format) && strings.ContainsRune("*0123456789hl", rune(format[i])) {
-			i++
-		}
-		if i >= len(format) {
-			break
-		}
-		outPtr := c.Read32(vaPtr)
-		vaPtr += 4
-		switch format[i] {
-		case 'd', 'i', 'u':
-			if v, err := strconv.ParseInt(fields[fIdx], 0, 64); err == nil {
-				c.Write32(outPtr, uint32(v))
-				matched++
-				fIdx++
-			}
-		case 'x', 'X':
-			if v, err := strconv.ParseUint(fields[fIdx], 16, 32); err == nil {
-				c.Write32(outPtr, uint32(v))
-				matched++
-				fIdx++
-			}
-		case 'f', 'g', 'e':
-			if v, err := strconv.ParseFloat(fields[fIdx], 32); err == nil {
-				c.WriteF32(outPtr, float32(v))
-				matched++
-				fIdx++
-			}
-		case 's':
-			c.WriteCString(outPtr, fields[fIdx])
-			matched++
-			fIdx++
-		}
-	}
-	c.Regs[cpu.RegEAX] = uint32(matched)
-	c.Ret()
-}
-
-func thunkAtoi(c *cpu.CPU) {
-	s := strings.TrimSpace(c.ReadCString(c.Arg(0)))
-	v, _ := strconv.ParseInt(s, 10, 32)
-	c.Regs[cpu.RegEAX] = uint32(int32(v))
-	c.Ret()
-}
-
-func thunkAtof(c *cpu.CPU) {
-	s := strings.TrimSpace(c.ReadCString(c.Arg(0)))
-	v, _ := strconv.ParseFloat(s, 64)
-	c.FPUPush(v)
-	c.Ret()
-}
-
-func thunkStrtol(c *cpu.CPU) {
-	sAddr := c.Arg(0)
-	endPtr := c.Arg(1)
-	base := int(c.Arg(2))
-	s := c.ReadCString(sAddr)
-	trimmed := strings.TrimLeft(s, " \t\r\n")
-	v, _ := strconv.ParseInt(trimmed, base, 64)
-	if endPtr != 0 {
-		c.Write32(endPtr, sAddr+uint32(len(s)))
-	}
-	c.Regs[cpu.RegEAX] = uint32(v)
-	c.Ret()
-}
-
 func thunkQsort(c *cpu.CPU) {
 	base := c.Arg(0)
 	nmemb := int(c.Arg(1))
@@ -961,8 +661,7 @@ func thunkIsNanD(c *cpu.CPU) {
 }
 
 func thunkFixUnsSfDi(c *cpu.CPU) {
-	f := c.ArgF32(0)
-	u := uint64(f)
+	u := fixUns64(float64(c.ArgF32(0)))
 	c.Regs[cpu.RegEAX] = uint32(u)
 	c.Regs[cpu.RegEDX] = uint32(u >> 32)
 	c.Ret()
@@ -1024,8 +723,34 @@ func thunkFix2X(c *cpu.CPU) {
 
 func thunkX2Fix(c *cpu.CPU) {
 	x := c.ReadF64(c.Regs[cpu.RegESP] + 4)
-	c.Regs[cpu.RegEAX] = uint32(int32(x * 65536.0))
+	c.Regs[cpu.RegEAX] = uint32(x2Fix(x))
 	c.Ret()
+}
+
+// fixUns64 converts like compiler-rt's __fixunssfdi: negative and NaN give 0, too large saturates
+// (Go leaves these cases to the host, and amd64 and arm64 differ).
+func fixUns64(f float64) uint64 {
+	switch {
+	case !(f > 0):
+		return 0
+	case f >= 1<<64:
+		return math.MaxUint64
+	}
+	return uint64(f)
+}
+
+// x2Fix converts to 16.16 fixed point like the Mac Toolbox X2Fix, which saturates.
+func x2Fix(x float64) int32 {
+	v := math.Trunc(x * 65536)
+	switch {
+	case v >= math.MaxInt32:
+		return math.MaxInt32
+	case v <= math.MinInt32:
+		return math.MinInt32
+	case v != v:
+		return math.MinInt32
+	}
+	return int32(v)
 }
 
 func thunkCxaAtexit(c *cpu.CPU) {
@@ -1270,4 +995,3 @@ func thunkVorbisBookDecodevvAdd(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
 }
-
