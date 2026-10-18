@@ -45,14 +45,20 @@ type mdctState struct {
 var mdct = &mdctState{tables: map[uint32]*mdctTables{}, seenN: map[int]bool{}, verify: os.Getenv("C32_VERIFY_MDCT") == "1"}
 
 func guestF32s(c *cpu.CPU, addr uint32, dst []float32) {
-	m := c.Mem[addr : addr+uint32(len(dst))*4]
+	m := c.Bytes(addr, uint32(len(dst))*4)
+	if m == nil {
+		return
+	}
 	for i := range dst {
 		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(m[i*4:]))
 	}
 }
 
 func putGuestF32s(c *cpu.CPU, addr uint32, src []float32) {
-	m := c.Mem[addr : addr+uint32(len(src))*4]
+	m := c.WBytes(addr, uint32(len(src))*4)
+	if m == nil {
+		return
+	}
 	for i, v := range src {
 		binary.LittleEndian.PutUint32(m[i*4:], math.Float32bits(v))
 	}
@@ -123,6 +129,10 @@ func thunkMdctBackward(c *cpu.CPU) {
 	c.Ret()
 }
 
+// Every product below is wrapped in float32(): an explicit conversion rounds it, so the Go
+// compiler cannot fuse it into a following add (arm64 FMA) and audio decodes identically on
+// Intel and Apple Silicon.
+
 // mdctBackward computes the inverse MDCT of in[0:n/2] into out[0:n] (in and out must not alias).
 func mdctBackward(t *mdctTables, in, out []float32) {
 	n := t.n
@@ -136,10 +146,10 @@ func mdctBackward(t *mdctTables, in, out []float32) {
 	T := n4
 	for {
 		oX -= 4
-		out[oX+0] = -in[iX+2]*trig[T+3] - in[iX+0]*trig[T+2]
-		out[oX+1] = in[iX+0]*trig[T+3] - in[iX+2]*trig[T+2]
-		out[oX+2] = -in[iX+6]*trig[T+1] - in[iX+4]*trig[T+0]
-		out[oX+3] = in[iX+4]*trig[T+1] - in[iX+6]*trig[T+0]
+		out[oX+0] = -float32(in[iX+2]*trig[T+3]) - float32(in[iX+0]*trig[T+2])
+		out[oX+1] = float32(in[iX+0]*trig[T+3]) - float32(in[iX+2]*trig[T+2])
+		out[oX+2] = -float32(in[iX+6]*trig[T+1]) - float32(in[iX+4]*trig[T+0])
+		out[oX+3] = float32(in[iX+4]*trig[T+1]) - float32(in[iX+6]*trig[T+0])
 		iX -= 8
 		T += 4
 		if iX < 0 {
@@ -152,10 +162,10 @@ func mdctBackward(t *mdctTables, in, out []float32) {
 	T = n4
 	for {
 		T -= 4
-		out[oX+0] = in[iX+4]*trig[T+3] + in[iX+6]*trig[T+2]
-		out[oX+1] = in[iX+4]*trig[T+2] - in[iX+6]*trig[T+3]
-		out[oX+2] = in[iX+0]*trig[T+1] + in[iX+2]*trig[T+0]
-		out[oX+3] = in[iX+0]*trig[T+0] - in[iX+2]*trig[T+1]
+		out[oX+0] = float32(in[iX+4]*trig[T+3]) + float32(in[iX+6]*trig[T+2])
+		out[oX+1] = float32(in[iX+4]*trig[T+2]) - float32(in[iX+6]*trig[T+3])
+		out[oX+2] = float32(in[iX+0]*trig[T+1]) + float32(in[iX+2]*trig[T+0])
+		out[oX+3] = float32(in[iX+0]*trig[T+0]) - float32(in[iX+2]*trig[T+1])
 		iX -= 8
 		oX += 4
 		if iX < 0 {
@@ -173,14 +183,14 @@ func mdctBackward(t *mdctTables, in, out []float32) {
 	T = n2
 	for {
 		oX1 -= 4
-		out[oX1+3] = out[iX+0]*trig[T+1] - out[iX+1]*trig[T+0]
-		out[oX2+0] = -(out[iX+0]*trig[T+0] + out[iX+1]*trig[T+1])
-		out[oX1+2] = out[iX+2]*trig[T+3] - out[iX+3]*trig[T+2]
-		out[oX2+1] = -(out[iX+2]*trig[T+2] + out[iX+3]*trig[T+3])
-		out[oX1+1] = out[iX+4]*trig[T+5] - out[iX+5]*trig[T+4]
-		out[oX2+2] = -(out[iX+4]*trig[T+4] + out[iX+5]*trig[T+5])
-		out[oX1+0] = out[iX+6]*trig[T+7] - out[iX+7]*trig[T+6]
-		out[oX2+3] = -(out[iX+6]*trig[T+6] + out[iX+7]*trig[T+7])
+		out[oX1+3] = float32(out[iX+0]*trig[T+1]) - float32(out[iX+1]*trig[T+0])
+		out[oX2+0] = -(float32(out[iX+0]*trig[T+0]) + float32(out[iX+1]*trig[T+1]))
+		out[oX1+2] = float32(out[iX+2]*trig[T+3]) - float32(out[iX+3]*trig[T+2])
+		out[oX2+1] = -(float32(out[iX+2]*trig[T+2]) + float32(out[iX+3]*trig[T+3]))
+		out[oX1+1] = float32(out[iX+4]*trig[T+5]) - float32(out[iX+5]*trig[T+4])
+		out[oX2+2] = -(float32(out[iX+4]*trig[T+4]) + float32(out[iX+5]*trig[T+5]))
+		out[oX1+0] = float32(out[iX+6]*trig[T+7]) - float32(out[iX+7]*trig[T+6])
+		out[oX2+3] = -(float32(out[iX+6]*trig[T+6]) + float32(out[iX+7]*trig[T+7]))
 		oX2 += 4
 		iX += 8
 		T += 8
@@ -256,29 +266,29 @@ func mdctButterflyFirst(T []float32, x []float32, points int) {
 		r1 := x[x1+7] - x[x2+7]
 		x[x1+6] += x[x2+6]
 		x[x1+7] += x[x2+7]
-		x[x2+6] = r1*T[t+1] + r0*T[t+0]
-		x[x2+7] = r1*T[t+0] - r0*T[t+1]
+		x[x2+6] = float32(r1*T[t+1]) + float32(r0*T[t+0])
+		x[x2+7] = float32(r1*T[t+0]) - float32(r0*T[t+1])
 
 		r0 = x[x1+4] - x[x2+4]
 		r1 = x[x1+5] - x[x2+5]
 		x[x1+4] += x[x2+4]
 		x[x1+5] += x[x2+5]
-		x[x2+4] = r1*T[t+5] + r0*T[t+4]
-		x[x2+5] = r1*T[t+4] - r0*T[t+5]
+		x[x2+4] = float32(r1*T[t+5]) + float32(r0*T[t+4])
+		x[x2+5] = float32(r1*T[t+4]) - float32(r0*T[t+5])
 
 		r0 = x[x1+2] - x[x2+2]
 		r1 = x[x1+3] - x[x2+3]
 		x[x1+2] += x[x2+2]
 		x[x1+3] += x[x2+3]
-		x[x2+2] = r1*T[t+9] + r0*T[t+8]
-		x[x2+3] = r1*T[t+8] - r0*T[t+9]
+		x[x2+2] = float32(r1*T[t+9]) + float32(r0*T[t+8])
+		x[x2+3] = float32(r1*T[t+8]) - float32(r0*T[t+9])
 
 		r0 = x[x1+0] - x[x2+0]
 		r1 = x[x1+1] - x[x2+1]
 		x[x1+0] += x[x2+0]
 		x[x1+1] += x[x2+1]
-		x[x2+0] = r1*T[t+13] + r0*T[t+12]
-		x[x2+1] = r1*T[t+12] - r0*T[t+13]
+		x[x2+0] = float32(r1*T[t+13]) + float32(r0*T[t+12])
+		x[x2+1] = float32(r1*T[t+12]) - float32(r0*T[t+13])
 
 		x1 -= 8
 		x2 -= 8
@@ -298,32 +308,32 @@ func mdctButterflyGeneric(T []float32, x []float32, points, trigint int) {
 		r1 := x[x1+7] - x[x2+7]
 		x[x1+6] += x[x2+6]
 		x[x1+7] += x[x2+7]
-		x[x2+6] = r1*T[t+1] + r0*T[t+0]
-		x[x2+7] = r1*T[t+0] - r0*T[t+1]
+		x[x2+6] = float32(r1*T[t+1]) + float32(r0*T[t+0])
+		x[x2+7] = float32(r1*T[t+0]) - float32(r0*T[t+1])
 		t += trigint
 
 		r0 = x[x1+4] - x[x2+4]
 		r1 = x[x1+5] - x[x2+5]
 		x[x1+4] += x[x2+4]
 		x[x1+5] += x[x2+5]
-		x[x2+4] = r1*T[t+1] + r0*T[t+0]
-		x[x2+5] = r1*T[t+0] - r0*T[t+1]
+		x[x2+4] = float32(r1*T[t+1]) + float32(r0*T[t+0])
+		x[x2+5] = float32(r1*T[t+0]) - float32(r0*T[t+1])
 		t += trigint
 
 		r0 = x[x1+2] - x[x2+2]
 		r1 = x[x1+3] - x[x2+3]
 		x[x1+2] += x[x2+2]
 		x[x1+3] += x[x2+3]
-		x[x2+2] = r1*T[t+1] + r0*T[t+0]
-		x[x2+3] = r1*T[t+0] - r0*T[t+1]
+		x[x2+2] = float32(r1*T[t+1]) + float32(r0*T[t+0])
+		x[x2+3] = float32(r1*T[t+0]) - float32(r0*T[t+1])
 		t += trigint
 
 		r0 = x[x1+0] - x[x2+0]
 		r1 = x[x1+1] - x[x2+1]
 		x[x1+0] += x[x2+0]
 		x[x1+1] += x[x2+1]
-		x[x2+0] = r1*T[t+1] + r0*T[t+0]
-		x[x2+1] = r1*T[t+0] - r0*T[t+1]
+		x[x2+0] = float32(r1*T[t+1]) + float32(r0*T[t+0])
+		x[x2+1] = float32(r1*T[t+0]) - float32(r0*T[t+1])
 		t += trigint
 
 		x1 -= 8
@@ -346,22 +356,22 @@ func mdctButterfly32(x []float32) {
 	r1 = x[29] - x[13]
 	x[28] += x[12]
 	x[29] += x[13]
-	x[12] = r0*cPI1_8 - r1*cPI3_8
-	x[13] = r0*cPI3_8 + r1*cPI1_8
+	x[12] = float32(r0*cPI1_8) - float32(r1*cPI3_8)
+	x[13] = float32(r0*cPI3_8) + float32(r1*cPI1_8)
 
 	r0 = x[26] - x[10]
 	r1 = x[27] - x[11]
 	x[26] += x[10]
 	x[27] += x[11]
-	x[10] = (r0 - r1) * cPI2_8
-	x[11] = (r0 + r1) * cPI2_8
+	x[10] = float32((r0 - r1) * cPI2_8)
+	x[11] = float32((r0 + r1) * cPI2_8)
 
 	r0 = x[24] - x[8]
 	r1 = x[25] - x[9]
 	x[24] += x[8]
 	x[25] += x[9]
-	x[8] = r0*cPI3_8 - r1*cPI1_8
-	x[9] = r1*cPI3_8 + r0*cPI1_8
+	x[8] = float32(r0*cPI3_8) - float32(r1*cPI1_8)
+	x[9] = float32(r1*cPI3_8) + float32(r0*cPI1_8)
 
 	r0 = x[22] - x[6]
 	r1 = x[7] - x[23]
@@ -374,22 +384,22 @@ func mdctButterfly32(x []float32) {
 	r1 = x[5] - x[21]
 	x[20] += x[4]
 	x[21] += x[5]
-	x[4] = r1*cPI1_8 + r0*cPI3_8
-	x[5] = r1*cPI3_8 - r0*cPI1_8
+	x[4] = float32(r1*cPI1_8) + float32(r0*cPI3_8)
+	x[5] = float32(r1*cPI3_8) - float32(r0*cPI1_8)
 
 	r0 = x[2] - x[18]
 	r1 = x[3] - x[19]
 	x[18] += x[2]
 	x[19] += x[3]
-	x[2] = (r1 + r0) * cPI2_8
-	x[3] = (r1 - r0) * cPI2_8
+	x[2] = float32((r1 + r0) * cPI2_8)
+	x[3] = float32((r1 - r0) * cPI2_8)
 
 	r0 = x[0] - x[16]
 	r1 = x[1] - x[17]
 	x[16] += x[0]
 	x[17] += x[1]
-	x[0] = r1*cPI3_8 + r0*cPI1_8
-	x[1] = r1*cPI1_8 - r0*cPI3_8
+	x[0] = float32(r1*cPI3_8) + float32(r0*cPI1_8)
+	x[1] = float32(r1*cPI1_8) - float32(r0*cPI3_8)
 
 	mdctButterfly16(x)
 	mdctButterfly16(x[16:])
@@ -400,8 +410,8 @@ func mdctButterfly16(x []float32) {
 	r1 := x[0] - x[8]
 	x[8] += x[0]
 	x[9] += x[1]
-	x[0] = (r0 + r1) * cPI2_8
-	x[1] = (r0 - r1) * cPI2_8
+	x[0] = float32((r0 + r1) * cPI2_8)
+	x[1] = float32((r0 - r1) * cPI2_8)
 
 	r0 = x[3] - x[11]
 	r1 = x[10] - x[2]
@@ -414,8 +424,8 @@ func mdctButterfly16(x []float32) {
 	r1 = x[13] - x[5]
 	x[12] += x[4]
 	x[13] += x[5]
-	x[4] = (r0 - r1) * cPI2_8
-	x[5] = (r0 + r1) * cPI2_8
+	x[4] = float32((r0 - r1) * cPI2_8)
+	x[5] = float32((r0 + r1) * cPI2_8)
 
 	r0 = x[14] - x[6]
 	r1 = x[15] - x[7]
@@ -465,13 +475,13 @@ func mdctBitreverse(t *mdctTables, x []float32) {
 
 		r0 := x[x0+1] - x[x1+1]
 		r1 := x[x0+0] + x[x1+0]
-		r2 := r1*trig[T+0] + r0*trig[T+1]
-		r3 := r1*trig[T+1] - r0*trig[T+0]
+		r2 := float32(r1*trig[T+0]) + float32(r0*trig[T+1])
+		r3 := float32(r1*trig[T+1]) - float32(r0*trig[T+0])
 
 		w1 -= 4
 
-		r0 = (x[x0+1] + x[x1+1]) * .5
-		r1 = (x[x0+0] - x[x1+0]) * .5
+		r0 = float32((x[x0+1] + x[x1+1]) * .5)
+		r1 = float32((x[x0+0] - x[x1+0]) * .5)
 
 		x[w0+0] = r0 + r2
 		x[w1+2] = r0 - r2
@@ -483,11 +493,11 @@ func mdctBitreverse(t *mdctTables, x []float32) {
 
 		r0 = x[x0+1] - x[x1+1]
 		r1 = x[x0+0] + x[x1+0]
-		r2 = r1*trig[T+2] + r0*trig[T+3]
-		r3 = r1*trig[T+3] - r0*trig[T+2]
+		r2 = float32(r1*trig[T+2]) + float32(r0*trig[T+3])
+		r3 = float32(r1*trig[T+3]) - float32(r0*trig[T+2])
 
-		r0 = (x[x0+1] + x[x1+1]) * .5
-		r1 = (x[x0+0] - x[x1+0]) * .5
+		r0 = float32((x[x0+1] + x[x1+1]) * .5)
+		r1 = float32((x[x0+0] - x[x1+0]) * .5)
 
 		x[w0+2] = r0 + r2
 		x[w1+0] = r0 - r2
