@@ -20,8 +20,13 @@ func thunkMemset(c *cpu.CPU) {
 	dst := c.Arg(0)
 	val := uint8(c.Arg(1))
 	b := c.WBytes(dst, c.Arg(2))
-	for i := range b {
-		b[i] = val
+	if val == 0 {
+		clear(b)
+	} else if len(b) > 0 {
+		b[0] = val
+		for i := 1; i < len(b); i *= 2 { // double the filled prefix
+			copy(b[i:], b[:i])
+		}
 	}
 	c.Regs[cpu.RegEAX] = dst
 	c.Ret()

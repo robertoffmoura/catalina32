@@ -101,3 +101,46 @@ func TestSscanf(t *testing.T) {
 		t.Errorf("mismatch: n=%d, want 0", n)
 	}
 }
+
+func TestMemset(t *testing.T) {
+	const stack, buf = 0x300000, 0x100000
+	call := func(c *cpu.CPU, dst, val, n uint32) {
+		c.Regs[cpu.RegESP] = stack
+		c.Write32(stack, 0xDEAD) // return address
+		c.Write32(stack+4, dst)
+		c.Write32(stack+8, val)
+		c.Write32(stack+12, n)
+		thunkMemset(c)
+		if c.Regs[cpu.RegEAX] != dst || c.EIP != 0xDEAD {
+			t.Fatalf("memset(%#x, %#x, %d) returned %#x to %#x", dst, val, n, c.Regs[cpu.RegEAX], c.EIP)
+		}
+	}
+	for _, tc := range []struct {
+		val uint32
+		n   int
+	}{{0, 0}, {0xAB, 0}, {0xAB, 1}, {0, 1}, {0x5C, 1000}, {0, 1000}, {0x1FF, 37}} { // 0x1FF: only the low byte counts
+		c := cpu.NewCPU()
+		for i := 0; i < 1100; i++ {
+			c.Mem[buf-50+i] = 0x77
+		}
+		call(c, buf, tc.val, uint32(tc.n))
+		for i := -50; i < 1050; i++ {
+			want := byte(0x77)
+			if i >= 0 && i < tc.n {
+				want = byte(tc.val)
+			}
+			if got := c.Mem[buf+i]; got != want {
+				t.Fatalf("memset(val %#x, n %d): byte %d = %#x, want %#x", tc.val, tc.n, i, got, want)
+			}
+		}
+	}
+
+	// A range past the end of guest memory writes nothing and halts the guest.
+	c := cpu.NewCPU()
+	end := uint32(len(c.Mem))
+	c.Mem[end-1] = 0x77
+	call(c, end-4, 0xAB, 16)
+	if !c.Halted || c.Mem[end-1] != 0x77 {
+		t.Fatalf("out-of-range memset: halted %v, last byte %#x", c.Halted, c.Mem[end-1])
+	}
+}
