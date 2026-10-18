@@ -58,9 +58,7 @@ func registerCompiled(c *cpu.CPU) {
 // patchNuTexRead patches NuTexRead (0x00078df0) at 0x00079088 (jne 0x000791d0 -> 6x NOP) so .GSC
 // textures with flags & 0x3c0c are never skipped.
 func patchNuTexRead(c *cpu.CPU) {
-	for i := uint32(0); i < 6; i++ {
-		c.Mem[0x00079088+i] = 0x90
-	}
+	c.PatchCode(0x00079088, []byte{0x90, 0x90, 0x90, 0x90, 0x90, 0x90})
 }
 
 func returnZero(c *cpu.CPU) {

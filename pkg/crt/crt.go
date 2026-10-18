@@ -519,12 +519,16 @@ func thunkQsort(c *cpu.CPU) {
 		return
 	}
 
+	if uint64(nmemb)*uint64(size) >= 1<<32 {
+		return
+	}
+	arr := c.WBytes(base, uint32(nmemb*size))
+	if arr == nil {
+		return
+	}
 	items := make([][]byte, nmemb)
-	for i := 0; i < nmemb; i++ {
-		buf := make([]byte, size)
-		off := int(base) + i*size
-		copy(buf, c.Mem[off:off+size])
-		items[i] = buf
+	for i := range items {
+		items[i] = append([]byte(nil), arr[i*size:(i+1)*size]...)
 	}
 
 	tmpA := c.Malloc(uint32(size))
@@ -535,8 +539,8 @@ func thunkQsort(c *cpu.CPU) {
 	}()
 
 	sort.Slice(items, func(i, j int) bool {
-		copy(c.Mem[tmpA:int(tmpA)+size], items[i])
-		copy(c.Mem[tmpB:int(tmpB)+size], items[j])
+		copy(c.WBytes(tmpA, uint32(size)), items[i])
+		copy(c.WBytes(tmpB, uint32(size)), items[j])
 		res, err := c.CallGuest(compar, tmpA, tmpB)
 		if err != nil {
 			return false
@@ -544,9 +548,8 @@ func thunkQsort(c *cpu.CPU) {
 		return int32(res) < 0
 	})
 
-	for i := 0; i < nmemb; i++ {
-		off := int(base) + i*size
-		copy(c.Mem[off:off+size], items[i])
+	for i, it := range items {
+		copy(arr[i*size:], it)
 	}
 }
 
@@ -790,22 +793,22 @@ func thunkBasicStringInit(c *cpu.CPU) {
 	strPtr := c.Arg(1)
 	sz := c.Arg(2)
 	if sz <= 10 {
-		clear(c.Mem[thisPtr : thisPtr+12])
+		clear(c.WBytes(thisPtr, 12))
 		c.Write8(thisPtr, uint8(sz<<1))
 		if sz > 0 && strPtr != 0 {
-			copy(c.Mem[thisPtr+1:thisPtr+1+sz], c.Mem[strPtr:strPtr+sz])
+			copy(c.WBytes(thisPtr+1, sz), c.Bytes(strPtr, sz))
 		}
 		c.Write8(thisPtr+1+sz, 0)
 	} else {
 		capAligned := ((sz + 16) & ^uint32(15))
 		buf := c.Malloc(capAligned)
 		if strPtr != 0 {
-			copy(c.Mem[buf:buf+sz], c.Mem[strPtr:strPtr+sz])
+			copy(c.WBytes(buf, sz), c.Bytes(strPtr, sz))
 		}
 		c.Write8(buf+sz, 0)
-		binary.LittleEndian.PutUint32(c.Mem[thisPtr:thisPtr+4], capAligned|1)
-		binary.LittleEndian.PutUint32(c.Mem[thisPtr+4:thisPtr+8], sz)
-		binary.LittleEndian.PutUint32(c.Mem[thisPtr+8:thisPtr+12], buf)
+		c.Write32(thisPtr, capAligned|1)
+		c.Write32(thisPtr+4, sz)
+		c.Write32(thisPtr+8, buf)
 	}
 	c.Ret()
 }

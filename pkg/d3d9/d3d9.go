@@ -514,7 +514,7 @@ func (s *Subsystem) fillD3DCaps9(c *cpu.CPU, ptr uint32) {
 	if ptr == 0 {
 		return
 	}
-	clear(c.Mem[ptr : ptr+0x130])
+	clear(c.WBytes(ptr, 0x130))
 	c.Write32(ptr+0x00, 1)          // DeviceType = D3DDEVTYPE_HAL
 	c.Write32(ptr+0x04, 0)          // AdapterOrdinal = 0
 	c.Write32(ptr+0x0c, 0x00020000) // Caps2
@@ -572,7 +572,7 @@ func (s *Subsystem) handleIDirect3D9(c *cpu.CPU, winSlot int) {
 	case 5: // GetAdapterIdentifier(this, Adapter, Flags, pIdentifier)
 		pIdent := c.Arg(3)
 		if pIdent != 0 {
-			clear(c.Mem[pIdent : pIdent+1100])
+			clear(c.WBytes(pIdent, 1100))
 			c.WriteCString(pIdent+0x000, "IndirectX")
 			c.WriteCString(pIdent+0x200, "NVIDIA GeForce GTX 1080 Ti")
 			c.WriteCString(pIdent+0x400, "\\\\.\\DISPLAY1")
@@ -1008,9 +1008,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 					break
 				}
 				off := c.Read16(pElem + i*8 + 2)
-				elType := c.Mem[pElem+i*8+4]
-				usage := c.Mem[pElem+i*8+6]
-				usageIdx := c.Mem[pElem+i*8+7]
+				elType := c.Read8(pElem + i*8 + 4)
+				usage := c.Read8(pElem + i*8 + 6)
+				usageIdx := c.Read8(pElem + i*8 + 7)
 				vd.Elements = append(vd.Elements, VertexElement{Stream: stream, Offset: off, Type: elType, Usage: usage, UIdx: usageIdx})
 				switch usage {
 				case 0: // D3DDECLUSAGE_POSITION
@@ -1465,7 +1465,7 @@ func (s *Subsystem) thunkD3DXCompileShader(c *cpu.CPU) {
 	ppErr := c.Arg(8)
 	ppConst := c.Arg(9)
 	if dir := os.Getenv("C32_DUMP_SHADERS"); dir != "" {
-		src := c.Mem[c.Arg(0) : c.Arg(0)+c.Arg(1)]
+		src := c.Bytes(c.Arg(0), c.Arg(1))
 		entry, profile := c.ReadCString(c.Arg(4)), c.ReadCString(c.Arg(5))
 		s.shaderDumps++
 		name := fmt.Sprintf("%04d_%s_%s.hlsl", s.shaderDumps, profile, entry)
@@ -1521,13 +1521,12 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 		// DI8DEVCLASS_ALL=0, DI8DEVCLASS_KEYBOARD=3 (or DI8DEVTYPE_KEYBOARD=0x13): one keyboard.
 		cont := uint32(1)
 		if cb != 0 && (devClass == 0 || devClass == 3 || devClass == 0x13) {
-			inst := c.Malloc(580) // sizeof(DIDEVICEINSTANCEA) for DX8
-			clear(c.Mem[inst : inst+580])
+			inst := c.Calloc(1, 580) // sizeof(DIDEVICEINSTANCEA) for DX8
 			c.Write32(inst+0, 580)
 			kb := []byte{0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}
-			copy(c.Mem[inst+4:], kb)       // guidInstance
-			copy(c.Mem[inst+20:], kb)      // guidProduct
-			c.Write32(inst+36, 0x00000413) // DI8DEVTYPE_KEYBOARD | (DI8DEVTYPEKEYBOARD_PCENH << 8)
+			copy(c.WBytes(inst+4, 16), kb)  // guidInstance
+			copy(c.WBytes(inst+20, 16), kb) // guidProduct
+			c.Write32(inst+36, 0x00000413)  // DI8DEVTYPE_KEYBOARD | (DI8DEVTYPEKEYBOARD_PCENH << 8)
 			c.WriteCString(inst+40, "Keyboard")
 			c.WriteCString(inst+300, "Keyboard")
 			if s.TraceLog {
@@ -1541,13 +1540,12 @@ func (s *Subsystem) handleIDirectInput8(c *cpu.CPU, winSlot int) {
 			if _, ok := s.readPad(user); !ok {
 				continue
 			}
-			inst := c.Malloc(580)
-			clear(c.Mem[inst : inst+580])
+			inst := c.Calloc(1, 580)
 			c.Write32(inst+0, 580)
 			// guidInstance: unique per controller; guidProduct: {VID/PID-0000-0000-0000-"PIDVID"}
-			copy(c.Mem[inst+4:], []byte{0x00, 0x00, 0x32, 0xC3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(user)})
+			copy(c.WBytes(inst+4, 16), []byte{0x00, 0x00, 0x32, 0xC3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(user)})
 			c.Write32(inst+20, 0x028E045E) // VID 0x045E, PID 0x028E (Xbox 360 Controller)
-			copy(c.Mem[inst+30:], []byte("PIDVID"))
+			copy(c.WBytes(inst+30, 6), "PIDVID")
 			c.Write32(inst+36, 0x00010215) // DI8DEVTYPE_GAMEPAD | DI8DEVTYPEGAMEPAD_STANDARD<<8 | DIDEVTYPE_HID
 			c.WriteCString(inst+40, fmt.Sprintf("Controller %d", user+1))
 			c.WriteCString(inst+300, "Controller (XBOX 360 For Windows)")
@@ -1572,8 +1570,12 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 			diSeen[k] = true
 			fmt.Printf("[DInput8] GetDeviceState dev=0x%08x cbData=%d buf=0x%08x frame=%d\n", k[0], k[1], lpvData, s.FrameCount)
 		}
+		var buf []byte
 		if lpvData != 0 && cbData > 0 && cbData <= 4096 {
-			clear(c.Mem[lpvData : lpvData+cbData])
+			buf = c.WBytes(lpvData, cbData)
+		}
+		if buf != nil {
+			clear(buf)
 			if cbData == 256 {
 				if s.shm != nil {
 					var shmKeys [256]byte
@@ -1594,7 +1596,7 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 						}
 						for dik := 1; dik < 256; dik++ {
 							if shmKeys[dik] != 0 {
-								c.Mem[lpvData+uint32(dik)] = 0x80
+								buf[dik] = 0x80
 							}
 						}
 					}
@@ -1603,13 +1605,13 @@ func (s *Subsystem) handleIDirectInputDevice8(c *cpu.CPU, winSlot int) {
 				mode := s.AutoKeysMode
 				for dik := 0; dik < 256; dik++ {
 					if s.KeyHoldUntil[dik] > 0 && s.FrameCount <= s.KeyHoldUntil[dik] {
-						c.Mem[lpvData+uint32(dik)] = 0x80
+						buf[dik] = 0x80
 					}
 				}
 				s.KeyMu.Unlock()
 
 				if s.InputScript != nil && mode != "off" {
-					s.InputScript(s, mode, c.Mem[lpvData:lpvData+256])
+					s.InputScript(s, mode, buf)
 				}
 			}
 		}
@@ -1960,7 +1962,7 @@ func (s *Subsystem) thunkXInputGetState(c *cpu.CPU) {
 	}
 	if p != 0 {
 		c.Write32(p, s.padPacket[user])
-		copy(c.Mem[p+4:p+16], pad[:])
+		copy(c.WBytes(p+4, 12), pad[:])
 	}
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
@@ -1976,11 +1978,11 @@ func (s *Subsystem) thunkXInputGetCapabilities(c *cpu.CPU) {
 		return
 	}
 	if p != 0 {
-		clear(c.Mem[p : p+20])
-		c.Mem[p] = 1           // XINPUT_DEVTYPE_GAMEPAD
-		c.Mem[p+1] = 1         // XINPUT_DEVSUBTYPE_GAMEPAD
+		clear(c.WBytes(p, 20))
+		c.Write8(p, 1)         // XINPUT_DEVTYPE_GAMEPAD
+		c.Write8(p+1, 1)       // XINPUT_DEVSUBTYPE_GAMEPAD
 		c.Write16(p+4, 0xF3FF) // every button
-		c.Mem[p+6], c.Mem[p+7] = 0xFF, 0xFF
+		c.Write16(p+6, 0xFFFF)
 		for i := uint32(0); i < 4; i++ {
 			c.Write16(p+8+2*i, 0xFFC0) // thumbstick resolution
 		}

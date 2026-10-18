@@ -75,7 +75,7 @@ func (s *Subsystem) compileHLSL(c *cpu.CPU, src []byte, entry, profile string) (
 // compileShaderReal implements D3DXCompileShader. It returns false if compilation failed (the
 // caller then falls back to the placeholder behaviour so the game keeps running).
 func (s *Subsystem) compileShaderReal(c *cpu.CPU) bool {
-	src := c.Mem[c.Arg(0) : c.Arg(0)+c.Arg(1)]
+	src := c.Bytes(c.Arg(0), c.Arg(1))
 	entry, profile := c.ReadCString(c.Arg(4)), c.ReadCString(c.Arg(5))
 	ppShader, ppErr, ppConst := c.Arg(7), c.Arg(8), c.Arg(9)
 	cs, err := s.compileHLSL(c, src, entry, profile)

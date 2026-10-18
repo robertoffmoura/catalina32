@@ -333,7 +333,7 @@ func (env *Win32Env) thunkReturnOne(c *cpu.CPU) {
 func (env *Win32Env) thunkInitializeCriticalSection(c *cpu.CPU) {
 	cs := c.Arg(0)
 	if cs != 0 {
-		clear(c.Mem[cs : cs+24])
+		clear(c.WBytes(cs, 24))
 	}
 	c.Ret()
 }
@@ -543,7 +543,10 @@ func (env *Win32Env) thunkReadFile(c *cpu.CPU) {
 		c.Ret()
 		return
 	}
-	n, err := of.File.Read(c.Mem[buf : buf+toRead])
+	n, err := io.ReadFull(of.File, c.WBytes(buf, toRead))
+	if err == io.ErrUnexpectedEOF {
+		err = nil
+	}
 	if err != nil && err != io.EOF {
 		if readPtr != 0 {
 			c.Write32(readPtr, 0)
@@ -574,7 +577,7 @@ func (env *Win32Env) thunkWriteFile(c *cpu.CPU) {
 		c.Ret()
 		return
 	}
-	n, err := of.File.Write(c.Mem[buf : buf+toWrite])
+	n, err := of.File.Write(c.Bytes(buf, toWrite))
 	if err != nil {
 		if writtenPtr != 0 {
 			c.Write32(writtenPtr, 0)
@@ -752,8 +755,11 @@ func (env *Win32Env) thunkFread(c *cpu.CPU) {
 		c.Ret()
 		return
 	}
-	total := size * nmemb
-	n, _ := of.File.Read(c.Mem[ptr : ptr+total])
+	total := uint64(size) * uint64(nmemb)
+	if total >= 1<<32 {
+		total = 0
+	}
+	n, _ := io.ReadFull(of.File, c.WBytes(ptr, uint32(total)))
 	c.Regs[cpu.RegEAX] = uint32(n) / size
 	c.Ret()
 }
@@ -770,8 +776,11 @@ func (env *Win32Env) thunkFwrite(c *cpu.CPU) {
 		c.Ret()
 		return
 	}
-	total := size * nmemb
-	n, _ := of.File.Write(c.Mem[ptr : ptr+total])
+	total := uint64(size) * uint64(nmemb)
+	if total >= 1<<32 {
+		total = 0
+	}
+	n, _ := of.File.Write(c.Bytes(ptr, uint32(total)))
 	c.Regs[cpu.RegEAX] = uint32(n) / size
 	c.Ret()
 }

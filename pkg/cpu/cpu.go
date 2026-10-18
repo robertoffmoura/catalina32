@@ -416,6 +416,22 @@ func (c *CPU) CBytes(addr uint32) []byte {
 	return m
 }
 
+// PatchCode overwrites guest code (host-side binary patches), invalidating decoded instructions.
+// Patch before compiled functions are registered: CodeHash then sees the patched bytes.
+func (c *CPU) PatchCode(addr uint32, b []byte) {
+	copy(c.WBytes(addr, uint32(len(b))), b)
+}
+
+// CodeHash returns the FNV-1a hash of guest memory [lo, hi): compiled functions compare it with
+// the bytes they were compiled from before they are installed.
+func (c *CPU) CodeHash(lo, hi uint32) uint64 {
+	h := uint64(14695981039346656037)
+	for _, b := range c.Bytes(lo, hi-lo) {
+		h = (h ^ uint64(b)) * 1099511628211
+	}
+	return h
+}
+
 func (c *CPU) ReadCString(addr uint32) string {
 	return string(c.CBytes(addr))
 }
