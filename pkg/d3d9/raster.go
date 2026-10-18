@@ -904,11 +904,14 @@ func (s *Subsystem) submitFrame() {
 		go func() {
 			defer s.renderWG.Done()
 			s.gpu.encodeFrame(ops, gpuFrame)
+			s.publishCounters(info)
 		}()
 		s.gpuFrame = s.gpu.ready()
 		return
 	}
-	s.gpuFrame = s.gpu.ready()
+	if s.gpuFrame = s.gpu.ready(); s.gpuFrame {
+		fmt.Printf("[GPU] the viewer is connected: frames are drawn with Metal from frame %d\n", s.FrameCount+1)
+	}
 	s.renderWG.Add(1)
 	var ids []int32
 	if drawLogFrames[info.frame] {
@@ -1519,10 +1522,7 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 
 	if s.shm != nil {
 		copy(s.shm[ShmHeaderSize:], s.Framebuffer.Pix)
-		binary.LittleEndian.PutUint64(s.shm[8:16], fi.drawCalls)
-		binary.LittleEndian.PutUint64(s.shm[16:24], fi.triangles)
-		binary.LittleEndian.PutUint64(s.shm[24:32], fi.steps)
-		shmPublish(s.shm, 0, fi.frame) // last: the viewer polls the frame number
+		s.publishCounters(fi)
 	}
 
 	if liveMode {
@@ -1564,6 +1564,18 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 			replaceFile(latestPath, pngBytes)
 		}
 	}
+}
+
+// publishCounters writes the frame header of the viewer's shared memory (the frame number last:
+// the viewer polls it).
+func (s *Subsystem) publishCounters(fi frameInfo) {
+	if s.shm == nil {
+		return
+	}
+	binary.LittleEndian.PutUint64(s.shm[8:16], fi.drawCalls)
+	binary.LittleEndian.PutUint64(s.shm[16:24], fi.triangles)
+	binary.LittleEndian.PutUint64(s.shm[24:32], fi.steps)
+	shmPublish(s.shm, 0, fi.frame)
 }
 
 // linkOrWrite makes dst a hard link to src (replacing dst), or a copy of data if linking fails.

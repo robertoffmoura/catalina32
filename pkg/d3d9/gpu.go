@@ -140,7 +140,8 @@ func newGPUEncoder() *gpuEncoder {
 	if path == "" {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+	_ = os.Remove(path) // a new file: a viewer still mapping the previous run's notices and remaps
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
 		fmt.Printf("[GPU] cannot open %s: %v\n", path, err)
 		return nil

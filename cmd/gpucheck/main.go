@@ -231,7 +231,7 @@ func (c *checker) draw(frame uint64, b []byte) {
 	}
 	p += 4 * nIdx
 	if want := p + 16*(nVC+nPC); want != len(b) {
-		c.fail("frame %d: draw is %d bytes, fields need %d", frame, len(b), want)
+		c.fail("frame %d: draw is %d bytes, fields need %d (idx %d attr %d streams %d tex %d vc %d pc %d)", frame, len(b), want, nIdx, nAttr, nStream, nTex, nVC, nPC)
 	}
 }
 
