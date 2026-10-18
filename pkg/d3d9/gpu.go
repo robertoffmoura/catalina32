@@ -23,13 +23,15 @@ package d3d9
 // frees it. Commands (payload fields in order):
 //
 //	gpuLibrary  u32 id, u32 stage (0 vertex, 1 fragment), u32 byte length, MSL source (padded)
-//	gpuTexture  u32 id, u32 width, u32 height, u32 format (1 = RGBA8, red first), pixels
+//	gpuTexture  u32 id, u32 width, u32 height, u32 format, data: 1 = RGBA8 (red first),
+//	            2/3/4 = BC1/BC2/BC3 (the game's DXT1/DXT3/DXT5 blocks, width and height multiples of 4)
 //	gpuTexFree  u32 id
 //	gpuTarget   u32 id (0 = back buffer), u32 width, u32 height: draw into this target from now
 //	            on (created on first use; render targets are also textures with the same id)
 //	gpuClear    u32 flags (1 colour, 2 depth), u32 colour (ARGB), f32 depth, i32 x0, y0, x1, y1
 //	            (inclusive)
-//	gpuCopy     u32 source id, u32 destination id (whole targets, scaled)
+//	gpuCopy     u32 source id, u32 destination id, u32 destination width, height (whole
+//	            targets, scaled; the destination becomes a render target if it is not one)
 //	gpuDraw     see encodeDraw
 //	gpuFrameEnd (no payload): present the back buffer
 
@@ -95,6 +97,8 @@ type gpuTexRef struct {
 	unit, kind                            uint32 // kind: msl.TextureKind the shader declares
 	desc                                  *BufferDesc
 	pixels                                []uint32 // the image at draw time (nil for render targets)
+	raw                                   []byte   // its compressed data (DXT formats), if kept
+	format                                uint32   // D3DFORMAT
 	width, height                         uint32
 	addrU, addrV, addrW, magF, minF, mipF uint32
 }
@@ -170,6 +174,15 @@ func newGPUEncoder() *gpuEncoder {
 func (g *gpuEncoder) word(off int) *uint32 { return (*uint32)(unsafe.Pointer(&g.shm[off])) }
 
 // ready reports whether the viewer is consuming frames.
+// resend forgets what the viewer was sent, so that libraries and images are sent again (their
+// old ids stay unused).
+func (g *gpuEncoder) resend() {
+	clear(g.libs)
+	for _, e := range g.textures {
+		e.uploaded = nil
+	}
+}
+
 func (g *gpuEncoder) ready() bool { return g != nil && atomic.LoadUint32(g.word(16)) == 1 }
 
 func (g *gpuEncoder) logOnce(key, format string, args ...any) {
@@ -325,9 +338,9 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 			magF: s.gpuSampler(u, sampMagFilter), minF: s.gpuSampler(u, sampMinFilter), mipF: s.gpuSampler(u, sampMipFilter)}
 		if s.BoundTextures[u] != 0 {
 			if res := s.ensureTextureDecoded(c, s.BoundTextures[u]); res != nil && (res.IsRT || len(res.Pixels) > 0) {
-				ref.desc, ref.width, ref.height = res, res.Width, res.Height
+				ref.desc, ref.width, ref.height, ref.format = res, res.Width, res.Height, res.Format
 				if !res.IsRT {
-					ref.pixels = res.Pixels
+					ref.pixels, ref.raw = res.Pixels, res.Raw
 				}
 			}
 		}
@@ -410,7 +423,7 @@ func (g *gpuEncoder) library(key string, stage uint32, source func() string) uin
 
 // texture returns the id of a texture, sending its pixels when they are new or changed (and
 // fit in this frame; otherwise a later frame sends them and the viewer draws a placeholder).
-func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, w, h uint32) uint32 {
+func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, raw []byte, format, w, h uint32) uint32 {
 	g.mu.Lock()
 	e := g.textures[desc]
 	if e == nil {
@@ -423,8 +436,11 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, w, h uint32) uin
 		return e.id
 	}
 	if p := unsafe.Pointer(&pixels[0]); p != e.uploaded {
-		size := int(w * h * 4)
-		if !g.room(size + 32) {
+		kind, data := uint32(1), unsafe.Slice((*byte)(unsafe.Pointer(&pixels[0])), int(w*h*4))
+		if bc := bcFormat(format); bc != 0 && raw != nil && w%4 == 0 && h%4 == 0 {
+			kind, data = bc, raw
+		}
+		if !g.room(len(data) + 32) {
 			g.full = true
 			return e.id
 		}
@@ -432,12 +448,25 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, w, h uint32) uin
 		g.u32(e.id)
 		g.u32(w)
 		g.u32(h)
-		g.u32(1)
-		g.buf = append(g.buf, unsafe.Slice((*byte)(unsafe.Pointer(&pixels[0])), size)...)
+		g.u32(kind)
+		g.buf = append(g.buf, data...)
 		g.end(l)
 		e.uploaded = p
 	}
 	return e.id
+}
+
+// bcFormat is the stream's compressed texture format for a D3DFORMAT (0: none).
+func bcFormat(format uint32) uint32 {
+	switch format {
+	case 0x31545844: // DXT1
+		return 2
+	case 0x32545844, 0x33545844: // DXT2, DXT3
+		return 3
+	case 0x34545844, 0x35545844: // DXT4, DXT5
+		return 4
+	}
+	return 0
 }
 
 // targetID is the id of a render target (0 = back buffer).
@@ -445,7 +474,7 @@ func (g *gpuEncoder) targetID(desc *BufferDesc) uint32 {
 	if desc == nil {
 		return 0
 	}
-	return g.texture(desc, nil, desc.Width, desc.Height)
+	return g.texture(desc, nil, nil, 0, desc.Width, desc.Height)
 }
 
 // attrClasses lists, for each vertex shader attribute, the element feeding it and the data class.
@@ -518,7 +547,7 @@ func (g *gpuEncoder) encodeDraw(d *gpuDrawCmd) {
 		case t.pixels == nil:
 			texIDs = append(texIDs, g.targetID(t.desc))
 		default:
-			texIDs = append(texIDs, g.texture(t.desc, t.pixels, t.width, t.height))
+			texIDs = append(texIDs, g.texture(t.desc, t.pixels, t.raw, t.format, t.width, t.height))
 		}
 	}
 	nStreams := 0
@@ -642,6 +671,12 @@ func (g *gpuEncoder) encodeFrame(ops []queuedTri, frame uint64) bool {
 			l := g.begin(gpuCopy)
 			g.u32(g.targetID(op.copySrcDesc))
 			g.u32(g.targetID(op.copyDstDesc))
+			w, h := uint32(ScreenWidth), uint32(ScreenHeight)
+			if d := op.copyDstDesc; d != nil {
+				w, h = d.Width, d.Height
+			}
+			g.u32(w)
+			g.u32(h)
 			g.end(l)
 		default:
 			skipped++
@@ -657,17 +692,24 @@ func (g *gpuEncoder) encodeFrame(ops []queuedTri, frame uint64) bool {
 	return g.publish(frame)
 }
 
-// publish copies the frame into a free slot, waiting (up to a second) for the viewer to free
-// one.
+// publish copies the frame into a free slot, waiting for the viewer to free one. The viewer
+// can take seconds over a frame that needs many new shaders compiled, so only a viewer that
+// has quit or has not taken a frame for 30 seconds loses the frame; everything the lost frame
+// sent is then sent again.
 func (g *gpuEncoder) publish(frame uint64) bool {
 	k := int(g.seq % gpuSlots)
 	state := g.word(32 + 16*k + 12)
-	for deadline := time.Now().Add(time.Second); atomic.LoadUint32(state) != 0; {
-		if time.Now().After(deadline) || !g.ready() {
-			g.logOnce("stalled", "the viewer stopped taking frames; drawing in software")
+	start := time.Now()
+	for atomic.LoadUint32(state) != 0 {
+		if waited := time.Since(start); waited > 30*time.Second || !g.ready() {
+			g.logOnce("stalled", "the viewer stopped taking frames (frame %d lost)", frame)
+			g.resend()
 			return false
 		}
 		time.Sleep(200 * time.Microsecond)
+	}
+	if waited := time.Since(start); waited > 250*time.Millisecond {
+		fmt.Printf("[GPU] waited %v for the viewer before frame %d (shader compiles?)\n", waited.Round(time.Millisecond), frame)
 	}
 	if n := atomic.LoadUint32(g.word(20)); n != g.lastErr {
 		fmt.Printf("[GPU] the viewer reported %d shader/pipeline errors (see its log)\n", n)

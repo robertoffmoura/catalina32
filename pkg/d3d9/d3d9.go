@@ -30,6 +30,7 @@ type BufferDesc struct {
 	Pitch         uint32
 	Depth         uint32 // volume textures
 	Pixels        []uint32
+	Raw           []byte // GPU path: level 0 as the game wrote it, for DXT formats (uploaded compressed)
 	Channels      uint16
 	SampleRate    uint32
 	BitsPerSample uint16
@@ -1472,7 +1473,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 	srcSize := c.Arg(2)
 	pSrcInfo := c.Arg(12)
 	ppTex := c.Arg(14)
-	w, h, fmtCode, pixels := s.decodeDDSInMemory(c, pSrc, srcSize)
+	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize)
 	if pSrcInfo != 0 {
 		c.Write32(pSrcInfo+0, w)
 		c.Write32(pSrcInfo+4, h)
@@ -1483,7 +1484,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 	if ppTex != 0 {
 		tex := s.allocTextureLazy(c, w, h, fmtCode)
 		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
-			res.Pixels = pixels
+			res.Pixels, res.Raw = pixels, s.gpuRaw(raw, w, h, fmtCode)
 		}
 		c.Write32(ppTex, tex)
 	}
@@ -1496,11 +1497,11 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileInMemory(c *cpu.CPU) {
 	pSrc := c.Arg(1)
 	srcSize := c.Arg(2)
 	ppTex := c.Arg(3)
-	w, h, fmtCode, pixels := s.decodeDDSInMemory(c, pSrc, srcSize)
+	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize)
 	if ppTex != 0 {
 		tex := s.allocTextureLazy(c, w, h, fmtCode)
 		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
-			res.Pixels = pixels
+			res.Pixels, res.Raw = pixels, s.gpuRaw(raw, w, h, fmtCode)
 		}
 		c.Write32(ppTex, tex)
 	}

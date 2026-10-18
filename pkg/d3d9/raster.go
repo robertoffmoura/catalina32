@@ -398,27 +398,41 @@ func decodeTexturePixels(data []byte, w, h, fmtCode uint32) []uint32 {
 	return out
 }
 
-func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32) (uint32, uint32, uint32, []uint32) {
+// decodeDDSInMemory decodes a DDS file's top level; raw is its data as stored (aliasing guest
+// memory).
+func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32) (w, h, fmtCode uint32, pixels []uint32, raw []byte) {
 	if pSrc == 0 || srcSize < 128 || uint64(pSrc)+uint64(srcSize) > uint64(len(c.Mem)) {
-		return 64, 64, 21, nil
+		return 64, 64, 21, nil, nil
 	}
 	magic := c.Read32(pSrc)
 	if magic != 0x20534444 { // "DDS "
-		return 64, 64, 21, nil
+		return 64, 64, 21, nil, nil
 	}
-	h := c.Read32(pSrc + 12)
-	w := c.Read32(pSrc + 16)
+	h = c.Read32(pSrc + 12)
+	w = c.Read32(pSrc + 16)
 	pfFlags := c.Read32(pSrc + 80)
 	fourCC := c.Read32(pSrc + 84)
 	bitCount := c.Read32(pSrc + 88)
-	fmtCode := uint32(21)
+	fmtCode = 21
 	if (pfFlags & 0x4) != 0 { // DDPF_FOURCC
 		fmtCode = fourCC
 	} else if bitCount == 8 {
 		fmtCode = 50
 	}
-	pixels := decodeTexturePixels(c.Mem[pSrc+128:pSrc+srcSize], w, h, fmtCode)
-	return w, h, fmtCode, pixels
+	raw = c.Mem[pSrc+128 : pSrc+srcSize]
+	return w, h, fmtCode, decodeTexturePixels(raw, w, h, fmtCode), raw
+}
+
+// gpuRaw keeps a copy of a DXT image's level 0 for compressed upload (GPU path only).
+func (s *Subsystem) gpuRaw(data []byte, w, h, format uint32) []byte {
+	if s.gpu == nil || !isDXT(format) {
+		return nil
+	}
+	n := int(texPitch(w, format) * texRows(h, format))
+	if len(data) < n {
+		return nil
+	}
+	return append([]byte(nil), data[:n]...)
 }
 
 func (s *Subsystem) ensureTextureDecoded(c *cpu.CPU, texObj uint32) *BufferDesc {
@@ -432,6 +446,7 @@ func (s *Subsystem) ensureTextureDecoded(c *cpu.CPU, texObj uint32) *BufferDesc 
 		if data != nil && (res.Unlocked || slices.ContainsFunc(data[:min(len(data), 256)], func(b byte) bool { return b != 0 })) {
 			// A new slice: frames already queued keep sampling the old pixels (texSnap).
 			res.Pixels = decodeTexturePixels(data, res.Width, res.Height, res.Format)
+			res.Raw = s.gpuRaw(data, res.Width, res.Height, res.Format)
 			res.Stale = false
 		}
 	}

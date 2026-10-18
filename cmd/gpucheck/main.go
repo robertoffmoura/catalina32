@@ -54,7 +54,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	c := &checker{libs: map[uint32]bool{}, textures: map[uint32][2]uint32{}, out: *out}
+	c := &checker{libs: map[uint32]bool{}, formats: map[uint32]int{}, textures: map[uint32][2]uint32{}, out: *out}
 	var lastFrame uint64
 	for n := 0; *frames == 0 || n < *frames; {
 		select {
@@ -91,6 +91,7 @@ func main() {
 
 type checker struct {
 	libs                           map[uint32]bool
+	formats                        map[uint32]int       // texture uploads by format
 	textures                       map[uint32][2]uint32 // id -> size (0 for targets)
 	out                            string
 	frames, draws, clears, targets int
@@ -138,11 +139,13 @@ func (c *checker) frame(frame uint64, d []byte) {
 			}
 		case 2: // texture
 			id, w, h, f := u(0), u(1), u(2), u(3)
-			if f != 1 || 16+int(w*h*4) > n {
+			size := map[uint32]int{1: int(w * h * 4), 2: int(w * h / 2), 3: int(w * h), 4: int(w * h)}[f]
+			if size == 0 || 16+size > n || (f != 1 && (w%4 != 0 || h%4 != 0)) {
 				c.fail("texture %d: %dx%d format %d in %d bytes", id, w, h, f, n)
 			}
 			c.textures[id] = [2]uint32{w, h}
-			c.texBytes += int(w * h * 4)
+			c.texBytes += size
+			c.formats[f]++
 		case 3: // texture free
 			delete(c.textures, u(0))
 		case 4: // target
@@ -152,7 +155,13 @@ func (c *checker) frame(frame uint64, d []byte) {
 			}
 		case 5: // clear
 			c.clears++
-		case 6: // copy
+		case 6: // copy (the destination becomes a render target)
+			if n != 16 || u(2) == 0 || u(3) == 0 {
+				c.fail("frame %d: copy command of %d bytes, size %dx%d", frame, n, u(2), u(3))
+			}
+			if dst := u(1); dst != 0 {
+				c.textures[dst] = [2]uint32{}
+			}
 		case 7: // draw
 			c.draws++
 			c.draw(frame, b)
@@ -243,4 +252,5 @@ func (c *checker) report() {
 	fmt.Printf("gpucheck: %d frames, %d draws (%.0f per frame), %d clears, %d target switches; %d libraries; average %.2f MB per frame (max %.2f MB), %.1f MB of texture uploads; %d errors\n",
 		c.frames, c.draws, float64(c.draws)/float64(c.frames), c.clears, c.targets, len(c.libs),
 		float64(c.bytes)/float64(c.frames)/(1<<20), float64(c.maxFrame)/(1<<20), float64(c.texBytes)/(1<<20), c.errors)
+	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3): %v\n", c.formats)
 }

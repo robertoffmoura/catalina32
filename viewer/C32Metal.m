@@ -526,28 +526,40 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
 
 - (void)texture:(Reader *)r {
     uint32_t texID = rd32(r), w = rd32(r), h = rd32(r), fmt = rd32(r);
-    const uint8_t *px = rdbytes(r, (size_t)w * h * 4);
-    if (!px || fmt != 1 || w == 0 || h == 0) return;
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kColorFormat width:w height:h mipmapped:NO];
+    MTLPixelFormat pf = kColorFormat;
+    size_t rowBytes = (size_t)w * 4, size = rowBytes * h;
+    if (fmt >= 2 && fmt <= 4) { // BC1/BC2/BC3: rows of 4x4 blocks
+        pf = fmt == 2 ? MTLPixelFormatBC1_RGBA : (fmt == 3 ? MTLPixelFormatBC2_RGBA : MTLPixelFormatBC3_RGBA);
+        rowBytes = (size_t)(w / 4) * (fmt == 2 ? 8 : 16);
+        size = rowBytes * (h / 4);
+    } else if (fmt != 1) {
+        return;
+    }
+    const uint8_t *px = rdbytes(r, size);
+    if (!px || w == 0 || h == 0) return;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
     d.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> t = [_device newTextureWithDescriptor:d]; // a new texture: frames in flight keep the old one
-    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4];
+    if (!t) return; // BC formats need a GPU that supports them (every Mac with Metal 2 does)
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:rowBytes];
     _textures[@(texID)] = t;
+}
+
+// renderTargetForID returns texture tid as a render target of w x h, (re)creating it if it is
+// not one yet (a texture the game copies into or draws into from now on).
+- (id<MTLTexture>)renderTargetForID:(uint32_t)tid width:(uint32_t)w height:(uint32_t)h {
+    id<MTLTexture> t = _textures[@(tid)];
+    if (!t || !(t.usage & MTLTextureUsageRenderTarget) || t.width != w || t.height != h) {
+        t = [self renderTargetWidth:MAX(w, 1u) height:MAX(h, 1u)];
+        _textures[@(tid)] = t;
+    }
+    return t;
 }
 
 - (void)target:(Reader *)r {
     uint32_t tid = rd32(r), w = rd32(r), h = rd32(r);
     [self endPass];
-    if (tid == 0) {
-        _target = _backBuffer;
-    } else {
-        id<MTLTexture> t = _textures[@(tid)];
-        if (!t || !(t.usage & MTLTextureUsageRenderTarget) || t.width != w || t.height != h) {
-            t = [self renderTargetWidth:MAX(w, 1u) height:MAX(h, 1u)];
-            _textures[@(tid)] = t;
-        }
-        _target = t;
-    }
+    _target = tid == 0 ? _backBuffer : [self renderTargetForID:tid width:w height:h];
     _targetDepth = [self depthForWidth:_target.width height:_target.height];
 }
 
@@ -610,8 +622,10 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
 }
 
 - (void)copy:(Reader *)r {
-    id<MTLTexture> src = [self textureForID:rd32(r)], dst = [self textureForID:rd32(r)];
-    if (!src || !dst || src == dst || !(dst.usage & MTLTextureUsageRenderTarget)) return;
+    uint32_t srcID = rd32(r), dstID = rd32(r), w = rd32(r), h = rd32(r);
+    id<MTLTexture> src = [self textureForID:srcID];
+    id<MTLTexture> dst = dstID == 0 ? _backBuffer : [self renderTargetForID:dstID width:w height:h];
+    if (!src || !dst || src == dst) return;
     [self endPass];
     MTLViewport vp = {0, 0, (double)dst.width, (double)dst.height, 0, 1};
     [self copyFrom:src to:dst pipeline:_copyPipe viewport:vp load:MTLLoadActionDontCare];
