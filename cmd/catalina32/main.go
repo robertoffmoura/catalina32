@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -25,15 +26,28 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
+// appParent returns the directory containing the .app bundle the executable is in (or the
+// executable's own directory).
+func appParent(bin string) string {
+	for d := filepath.Dir(bin); d != filepath.Dir(d); d = filepath.Dir(d) {
+		if strings.HasSuffix(d, ".app") {
+			return filepath.Dir(d)
+		}
+	}
+	return filepath.Dir(bin)
+}
+
 func main() {
 	gameFlag := flag.String("game", "", "path to the game's i386 Mach-O executable (default: $C32_BIN_PATH)")
 	flag.Parse()
-	binPath := envOrDefault("C32_BIN_PATH", "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga")
+	binPath := os.Getenv("C32_BIN_PATH")
 	if *gameFlag != "" {
 		binPath = *gameFlag
 	}
-	dataRoot := envOrDefault("C32_DATA_ROOT", "/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData")
-	saveRoot := envOrDefault("C32_SAVE_ROOT", "/workspace/Lego Star Wars Saga/SaveData")
+	if binPath == "" {
+		fmt.Fprintln(os.Stderr, "usage: catalina32 -game <path to the game's i386 executable> (or set C32_BIN_PATH)")
+		os.Exit(2)
+	}
 
 	img, err := macho32.LoadImage(binPath)
 	if err != nil {
@@ -46,6 +60,14 @@ func main() {
 		os.Exit(1)
 	}
 	prof := game.Profile
+	// Defaults: game data in the profile's folder next to the .app, saves under the user's
+	// application support directory.
+	dataRoot := envOrDefault("C32_DATA_ROOT", filepath.Join(appParent(binPath), prof.DataDir))
+	saveRoot := os.Getenv("C32_SAVE_ROOT")
+	if saveRoot == "" {
+		dir, _ := os.UserConfigDir()
+		saveRoot = filepath.Join(dir, "catalina32", game.ID, "SaveData")
+	}
 	var modInits []uint32
 	for _, fn := range img.ModInitFuncs {
 		if fn != 0 && (prof.ModInitLimit == 0 || fn < prof.ModInitLimit) {
@@ -75,6 +97,9 @@ func main() {
 
 	crt.RegisterCRT(vm, img, prof)
 	w32 := win32.NewWin32Env(vm, dataRoot, saveRoot)
+	if prof.ModulePath != "" {
+		w32.ModulePath = prof.ModulePath
+	}
 	w32.RegisterBoundaryThunks(vm, prof)
 	d3d := d3d9.NewSubsystem(vm)
 	d3d.RegisterIndirectXThunks(vm, prof)

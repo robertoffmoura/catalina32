@@ -206,11 +206,14 @@ type Subsystem struct {
 	AutoKeysMode string
 	// InputScript, when set by the game profile, presses scripted keys (DIK-indexed, 0x80 = down)
 	// for the C32_AUTO_KEYS mode in effect; used for unattended test runs.
-	InputScript       func(s *Subsystem, mode string, keys []byte)
-	CubeTexCount      uint64
-	TitleFirstFrame   uint64
-	CantinaFirstFrame uint64
-	CantinaDIPLogged  int
+	InputScript  func(s *Subsystem, mode string, keys []byte)
+	CubeTexCount uint64
+	// Scene milestones, set by the game profile through SceneHook (frame numbers, 0 = not yet):
+	// the first interactive menu frame and the first 3D gameplay frame. Headless runs render
+	// more often from FirstGameFrame on, and scripted input times key presses from them.
+	FirstMenuFrame uint64
+	FirstGameFrame uint64
+	SceneHook      func(s *Subsystem, ev SceneEvent)
 
 	// OnPresent, when set, is called with the new frame number at each device Present.
 	OnPresent func(frame uint64)
@@ -465,6 +468,14 @@ func (s *Subsystem) guestBuf(c *cpu.CPU, res *BufferDesc) uint32 {
 	return res.DataPtr
 }
 
+// SceneEvent tells SceneHook what just happened.
+type SceneEvent int
+
+const (
+	ScenePresent     SceneEvent = iota // a frame was presented
+	SceneIndexedDraw                   // an indexed draw is about to run (before FirstGameFrame only)
+)
+
 // unimplemented reports (once per method) a COM method the shims answer with S_OK and nothing
 // else, so missing features show up in the log instead of failing silently.
 func (s *Subsystem) unimplemented(c *cpu.CPU, iface string, winSlot int) {
@@ -695,9 +706,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if s.OnPresent != nil {
 			s.OnPresent(s.FrameCount)
 		}
-		if s.TitleFirstFrame == 0 && s.CubeTexCount >= 5 && s.FrameDrawCalls >= 10 {
-			s.TitleFirstFrame = s.FrameCount
-			fmt.Printf("[D3D9] Title screen detected at Frame #%d (CubeTexCount=%d, FrameDrawCalls=%d)\n", s.FrameCount, s.CubeTexCount, s.FrameDrawCalls)
+		if s.SceneHook != nil {
+			s.SceneHook(s, ScenePresent)
 		}
 		if s.rendering && (s.FrameDrawCalls > 0 || s.FrameCount == 1) {
 			s.submitFrame()
@@ -974,20 +984,20 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		s.DIPCount++
 		prims := c.Arg(6)
 		s.TriangleCount += uint64(prims)
-		if s.rendering || (s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0) {
-			vbRes := s.Resources[s.StreamSources[0]]
-			ibRes := s.Resources[s.BoundIndices]
+		vbRes, ibRes := s.Resources[s.StreamSources[0]], s.Resources[s.BoundIndices]
+		if s.FirstGameFrame == 0 && s.SceneHook != nil && vbRes != nil && ibRes != nil {
+			if s.SceneHook(s, SceneIndexedDraw); s.FirstGameFrame != 0 {
+				// Gameplay starts: draw this frame from here on.
+				s.rendering = true
+				s.frameTris = s.frameTris[:0]
+				s.queueClear(0xFF000000, 3)
+			}
+		}
+		if s.rendering {
 			stride := s.StreamStrides[0]
 			if vbRes != nil && ibRes != nil {
 				pVerts := vbRes.DataPtr + s.StreamOffsets[0]
 				is32 := ibRes.Format == 102 // D3DFMT_INDEX32
-				if s.CubeTexCount >= 8 && s.CantinaDIPLogged == 0 {
-					s.CantinaDIPLogged = 1
-					s.CantinaFirstFrame = s.FrameCount
-					s.rendering = true
-					s.frameTris = s.frameTris[:0]
-					s.queueClear(0xFF000000, 3)
-				}
 				s.rasterizeIndexedBatch(c, c.Arg(1), int32(c.Arg(2)), c.Arg(5), prims, pVerts, stride, ibRes.DataPtr, ibRes.Length, is32, false)
 			}
 		}

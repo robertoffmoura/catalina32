@@ -32,6 +32,10 @@ type Profile struct {
 	EntryPoint string
 	// ModInitLimit, when non-zero, runs only __mod_init_func entries below this address.
 	ModInitLimit uint32
+	// DataDir is the game data folder's name, next to the .app (the default data root).
+	DataDir string
+	// ModulePath is what GetModuleFileNameA reports (a Windows path).
+	ModulePath string
 	// UnmappedStubs lists engine->platform boundary functions that should return 1 and be logged
 	// instead of being emulated (platform services the runtime does not model yet).
 	UnmappedStubs []uint32

@@ -29,15 +29,15 @@ func inputScript(s *d3d9.Subsystem, mode string, keys []byte) {
 	f := s.FrameCount
 	switch mode {
 	case "boot", "episode1", "explore", "outside", "cantina":
-		// Auto-advance past initial device selection -> Main Menu -> New Game once TitleFirstFrame is reached.
-		if s.TitleFirstFrame > 0 && s.CubeTexCount < 8 && f >= s.TitleFirstFrame {
-			df := (f - s.TitleFirstFrame) % 50
+		// Auto-advance past initial device selection -> Main Menu -> New Game once FirstMenuFrame is reached.
+		if s.FirstMenuFrame > 0 && s.CubeTexCount < 8 && f >= s.FirstMenuFrame {
+			df := (f - s.FirstMenuFrame) % 50
 			if df >= 20 && df < 26 {
 				keys[0x1C] = 0x80 // DIK_RETURN
 			}
 		}
-		if s.CantinaFirstFrame > 0 && f >= s.CantinaFirstFrame {
-			cf := f - s.CantinaFirstFrame
+		if s.FirstGameFrame > 0 && f >= s.FirstGameFrame {
+			cf := f - s.FirstGameFrame
 			if (cf >= 10 && cf < 16) || (cf >= 40 && cf < 46) {
 				keys[0x1C] = 0x80 // DIK_RETURN
 			}

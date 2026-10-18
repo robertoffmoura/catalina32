@@ -120,7 +120,7 @@ func (s *Subsystem) wantRender(frame uint64) bool {
 	if s.shm != nil && s.FrameDrawCalls > 0 && s.FrameDrawCalls < 80 {
 		return true
 	}
-	if s.CantinaDIPLogged > 0 || (liveMode && s.TitleFirstFrame > 0) {
+	if s.FirstGameFrame > 0 || (liveMode && s.FirstMenuFrame > 0) {
 		if liveMode {
 			return true
 		}
@@ -850,7 +850,7 @@ func emitScreenTriangle(dst *[]queuedTri, v0, v1, v2 screenVertex, st *triState)
 type frameInfo struct {
 	frame, drawCalls, triangles, steps uint64
 	frameDrawCalls                     uint64
-	cubeTexCount                       uint64
+	inGame                             bool
 }
 
 // queueClear records a Clear (D3DCLEAR_TARGET = 1, D3DCLEAR_ZBUFFER = 2) in draw order.
@@ -866,7 +866,7 @@ func (s *Subsystem) submitFrame() {
 	s.WaitRender()
 	s.renderWait += time.Since(t)
 	info := frameInfo{frame: s.FrameCount, drawCalls: s.DrawCallCount, triangles: s.TriangleCount,
-		frameDrawCalls: s.FrameDrawCalls, cubeTexCount: s.CubeTexCount}
+		frameDrawCalls: s.FrameDrawCalls, inGame: s.FirstGameFrame > 0}
 	if s.VM != nil {
 		info.steps = s.VM.Steps
 	}
@@ -1508,13 +1508,13 @@ func (s *Subsystem) exportFrame(fi frameInfo) {
 		s.LatestPNG = pngBytes
 		s.FrameMu.Unlock()
 
-		// The PNG is written once; latest.png and cantina_latest.png become links to it.
+		// The PNG is written once; latest.png and game_latest.png become links to it.
 		latestPath := filepath.Join(s.FramesDir, "latest.png")
 		framePath := filepath.Join(s.FramesDir, fmt.Sprintf("frame_%04d.png", fi.frame))
 		switch {
-		case fi.cubeTexCount >= 8 && (fi.frameDrawCalls > 50 || exportAllFrames):
+		case fi.inGame && (fi.frameDrawCalls > 50 || exportAllFrames):
 			_ = os.WriteFile(framePath, pngBytes, 0644)
-			linkOrWrite(framePath, filepath.Join(s.FramesDir, "cantina_latest.png"), pngBytes)
+			linkOrWrite(framePath, filepath.Join(s.FramesDir, "game_latest.png"), pngBytes)
 			linkOrWrite(framePath, latestPath, pngBytes)
 		case fi.frame == 1 || fi.frame%30 == 0:
 			_ = os.WriteFile(framePath, pngBytes, 0644)

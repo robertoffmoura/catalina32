@@ -21,7 +21,7 @@ import (
 func main() {
 	startStr := flag.String("start", "0x00270500", "start VA")
 	endStr := flag.String("end", "0x002705b0", "end VA (exclusive)")
-	game := flag.String("game", "/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga", "i386 Mach-O executable")
+	game := flag.String("game", os.Getenv("C32_BIN_PATH"), "i386 Mach-O executable (default: $C32_BIN_PATH)")
 	showBytes := flag.Bool("bytes", false, "print instruction bytes")
 	flag.Parse()
 

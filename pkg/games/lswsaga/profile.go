@@ -11,6 +11,8 @@ var Profile = &profile.Profile{
 	// Static initialisers at or above this address belong to Feral's platform layer and are
 	// replaced by the runtime; only the game's own (NuEngine) initialisers are run.
 	ModInitLimit:  0x002e3be0,
+	DataDir:       "LEGOStarWarsSagaData",
+	ModulePath:    `C:\LEGOStarWarsSaga\LEGOStarWarsSaga.exe`,
 	UnmappedStubs: unmappedStubs,
 	Globals: map[string]uint32{
 		"MacDoze.LastError":    0x00b9fdac,

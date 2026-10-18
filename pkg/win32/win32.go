@@ -61,7 +61,7 @@ func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
 		StdioMap:        make(map[uint32]*OpenFile),
 		StartTime:       time.Now(),
 		CmdLineAddr:     cmdAddr,
-		ModulePath:      "C:\\LEGOStarWarsSaga\\LEGOStarWarsSaga.exe",
+		ModulePath:      `C:\Game\Game.exe`, // the game profile normally sets its own
 		CurrentThreadId: 1,
 		PerfCounter:     1000000,
 		TraceLog:        os.Getenv("C32_LIVE") != "1",

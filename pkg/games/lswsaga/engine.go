@@ -4,6 +4,7 @@ import (
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/d3d9"
 	"catalina32/pkg/profile"
+	"fmt"
 	"os"
 )
 
@@ -21,6 +22,7 @@ func Install(c *cpu.CPU, d3d *d3d9.Subsystem, prof *profile.Profile) {
 	c.RegisterIntercept(0x00620da0, "MacDoze::Unknown_620da0", returnZero)
 
 	d3d.InputScript = inputScript
+	d3d.SceneHook = sceneHook
 
 	// NuPostProcessRender (0x0001d900) composites the scene render target onto the back buffer; it
 	// runs unmodified now that render targets are modelled.
@@ -59,6 +61,22 @@ func registerCompiled(c *cpu.CPU) {
 // textures with flags & 0x3c0c are never skipped.
 func patchNuTexRead(c *cpu.CPU) {
 	c.PatchCode(0x00079088, []byte{0x90, 0x90, 0x90, 0x90, 0x90, 0x90})
+}
+
+// sceneHook recognises this game's scenes by how many cube maps it has loaded: 5 once the title
+// screen is up, 8 once the 3D hub (Mos Eisley Cantina) or a level has loaded.
+func sceneHook(s *d3d9.Subsystem, ev d3d9.SceneEvent) {
+	switch ev {
+	case d3d9.ScenePresent:
+		if s.FirstMenuFrame == 0 && s.CubeTexCount >= 5 && s.FrameDrawCalls >= 10 {
+			s.FirstMenuFrame = s.FrameCount
+			fmt.Printf("[D3D9] Title screen detected at Frame #%d (CubeTexCount=%d, FrameDrawCalls=%d)\n", s.FrameCount, s.CubeTexCount, s.FrameDrawCalls)
+		}
+	case d3d9.SceneIndexedDraw:
+		if s.CubeTexCount >= 8 {
+			s.FirstGameFrame = s.FrameCount
+		}
+	}
 }
 
 func returnZero(c *cpu.CPU) {
