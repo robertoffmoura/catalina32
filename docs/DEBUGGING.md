@@ -100,6 +100,11 @@ LZHUF_TEST_DIR=<C32_DUMP_LZHUF dir> C32_BIN_PATH=... go test ./pkg/crt -run LZHU
   `pkg/games/lswsaga/aot.go` was chosen.
 - **Live mode** prints FPS, x86 instructions per second and the share of time spent waiting
   for the renderer every 2 s.
+- **Profile-guided optimisation:** `cmd/catalina32/default.pgo` is a CPU profile that `go build`
+  uses automatically (hot paths inlined more aggressively; about 9% faster on the GPU path).
+  Refresh it after large changes to `pkg/cpu`, from an interpreter-only GPU-path run (no
+  `aot_gen.go`): `scripts/gpuroute.sh EXE GPUCHECK OUT cantina 1300000000 C32_CPUPROF=<file>`,
+  then copy the file over `default.pgo`.
 - **Replacing a hot function natively:** `go run ./cmd/lift -start A -end B` disassembles it;
   `go run ./cmd/sigmake -start A -end B [-list]` prints a signature for `pkg/profile` (with
   wildcards over operands that move between builds) and where its globals are addressed, so
