@@ -68,6 +68,8 @@ func RegisterCRT(c *CPUWrapper, img *macho32.Image, prof *profile.Profile) {
 		}
 	}
 
+	bindLZHUF(c, prof) // NuEngine's level-data decompressor, when the binary has it
+
 	// Native fast-paths for hot statically linked libogg / libvorbis bitstream & Huffman functions
 	prof.Bind(c, "ogg:oggpack_look", thunkOggpackLook)
 	prof.Bind(c, "ogg:oggpack_adv", thunkOggpackAdv)

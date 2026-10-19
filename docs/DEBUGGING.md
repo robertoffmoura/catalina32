@@ -77,7 +77,7 @@ scripts/gpuroute.sh EXE GPUCHECK OUTDIR ROUTE MAXSTEPS [VAR=value...]  # GPU pat
 go test ./...                                    # everything that needs no game files
 C32_BIN_PATH=".../LEGO Star Wars Saga" go test ./pkg/d3dsm ./pkg/games/lswsaga ./pkg/d3d9
 HLSL_TEST_DIR=<C32_DUMP_SHADERS dir> go test ./pkg/hlsl -run TestMSLMatchesEvaluator
-LZHUF_TEST_DIR=<C32_DUMP_LZHUF dir> C32_BIN_PATH=... go test ./pkg/games/lswsaga -run TestLZHUFMatchesGuest
+LZHUF_TEST_DIR=<C32_DUMP_LZHUF dir> C32_BIN_PATH=... go test ./pkg/crt -run LZHUF
 ```
 
 - **Translators.** The MSL tests compile the generated Metal code as C++20 with clang,
@@ -100,6 +100,10 @@ LZHUF_TEST_DIR=<C32_DUMP_LZHUF dir> C32_BIN_PATH=... go test ./pkg/games/lswsaga
   `pkg/games/lswsaga/aot.go` was chosen.
 - **Live mode** prints FPS, x86 instructions per second and the share of time spent waiting
   for the renderer every 2 s.
+- **Replacing a hot function natively:** `go run ./cmd/lift -start A -end B` disassembles it;
+  `go run ./cmd/sigmake -start A -end B [-list]` prints a signature for `pkg/profile` (with
+  wildcards over operands that move between builds) and where its globals are addressed, so
+  the replacement binds by signature in any binary that has the same code.
 
 ## Throwaway probes
 

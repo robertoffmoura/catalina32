@@ -27,12 +27,13 @@ Facts about this binary that took effort to find and still matter. Profile id `l
     (`pkg/profile/signatures.go`), and the inverse MDCT runs natively (`pkg/crt`).
   - Hot game functions are AOT-compiled; the list (from guest profiles of Episode I) is the
     `go:generate` line in `aot.go`.
-  - **Level data decompression** runs natively (`lzhuf.go`, `pkg/lh5`). The game streams
+  - **Level data decompression** runs natively (`pkg/crt/lzhuf.go`, `pkg/lh5`), found by
+    signature like the libogg/libvorbis paths, so other games with this decoder get it too. The game streams
     LHA `-lh5-` compressed blocks (ar002's decoder, 32-bit bit buffer) through
     `NuLZHUF_Decompress` 0x002734f0 (src, dst, srcSize, dstSize) whenever the player moves
     between areas; emulated, that froze the frame rate for seconds. The decoder's state is in
-    globals (addresses in `lzhuf.go`); the native version leaves them exactly as the game's
-    code would, and hands input the game would mis-decode back to it.
+    globals, whose addresses are read out of the matched code; the native version leaves them
+    exactly as the game's code would, and hands input the game would mis-decode back to it.
 - **Trace sensitivity.** The adapter description string must keep its length (26
   characters, "NVIDIA GeForce GTX 1080 Ti"). A different length shifts the startup
   instruction count, and with it every later preemption point, which breaks comparisons with
