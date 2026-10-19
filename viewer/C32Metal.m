@@ -31,6 +31,15 @@ enum {
 static const MTLPixelFormat kColorFormat = MTLPixelFormatRGBA8Unorm;
 static const MTLPixelFormat kDepthFormat = MTLPixelFormatDepth32Float;
 
+// pendingMarker stands in a function or pipeline dictionary for one still compiling.
+static id pendingMarker(void) {
+    static id marker;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ marker = [NSObject new]; });
+    return marker;
+}
+#define kPending pendingMarker()
+
 // ---- D3D -> Metal --------------------------------------------------------------------------
 
 static MTLVertexFormat vertexFormat(uint32_t d3dType) {
@@ -184,10 +193,20 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     uint32_t _errors;
     NSString *_errorDir;
 
-    NSMutableDictionary<NSNumber *, id> *_vfuncs, *_ffuncs; // id<MTLFunction> or NSNull (failed)
+    // Shaders compile in the background (C32_METAL_SYNC_SHADERS=1: on this thread, as before);
+    // draws that need one still compiling are skipped. Completions queue their results in
+    // _ready, applied on this thread (drainReady), so the dictionaries stay single-threaded;
+    // _generation drops results that arrive after a reconnect cleared them.
+    BOOL _syncShaders;
+    NSMutableArray<dispatch_block_t> *_ready;
+    atomic_uint _readyCount;
+    uint64_t _generation;
+    NSUInteger _skippedDraws;
+
+    NSMutableDictionary<NSNumber *, id> *_vfuncs, *_ffuncs; // id<MTLFunction>, NSNull (failed) or kPending
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *_textures; // textures and render targets
     NSMutableDictionary<NSString *, id<MTLTexture>> *_depths;   // per target size
-    NSMutableDictionary<NSString *, id> *_pipelines;            // id<MTLRenderPipelineState> or NSNull
+    NSMutableDictionary<NSString *, id> *_pipelines;            // id<MTLRenderPipelineState>, NSNull or kPending
     NSMutableDictionary<NSString *, id<MTLDepthStencilState>> *_depthStates;
     NSMutableDictionary<NSString *, id<MTLSamplerState>> *_samplers;
     id<MTLTexture> _backBuffer, _white2D, _whiteCube, _white3D;
@@ -224,6 +243,10 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         _depthStates = [NSMutableDictionary new];
         _samplers = [NSMutableDictionary new];
         _inFlight = dispatch_semaphore_create(kFramesInFlight);
+        const char *syncShaders = getenv("C32_METAL_SYNC_SHADERS");
+        _syncShaders = syncShaders && strcmp(syncShaders, "1") == 0;
+        _ready = [NSMutableArray new];
+        atomic_init(&_readyCount, 0);
         _errorDir = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"msl_errors"];
         atomic_init(&_stop, false);
         const char *wind = getenv("C32_METAL_WINDING");
@@ -399,6 +422,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
                         [_vfuncs removeAllObjects];
                         [_ffuncs removeAllObjects];
                         [_pipelines removeAllObjects];
+                        _generation++;
                         continue;
                     }
                 }
@@ -509,9 +533,42 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     NSString *source = [[NSString alloc] initWithBytes:src length:n encoding:NSUTF8StringEncoding];
     MTLCompileOptions *opt = [MTLCompileOptions new];
     opt.fastMathEnabled = NO; // keep IEEE semantics (inf/NaN), as the software renderer has
-    NSError *err = nil;
-    id<MTLLibrary> lib = [_device newLibraryWithSource:source options:opt error:&err];
-    id<MTLFunction> fn = [lib newFunctionWithName:stage == 0 ? @"vs_main" : @"ps_main"];
+    if (_syncShaders) {
+        NSError *err = nil;
+        id<MTLLibrary> lib = [_device newLibraryWithSource:source options:opt error:&err];
+        [self setLibrary:libID stage:stage function:[lib newFunctionWithName:stage == 0 ? @"vs_main" : @"ps_main"] source:source error:err];
+        return;
+    }
+    (stage == 0 ? _vfuncs : _ffuncs)[@(libID)] = kPending;
+    uint64_t gen = _generation;
+    [_device newLibraryWithSource:source options:opt completionHandler:^(id<MTLLibrary> lib, NSError *err) {
+        id<MTLFunction> fn = [lib newFunctionWithName:stage == 0 ? @"vs_main" : @"ps_main"];
+        [self whenReady:^{
+            if (gen == self->_generation) [self setLibrary:libID stage:stage function:fn source:source error:err];
+        }];
+    }];
+}
+
+// whenReady queues work for the render thread (from a compile completion).
+- (void)whenReady:(dispatch_block_t)block {
+    @synchronized(_ready) {
+        [_ready addObject:block];
+        atomic_fetch_add(&_readyCount, 1);
+    }
+}
+
+- (void)drainReady {
+    if (atomic_load(&_readyCount) == 0) return;
+    NSArray<dispatch_block_t> *blocks;
+    @synchronized(_ready) {
+        blocks = [_ready copy];
+        [_ready removeAllObjects];
+        atomic_store(&_readyCount, 0);
+    }
+    for (dispatch_block_t b in blocks) b();
+}
+
+- (void)setLibrary:(uint32_t)libID stage:(uint32_t)stage function:(id<MTLFunction>)fn source:(NSString *)source error:(NSError *)err {
     NSMutableDictionary *dict = stage == 0 ? _vfuncs : _ffuncs;
     if (!fn) {
         [[NSFileManager defaultManager] createDirectoryAtPath:_errorDir withIntermediateDirectories:YES attributes:nil error:NULL];
@@ -696,6 +753,18 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     return s;
 }
 
+- (void)setPipeline:(id<MTLRenderPipelineState>)pipe forKey:(NSString *)key error:(NSError *)err {
+    if (!pipe) {
+        [self log:@"pipeline %@: %@", key, err.localizedDescription];
+        [self reportError];
+    }
+    _pipelines[key] = pipe ?: (id)[NSNull null];
+}
+
+- (void)skippedDraw {
+    if (_skippedDraws++ == 0) [self log:@"skipping draws whose shaders are still compiling (C32_METAL_SYNC_SHADERS=1 waits instead)"];
+}
+
 - (void)draw:(Reader *)r {
     uint32_t vsID = rd32(r), psID = rd32(r), prim = rd32(r), nIdx = rd32(r), nAttr = rd32(r), nStream = rd32(r),
              nTex = rd32(r), nVC = rd32(r), nPC = rd32(r);
@@ -740,8 +809,13 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     const uint8_t *pconst = rdbytes(r, (size_t)nPC * 16);
     if (!indices || nIdx == 0) return;
 
+    [self drainReady];
     id vf = _vfuncs[@(vsID)], ff = _ffuncs[@(psID)];
     if (!vf || !ff || vf == [NSNull null] || ff == [NSNull null]) return;
+    if (vf == kPending || ff == kPending) {
+        [self skippedDraw];
+        return;
+    }
 
     // Pipeline: functions, vertex layout, blending and write mask.
     uint32_t strides[16] = {0};
@@ -799,14 +873,25 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
             ca.alphaBlendOperation = blendOp(opA);
         }
         pd.depthAttachmentPixelFormat = kDepthFormat;
-        NSError *err = nil;
-        pipe = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!pipe) {
-            [self log:@"pipeline %@: %@", key, err.localizedDescription];
-            [self reportError];
-            pipe = [NSNull null];
+        if (_syncShaders) {
+            NSError *err = nil;
+            pipe = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+            [self setPipeline:pipe forKey:key error:err];
+        } else {
+            _pipelines[key] = pipe = kPending;
+            uint64_t gen = _generation;
+            NSString *k = [key copy];
+            [_device newRenderPipelineStateWithDescriptor:pd completionHandler:^(id<MTLRenderPipelineState> state, NSError *err) {
+                [self whenReady:^{
+                    if (gen == self->_generation) [self setPipeline:state forKey:k error:err];
+                }];
+            }];
         }
-        _pipelines[key] = pipe;
+        pipe = _pipelines[key];
+    }
+    if (pipe == kPending) {
+        [self skippedDraw];
+        return;
     }
     if (pipe == [NSNull null]) return;
 
