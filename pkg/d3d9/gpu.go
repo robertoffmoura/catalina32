@@ -100,7 +100,8 @@ type gpuState struct {
 type gpuTexRef struct {
 	unit, kind                            uint32 // kind: msl.TextureKind the shader declares
 	desc                                  *BufferDesc
-	pixels                                []uint32 // the image at draw time (nil for render targets)
+	rt                                    bool     // a render target (drawn on the GPU, not uploaded)
+	pixels                                []uint32 // the image at draw time (nil when only raw is kept)
 	raw                                   []byte   // its compressed data (DXT formats), if kept
 	format                                uint32   // D3DFORMAT
 	width, height                         uint32
@@ -372,8 +373,8 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 			addrU: s.gpuSampler(u, sampAddressU), addrV: s.gpuSampler(u, sampAddressV), addrW: s.gpuSampler(u, sampAddressW),
 			magF: s.gpuSampler(u, sampMagFilter), minF: s.gpuSampler(u, sampMinFilter), mipF: s.gpuSampler(u, sampMipFilter)}
 		if s.BoundTextures[u] != 0 {
-			if res := s.ensureTextureDecoded(c, s.BoundTextures[u]); res != nil && (res.IsRT || len(res.Pixels) > 0) {
-				ref.desc, ref.width, ref.height, ref.format = res, res.Width, res.Height, res.Format
+			if res := s.gpuTextureRes(c, s.BoundTextures[u]); res != nil && (res.IsRT || len(res.Pixels) > 0 || res.Undecoded) {
+				ref.desc, ref.width, ref.height, ref.format, ref.rt = res, res.Width, res.Height, res.Format, res.IsRT
 				if !res.IsRT {
 					ref.pixels, ref.raw = res.Pixels, res.Raw
 				}
@@ -471,14 +472,21 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, raw []byte, form
 	if desc != nil && desc.Cube {
 		faces = 6
 	}
-	if len(pixels) == 0 || len(pixels) < int(w*h)*faces {
-		return e.id
-	}
-	if p := unsafe.Pointer(&pixels[0]); p != e.uploaded {
-		kind, data := uint32(1), unsafe.Slice((*byte)(unsafe.Pointer(&pixels[0])), int(w*h*4)*faces)
-		if bc := bcFormat(format); bc != 0 && raw != nil && w%4 == 0 && h%4 == 0 {
+	var p unsafe.Pointer // what was uploaded, to upload again only when it changes
+	var kind uint32
+	var data []byte
+	switch {
+	case faces == 1 && raw != nil && gpuUploadsRaw(format, w, h):
+		p, kind, data = unsafe.Pointer(&raw[0]), bcFormat(format), raw
+	case len(pixels) > 0 && len(pixels) >= int(w*h)*faces:
+		p, kind, data = unsafe.Pointer(&pixels[0]), 1, unsafe.Slice((*byte)(unsafe.Pointer(&pixels[0])), int(w*h*4)*faces)
+		if bc := bcFormat(format); bc != 0 && raw != nil && gpuUploadsRaw(format, w, h) {
 			kind, data = bc, raw
 		}
+	default:
+		return e.id
+	}
+	if p != e.uploaded {
 		if faces == 6 {
 			kind |= gpuCubeFlag
 		} else if desc != nil && desc.Mips && max(w, h) > 1 {
@@ -600,7 +608,7 @@ func (g *gpuEncoder) encodeDraw(d *gpuDrawCmd) {
 		switch {
 		case t.desc == nil:
 			texIDs = append(texIDs, 0)
-		case t.pixels == nil:
+		case t.rt:
 			texIDs = append(texIDs, g.targetID(t.desc))
 		default:
 			texIDs = append(texIDs, g.texture(t.desc, t.pixels, t.raw, t.format, t.width, t.height))

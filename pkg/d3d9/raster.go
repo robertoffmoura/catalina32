@@ -429,7 +429,9 @@ func decodeTexturePixels(data []byte, w, h, fmtCode uint32) []uint32 {
 
 // decodeDDSInMemory decodes a DDS file's top level; raw is its data as stored (aliasing guest
 // memory).
-func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32) (w, h, fmtCode uint32, pixels []uint32, raw []byte) {
+// decodeDDSInMemory reads a DDS file's level 0. lazy leaves pixels nil when the GPU path can
+// upload the data as it is (setLoadedTexture); software use decodes it later.
+func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32, lazy bool) (w, h, fmtCode uint32, pixels []uint32, raw []byte) {
 	if pSrc == 0 || srcSize < 128 || uint64(pSrc)+uint64(srcSize) > uint64(len(c.Mem)) {
 		return 64, 64, 21, nil, nil
 	}
@@ -439,7 +441,28 @@ func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32) (
 	}
 	hd, _ := readDDSHeader(c, pSrc, srcSize)
 	raw = c.Mem[pSrc+128 : pSrc+srcSize]
+	if lazy && gpuUploadsRaw(hd.format, hd.w, hd.h) && len(raw) >= int(texPitch(hd.w, hd.format)*texRows(hd.h, hd.format)) {
+		return hd.w, hd.h, hd.format, nil, raw
+	}
 	return hd.w, hd.h, hd.format, decodeTexturePixels(raw, hd.w, hd.h, hd.format), raw
+}
+
+// gpuUploadsRaw reports whether the GPU path sends a texture compressed (BC formats with whole
+// 4x4 blocks), so it never needs it decoded.
+func gpuUploadsRaw(format, w, h uint32) bool {
+	return bcFormat(format) != 0 && w%4 == 0 && h%4 == 0
+}
+
+// setLoadedTexture stores a D3DX-loaded texture: decoded pixels, or only its compressed data
+// (Undecoded) when decodeDDSInMemory left the decoding for later.
+func (s *Subsystem) setLoadedTexture(res *BufferDesc, pixels []uint32, raw []byte, w, h, format uint32) {
+	res.Raw = s.gpuRaw(raw, w, h, format)
+	switch {
+	case len(pixels) > 0:
+		res.Pixels = pixels
+	case res.Raw != nil:
+		res.Undecoded = true
+	}
 }
 
 // ddsHeader is what the texture loaders use from a DDS file's header.
@@ -514,6 +537,17 @@ func (s *Subsystem) gpuRaw(data []byte, w, h, format uint32) []byte {
 }
 
 func (s *Subsystem) ensureTextureDecoded(c *cpu.CPU, texObj uint32) *BufferDesc {
+	res := s.gpuTextureRes(c, texObj)
+	if res != nil && res.Undecoded && len(res.Pixels) == 0 {
+		res.Pixels = decodeTexturePixels(res.Raw, res.Width, res.Height, res.Format)
+		res.Undecoded = false
+	}
+	return res
+}
+
+// gpuTextureRes is ensureTextureDecoded for the GPU path, which uploads compressed textures as
+// they are: it leaves an Undecoded texture undecoded.
+func (s *Subsystem) gpuTextureRes(c *cpu.CPU, texObj uint32) *BufferDesc {
 	res := s.Resources[texObj]
 	if res == nil || res.IsRT {
 		return res

@@ -46,6 +46,7 @@ type BufferDesc struct {
 	Mips          bool // D3D gives the texture a mip chain (only level 0 is kept; the GPU path generates the rest)
 	Unlocked      bool // the game has written level 0 through a lock at least once
 	Stale         bool // level 0 changed since Pixels was decoded
+	Undecoded     bool // Pixels is decoded from Raw on first software use (GPU path loads)
 }
 
 // unlocked records a write to level 0 through LockRect/LockBox: the next draw re-decodes it.
@@ -1510,7 +1511,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 	srcSize := c.Arg(2)
 	pSrcInfo := c.Arg(12)
 	ppTex := c.Arg(14)
-	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize)
+	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize, s.gpu != nil)
 	mips := true // D3DX_DEFAULT or 0: a full chain, generated when the file has none
 	switch levels := c.Arg(5); levels {
 	case 1:
@@ -1528,8 +1529,9 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 	}
 	if ppTex != 0 {
 		tex := s.allocTextureLazy(c, w, h, fmtCode)
-		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
-			res.Pixels, res.Raw, res.Mips = pixels, s.gpuRaw(raw, w, h, fmtCode), mips
+		if res := s.Resources[tex]; res != nil {
+			s.setLoadedTexture(res, pixels, raw, w, h, fmtCode)
+			res.Mips = mips
 		}
 		c.Write32(ppTex, tex)
 	}
@@ -1542,11 +1544,12 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileInMemory(c *cpu.CPU) {
 	pSrc := c.Arg(1)
 	srcSize := c.Arg(2)
 	ppTex := c.Arg(3)
-	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize)
+	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize, s.gpu != nil)
 	if ppTex != 0 {
 		tex := s.allocTextureLazy(c, w, h, fmtCode)
-		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
-			res.Pixels, res.Raw, res.Mips = pixels, s.gpuRaw(raw, w, h, fmtCode), true // a full chain
+		if res := s.Resources[tex]; res != nil {
+			s.setLoadedTexture(res, pixels, raw, w, h, fmtCode)
+			res.Mips = true // a full chain
 		}
 		c.Write32(ppTex, tex)
 	}
