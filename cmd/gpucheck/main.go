@@ -95,6 +95,8 @@ type checker struct {
 	cubes                          map[uint32]bool      // texture id -> uploaded as a cube
 	cubeDraws, cubeBound           int                  // cube samplers in draws; those bound to an uploaded cube
 	scissorDraws                   int                  // draws with the scissor test on
+	partialViewport                int                  // draws whose viewport is not their whole target
+	targetW, targetH               uint32               // the current target's size
 	textures                       map[uint32][2]uint32 // id -> size (0 for targets)
 	out                            string
 	frames, draws, clears, targets int
@@ -157,6 +159,7 @@ func (c *checker) frame(frame uint64, d []byte) {
 			delete(c.textures, u(0))
 		case 4: // target
 			c.targets++
+			c.targetW, c.targetH = u(1), u(2)
 			if id := u(0); id != 0 {
 				c.textures[id] = [2]uint32{}
 			}
@@ -201,6 +204,9 @@ func (c *checker) draw(frame uint64, b []byte) {
 	}
 	if u(13) != 0 { // scissor test on
 		c.scissorDraws++
+	}
+	if vp := [4]uint32{u(9), u(10), u(11), u(12)}; vp != [4]uint32{0, 0, c.targetW, c.targetH} {
+		c.partialViewport++
 	}
 	p := 4 * (9 + 4 + 5 + 1 + 15) // header, viewport, scissor, fixed-texture flag, state
 	streams := map[uint32]int{}   // stream -> vertex count
@@ -270,5 +276,5 @@ func (c *checker) report() {
 		float64(c.bytes)/float64(c.frames)/(1<<20), float64(c.maxFrame)/(1<<20), float64(c.texBytes)/(1<<20), c.errors)
 	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3; +0x100 cube): %v\n", c.formats)
 	fmt.Printf("gpucheck: %d cube samplers in draws, %d bound to an uploaded cube map\n", c.cubeDraws, c.cubeBound)
-	fmt.Printf("gpucheck: %d draws with the scissor test on\n", c.scissorDraws)
+	fmt.Printf("gpucheck: %d draws with the scissor test on, %d with a viewport other than their whole target\n", c.scissorDraws, c.partialViewport)
 }

@@ -893,8 +893,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if c.Arg(1) == 0 {
 			s.bind(c, &s.curRT, c.Arg(2))
 			s.setRenderTarget(c.Arg(2))
-			// D3D9 resets the scissor rectangle to the whole new target.
+			// D3D9 resets the viewport and the scissor rectangle to the whole new target.
 			w, h := s.targetSize(c.Arg(2))
+			s.viewportX, s.viewportY, s.viewportW, s.viewportH = 0, 0, w, h
 			s.scissor = [4]uint32{0, 0, w, h}
 		}
 		if s.drawLogging() {

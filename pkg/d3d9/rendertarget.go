@@ -2,7 +2,6 @@ package d3d9
 
 import (
 	"fmt"
-	"math"
 	"unsafe"
 )
 
@@ -86,12 +85,14 @@ func (s *Subsystem) targetSize(surf uint32) (w, h uint32) {
 }
 
 // clearClip is the region a Clear may touch (inclusive bounds): D3D9 clears only inside the
-// scissor rectangle while the scissor test is on.
+// viewport, and inside the scissor rectangle while the scissor test is on.
 func (s *Subsystem) clearClip() (x0, y0, x1, y1 int) {
-	x0, y0, x1, y1 = 0, 0, math.MaxInt32, math.MaxInt32
+	x0, y0 = int(s.viewportX), int(s.viewportY)
+	x1, y1 = x0+int(s.viewportW)-1, y0+int(s.viewportH)-1
 	if s.renderState(rsScissorTestEnable) != 0 {
 		sc := s.scissor
-		x0, y0, x1, y1 = int(int32(sc[0])), int(int32(sc[1])), int(int32(sc[2]))-1, int(int32(sc[3]))-1
+		x0, y0 = max(x0, int(int32(sc[0]))), max(y0, int(int32(sc[1])))
+		x1, y1 = min(x1, int(int32(sc[2]))-1), min(y1, int(int32(sc[3]))-1)
 	}
 	return x0, y0, x1, y1
 }

@@ -599,6 +599,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     [_enc setRenderPipelineState:_clearPipes[(flags & 1) ? 1 : 0]];
     [_enc setDepthStencilState:[self depthStateCompare:MTLCompareFunctionAlways write:(flags & 2) != 0]];
     [_enc setCullMode:MTLCullModeNone];
+    [_enc setViewport:(MTLViewport){0, 0, (double)tw, (double)th, 0, 1}]; // not the last draw's: the rectangle is the region
     MTLScissorRect sc = {(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0 + 1), (NSUInteger)(y1 - y0 + 1)};
     [_enc setScissorRect:sc];
     float zv[4] = {z, 0, 0, 0};
