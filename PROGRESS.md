@@ -13,7 +13,7 @@ explain each change); keep this file to what is true now.
 | Rendering (software) | Reference renderer for headless runs and Linux. Doesn't draw render targets other than screen size (bloom buffers). |
 | Audio | Works (DirectSound mixing → shared memory → AudioQueue). |
 | Input | Keyboard and controllers (USB/Bluetooth, players 1 and 2, hot-plug) confirmed on the Mac. |
-| Speed | Metal: levels 35–50 FPS, Cantina ~57. The emulator is the limit there (~110M x86 instructions/s; 60 FPS needs ~170M). Shaders now compile in the background (no more 0.4–0.7 s stalls; untested on the Mac). The near-zero freezes when moving between areas came from the game's level-data decompressor running emulated; it now runs natively. Profile-guided optimisation and lazy texture decoding: 10–13% less time for the same emulated work (headless, GPU path). |
+| Speed | Metal: levels 35–50 FPS, Cantina ~57. The emulator is the limit there (~110M x86 instructions/s; 60 FPS needs ~170M). Shaders now compile in the background (no more 0.4–0.7 s stalls). The near-zero freezes when moving between areas came from the game's level-data decompressor running emulated; it now runs natively. Profile-guided optimisation and lazy texture decoding: 10–13% less time for the same emulated work (headless, GPU path). |
 | Platforms | Tested on an Intel MacBook Pro only. Apple Silicon builds exist but won't be tested (the user's decision). |
 
 ## Open
@@ -22,7 +22,7 @@ explain each change); keep this file to what is true now.
    - **Cause:** the game streams LHA `-lh5-` compressed level data as the player moves
      between areas, and its decoder ran emulated. Profiled over the user's session: more
      than half the guest instructions of those frames, 2–7 s per freeze.
-   - **Fix (in `master`, not yet confirmed on the Mac):** a native decoder (`pkg/lh5`)
+   - **Fix (confirmed on the Mac):** a native decoder (`pkg/lh5`)
      replaces `NuLZHUF_Decompress`, found by signature (`pkg/crt/lzhuf.go`, so any game built
      with this decoder gets it), leaving the game's state exactly as its own code would. `TestLZHUFMatchesGuest` checked all 3,724 blocks the session decompressed (output
      and decoder state identical) and, by default, a sample plus damaged and random input.
