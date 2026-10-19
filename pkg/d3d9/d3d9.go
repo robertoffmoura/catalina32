@@ -179,6 +179,7 @@ type Subsystem struct {
 	drawSeq             int32              // draw calls so far in the frame being recorded
 	curRT               uint32             // render target 0 as set by the game (0: back buffer)
 	viewportX, viewportY, viewportW, viewportH uint32 // SetViewport (GPU path only; defaults to the screen)
+	scissor             [4]uint32          // SetScissorRect: left, top, right, bottom (GPU path only; the target by default)
 	refs                map[uint32]*comRef // reference counts of device resources (refs.go)
 	origin              map[uint32]string  // C32_DRAW_LOG: how each texture/surface was created
 	devCalls            [128]int           // C32_DRAW_LOG: device method calls in the inspected frame
@@ -251,6 +252,7 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		TraceLog:       os.Getenv("C32_LIVE") != "1",
 		viewportW:      ScreenWidth,
 		viewportH:      ScreenHeight,
+		scissor:        [4]uint32{0, 0, ScreenWidth, ScreenHeight},
 	}
 
 	s.vtD3D9 = s.buildVTable(c, "IDirect3D9", 32, s.handleIDirect3D9)
@@ -891,6 +893,9 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if c.Arg(1) == 0 {
 			s.bind(c, &s.curRT, c.Arg(2))
 			s.setRenderTarget(c.Arg(2))
+			// D3D9 resets the scissor rectangle to the whole new target.
+			w, h := s.targetSize(c.Arg(2))
+			s.scissor = [4]uint32{0, 0, w, h}
 		}
 		if s.drawLogging() {
 			desc := ""
@@ -924,13 +929,19 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		count, pRects, flags, col, z := c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4), c.ArgF32(5)
 		s.LastClearColor = col
 		if s.rendering {
+			clear := func(x0, y0, x1, y1 int) {
+				if s.gpuFrame {
+					cx0, cy0, cx1, cy1 := s.clearClip()
+					x0, y0, x1, y1 = max(x0, cx0), max(y0, cy0), min(x1, cx1), min(y1, cy1)
+				}
+				s.queueClear(col, flags, z, x0, y0, x1, y1)
+			}
 			if count == 0 || pRects == 0 {
-				s.queueClear(col, flags, z, 0, 0, ScreenWidth-1, ScreenHeight-1)
+				clear(0, 0, ScreenWidth-1, ScreenHeight-1)
 			}
 			for i := uint32(0); i < count && pRects != 0 && i < 1024; i++ { // D3DRECT{x1, y1, x2, y2}, x2/y2 exclusive
 				r := pRects + i*16
-				s.queueClear(col, flags, z, int(int32(c.Read32(r))), int(int32(c.Read32(r+4))),
-					int(int32(c.Read32(r+8)))-1, int(int32(c.Read32(r+12)))-1)
+				clear(int(int32(c.Read32(r))), int(int32(c.Read32(r+4))), int(int32(c.Read32(r+8)))-1, int(int32(c.Read32(r+12)))-1)
 			}
 		}
 		c.Regs[cpu.RegEAX] = 0
@@ -939,6 +950,18 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		if vp != 0 && c.Read32(vp+8) != 0 && c.Read32(vp+12) != 0 {
 			s.viewportX, s.viewportY = c.Read32(vp+0), c.Read32(vp+4)
 			s.viewportW, s.viewportH = c.Read32(vp+8), c.Read32(vp+12)
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 75: // SetScissorRect(this, pRect): RECT{left, top, right, bottom}, right/bottom exclusive
+		if r := c.Arg(1); r != 0 {
+			s.scissor = [4]uint32{c.Read32(r), c.Read32(r + 4), c.Read32(r + 8), c.Read32(r + 12)}
+		}
+		c.Regs[cpu.RegEAX] = 0
+	case 76: // GetScissorRect(this, pRect)
+		if r := c.Arg(1); r != 0 {
+			for i, v := range s.scissor {
+				c.Write32(r+uint32(4*i), v)
+			}
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 48: // GetViewport(this, pViewport)

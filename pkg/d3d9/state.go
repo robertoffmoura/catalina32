@@ -13,6 +13,7 @@ const (
 	rsAlphaFunc              = 25
 	rsAlphaBlendEnable       = 27
 	rsColorWriteEnable       = 168
+	rsScissorTestEnable      = 174
 	rsBlendOp                = 171
 	rsBlendFactor            = 193
 	rsSeparateAlphaBlendEnab = 206

@@ -94,6 +94,7 @@ type checker struct {
 	formats                        map[uint32]int       // texture uploads by format
 	cubes                          map[uint32]bool      // texture id -> uploaded as a cube
 	cubeDraws, cubeBound           int                  // cube samplers in draws; those bound to an uploaded cube
+	scissorDraws                   int                  // draws with the scissor test on
 	textures                       map[uint32][2]uint32 // id -> size (0 for targets)
 	out                            string
 	frames, draws, clears, targets int
@@ -198,8 +199,11 @@ func (c *checker) draw(frame uint64, b []byte) {
 	if prim < 1 || prim > 5 {
 		c.fail("frame %d: primitive type %d", frame, prim)
 	}
-	p := 4 * (9 + 4 + 1 + 15) // header, viewport, fixed-texture flag, state
-	streams := map[uint32]int{} // stream -> vertex count
+	if u(13) != 0 { // scissor test on
+		c.scissorDraws++
+	}
+	p := 4 * (9 + 4 + 5 + 1 + 15) // header, viewport, scissor, fixed-texture flag, state
+	streams := map[uint32]int{}   // stream -> vertex count
 	type attr struct{ stream, offset, typ uint32 }
 	var attrs []attr
 	for i := 0; i < nAttr; i++ {
@@ -266,4 +270,5 @@ func (c *checker) report() {
 		float64(c.bytes)/float64(c.frames)/(1<<20), float64(c.maxFrame)/(1<<20), float64(c.texBytes)/(1<<20), c.errors)
 	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3; +0x100 cube): %v\n", c.formats)
 	fmt.Printf("gpucheck: %d cube samplers in draws, %d bound to an uploaded cube map\n", c.cubeDraws, c.cubeBound)
+	fmt.Printf("gpucheck: %d draws with the scissor test on\n", c.scissorDraws)
 }

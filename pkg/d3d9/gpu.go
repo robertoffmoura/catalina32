@@ -55,7 +55,7 @@ import (
 
 const (
 	gpuMagic      = 0x47323343 // "C32G"
-	gpuVersion    = 2 // bumped when gpuDraw gained a per-draw viewport
+	gpuVersion    = 3 // 2: gpuDraw gained a per-draw viewport; 3: and a scissor rectangle
 	gpuHeaderSize = 4096
 	gpuSlots      = 2
 	gpuSlotSize   = 48 << 20
@@ -113,6 +113,7 @@ type gpuDrawCmd struct {
 	indices      []uint32 // relative to the first vertex of the snapshots
 	prim         uint32   // D3DPRIMITIVETYPE (fans become lists)
 	viewport     [4]uint32 // SetViewport: x, y, width, height (the target's full size by default)
+	scissor      [5]uint32 // scissor test: enabled, x, y, width, height
 	state        gpuState
 	vsC, psC     [][4]float32
 	tex          []gpuTexRef
@@ -276,6 +277,10 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 	}
 	d := &gpuDrawCmd{elems: s.CurrentVD.Elements, prim: primType, state: s.gpuState(),
 		viewport: [4]uint32{s.viewportX, s.viewportY, s.viewportW, s.viewportH}}
+	if s.renderState(rsScissorTestEnable) != 0 {
+		sc := s.scissor
+		d.scissor = [5]uint32{1, sc[0], sc[1], sc[2] - min(sc[0], sc[2]), sc[3] - min(sc[1], sc[3])}
+	}
 	switch {
 	case s.progShading():
 		d.vs, d.vsKey = s.curVSProg, s.curVSProg
@@ -530,6 +535,7 @@ func varyingKey(v []msl.Varying) string {
 //	    attribute count, stream count, texture count, vertex constant count, fragment constant
 //	    count
 //	viewport: u32 x, y, width, height (SetViewport; the target's full size by default)
+//	scissor: u32 enabled, x, y, width, height (SetScissorRect, when D3DRS_SCISSORTESTENABLE is on)
 //	u32 fixed-texture flag
 //	state: u32 blend enable, src, dst, op, src alpha, dst alpha, op alpha (D3DBLEND/D3DBLENDOP),
 //	    blend factor (ARGB), colour write mask (D3DCOLORWRITEENABLE), z enable, z write, z func
@@ -583,6 +589,9 @@ func (g *gpuEncoder) encodeDraw(d *gpuDrawCmd) {
 		g.u32(v)
 	}
 	for _, v := range d.viewport {
+		g.u32(v)
+	}
+	for _, v := range d.scissor {
 		g.u32(v)
 	}
 	g.b32(d.fixedTex)

@@ -2,6 +2,7 @@ package d3d9
 
 import (
 	"fmt"
+	"math"
 	"unsafe"
 )
 
@@ -74,6 +75,25 @@ func (s *Subsystem) renderTargetFor(desc *BufferDesc) *renderTarget {
 		desc.IsRT = true
 	}
 	return rt
+}
+
+// targetSize is the size of render target surface surf (the back buffer: the screen).
+func (s *Subsystem) targetSize(surf uint32) (w, h uint32) {
+	if r := s.Resources[surf]; r != nil && surf != s.defaultBackBuf && r.Width != 0 && r.Height != 0 {
+		return r.Width, r.Height
+	}
+	return ScreenWidth, ScreenHeight
+}
+
+// clearClip is the region a Clear may touch (inclusive bounds): D3D9 clears only inside the
+// scissor rectangle while the scissor test is on.
+func (s *Subsystem) clearClip() (x0, y0, x1, y1 int) {
+	x0, y0, x1, y1 = 0, 0, math.MaxInt32, math.MaxInt32
+	if s.renderState(rsScissorTestEnable) != 0 {
+		sc := s.scissor
+		x0, y0, x1, y1 = int(int32(sc[0])), int(int32(sc[1])), int(int32(sc[2]))-1, int(int32(sc[3]))-1
+	}
+	return x0, y0, x1, y1
 }
 
 // stretchRect handles StretchRect(src, srcRect, dst, dstRect, filter) between screen-sized surfaces
