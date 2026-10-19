@@ -43,6 +43,7 @@ type BufferDesc struct {
 	IsDuplicate   bool
 	IsRT          bool // texture used as a render target: Pixels is its colour buffer
 	Cube          bool // cube texture: Pixels (and Raw) hold the six faces, +X -X +Y -Y +Z -Z
+	Mips          bool // D3D gives the texture a mip chain (only level 0 is kept; the GPU path generates the rest)
 	Unlocked      bool // the game has written level 0 through a lock at least once
 	Stale         bool // level 0 changed since Pixels was decoded
 }
@@ -797,6 +798,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		pp := c.Arg(7)
 		tex := s.allocTexture(c, w, h, fmtCode)
 		s.noteOrigin(tex, "CreateTexture(%dx%d fmt %d usage %x pool %d)", w, h, fmtCode, c.Arg(4), c.Arg(6))
+		s.Resources[tex].Mips = c.Arg(3) != 1 // Levels (0: a full chain)
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -1509,6 +1511,14 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 	pSrcInfo := c.Arg(12)
 	ppTex := c.Arg(14)
 	w, h, fmtCode, pixels, raw := s.decodeDDSInMemory(c, pSrc, srcSize)
+	mips := true // D3DX_DEFAULT or 0: a full chain, generated when the file has none
+	switch levels := c.Arg(5); levels {
+	case 1:
+		mips = false
+	case 0xFFFFFFFD: // D3DX_FROM_FILE
+		hd, _ := readDDSHeader(c, pSrc, srcSize)
+		mips = hd.mips > 1
+	}
 	if pSrcInfo != 0 {
 		c.Write32(pSrcInfo+0, w)
 		c.Write32(pSrcInfo+4, h)
@@ -1519,7 +1529,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileExA(c *cpu.CPU) {
 	if ppTex != 0 {
 		tex := s.allocTextureLazy(c, w, h, fmtCode)
 		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
-			res.Pixels, res.Raw = pixels, s.gpuRaw(raw, w, h, fmtCode)
+			res.Pixels, res.Raw, res.Mips = pixels, s.gpuRaw(raw, w, h, fmtCode), mips
 		}
 		c.Write32(ppTex, tex)
 	}
@@ -1536,7 +1546,7 @@ func (s *Subsystem) thunkD3DXCreateTextureFromFileInMemory(c *cpu.CPU) {
 	if ppTex != 0 {
 		tex := s.allocTextureLazy(c, w, h, fmtCode)
 		if res := s.Resources[tex]; res != nil && len(pixels) > 0 {
-			res.Pixels, res.Raw = pixels, s.gpuRaw(raw, w, h, fmtCode)
+			res.Pixels, res.Raw, res.Mips = pixels, s.gpuRaw(raw, w, h, fmtCode), true // a full chain
 		}
 		c.Write32(ppTex, tex)
 	}

@@ -148,7 +148,7 @@ func (c *checker) frame(frame uint64, d []byte) {
 			if f&0x100 != 0 { // cube: six faces
 				size *= 6
 			}
-			if size == 0 || f&^0x1FF != 0 || 16+size > n || (f&0xFF != 1 && (w%4 != 0 || h%4 != 0)) || (f&0x100 != 0 && w != h) {
+			if size == 0 || f&^0x3FF != 0 || 16+size > n || (f&0xFF != 1 && (w%4 != 0 || h%4 != 0)) || (f&0x100 != 0 && w != h) {
 				c.fail("texture %d: %dx%d format %#x in %d bytes", id, w, h, f, n)
 			}
 			c.textures[id] = [2]uint32{w, h}
@@ -274,7 +274,7 @@ func (c *checker) report() {
 	fmt.Printf("gpucheck: %d frames, %d draws (%.0f per frame), %d clears, %d target switches; %d libraries; average %.2f MB per frame (max %.2f MB), %.1f MB of texture uploads; %d errors\n",
 		c.frames, c.draws, float64(c.draws)/float64(c.frames), c.clears, c.targets, len(c.libs),
 		float64(c.bytes)/float64(c.frames)/(1<<20), float64(c.maxFrame)/(1<<20), float64(c.texBytes)/(1<<20), c.errors)
-	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3; +0x100 cube): %v\n", c.formats)
+	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3; +0x100 cube, +0x200 mip chain): %v\n", c.formats)
 	fmt.Printf("gpucheck: %d cube samplers in draws, %d bound to an uploaded cube map\n", c.cubeDraws, c.cubeBound)
 	fmt.Printf("gpucheck: %d draws with the scissor test on, %d with a viewport other than their whole target\n", c.scissorDraws, c.partialViewport)
 }

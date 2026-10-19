@@ -25,7 +25,8 @@ package d3d9
 //	gpuLibrary  u32 id, u32 stage (0 vertex, 1 fragment), u32 byte length, MSL source (padded)
 //	gpuTexture  u32 id, u32 width, u32 height, u32 format, data: 1 = RGBA8 (red first),
 //	            2/3/4 = BC1/BC2/BC3 (the game's DXT1/DXT3/DXT5 blocks, width and height multiples of 4);
-//	            format | 0x100 (gpuCubeFlag): a cube texture, its six faces (+X -X +Y -Y +Z -Z) one after another
+//	            format | 0x100 (gpuCubeFlag): a cube texture, its six faces (+X -X +Y -Y +Z -Z) one after another;
+//	            format | 0x200 (gpuMipsFlag): D3D gives the texture a mip chain, which the viewer generates
 //	gpuTexFree  u32 id
 //	gpuTarget   u32 id (0 = back buffer), u32 width, u32 height: draw into this target from now
 //	            on (created on first use; render targets are also textures with the same id)
@@ -454,6 +455,8 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, raw []byte, form
 		}
 		if faces == 6 {
 			kind |= gpuCubeFlag
+		} else if desc != nil && desc.Mips && max(w, h) > 1 {
+			kind |= gpuMipsFlag
 		}
 		if !g.room(len(data) + 32) {
 			g.full = true
@@ -471,8 +474,12 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, raw []byte, form
 	return e.id
 }
 
-// gpuCubeFlag marks a gpuTexture format word whose data is the six faces of a cube texture.
-const gpuCubeFlag = 0x100
+// Flags of a gpuTexture format word: the data is the six faces of a cube texture; the texture
+// has a mip chain (the stream carries level 0 and the viewer generates the rest).
+const (
+	gpuCubeFlag = 0x100
+	gpuMipsFlag = 0x200
+)
 
 // bcFormat is the stream's compressed texture format for a D3DFORMAT (0: none).
 func bcFormat(format uint32) uint32 {

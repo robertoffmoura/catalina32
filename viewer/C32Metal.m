@@ -527,6 +527,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
 - (void)texture:(Reader *)r {
     uint32_t texID = rd32(r), w = rd32(r), h = rd32(r), fmt = rd32(r);
     BOOL cube = (fmt & 0x100) != 0; // six faces, +X -X +Y -Y +Z -Z, one after another
+    BOOL mips = (fmt & 0x200) != 0 && !cube; // D3D gives it a mip chain: generate one
     fmt &= 0xFF;
     MTLPixelFormat pf = kColorFormat;
     size_t rowBytes = (size_t)w * 4, size = rowBytes * h;
@@ -553,7 +554,27 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 slice:face withBytes:px + face * faceSize
              bytesPerRow:rowBytes bytesPerImage:0]; // one image per call (0 except for 3D and array textures)
     }
+    if (mips) t = [self mipmapped:t];
     _textures[@(texID)] = t;
+}
+
+// mipmapped returns an RGBA copy of t with a full mip chain, generated on the GPU as D3DX
+// generates the chain of a file without one (Metal cannot generate mipmaps of compressed
+// formats, so level 0 is drawn into an uncompressed texture first). The work goes into the
+// frame's command buffer ahead of the draws that sample it.
+- (id<MTLTexture>)mipmapped:(id<MTLTexture>)t {
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kColorFormat width:t.width height:t.height mipmapped:YES];
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> m = [_device newTextureWithDescriptor:d];
+    if (!m || !_cb) return t;
+    [self endPass];
+    MTLViewport vp = {0, 0, (double)t.width, (double)t.height, 0, 1};
+    [self copyFrom:t to:m pipeline:_copyPipe viewport:vp load:MTLLoadActionDontCare];
+    id<MTLBlitCommandEncoder> blit = [_cb blitCommandEncoder];
+    [blit generateMipmapsForTexture:m];
+    [blit endEncoding];
+    return m;
 }
 
 // renderTargetForID returns texture tid as a render target of w x h, (re)creating it if it is
@@ -654,7 +675,8 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         d.magFilter = mag >= 2 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
         d.minFilter = mn >= 2 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
         if (mn == 3 || mag == 3) d.maxAnisotropy = 8;
-        d.mipFilter = MTLSamplerMipFilterNotMipmapped; // only level 0 is uploaded
+        // D3DTEXF_NONE / POINT / LINEAR (textures without a chain only have level 0 to sample)
+        d.mipFilter = mip == 0 ? MTLSamplerMipFilterNotMipmapped : (mip == 1 ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear);
         d.borderColor = MTLSamplerBorderColorOpaqueBlack;
         s = [_device newSamplerStateWithDescriptor:d];
         _samplers[key] = s;
