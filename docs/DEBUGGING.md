@@ -140,7 +140,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 |---|---|
 | `C32_BIN_PATH` | the game executable (or pass `-game`) |
 | `C32_DATA_ROOT` | game data folder (default: the profile's folder next to the `.app`) |
-| `C32_SAVE_ROOT` | save folder (default `~/Library/Application Support/catalina32/<game id>/SaveData`; `run_on_mac.sh` uses `.../catalina32/LEGO Star Wars Saga/SaveData`) |
+| `C32_SAVE_ROOT` | save folder (default `~/Library/Application Support/catalina32/<profile's SaveDir, else its id>/SaveData`; for this game `.../catalina32/LEGO Star Wars Saga/SaveData`, as `run_on_mac.sh` sets it) |
 | `C32_PROFILE` | force a game profile id instead of detecting it by SHA-256 |
 | `C32_AUTO_KEYS` | scripted input route (see above); `off` for none |
 | `C32_ATTACK_KEY` | key code (hex) the `cantina` route presses |
