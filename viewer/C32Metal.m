@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -224,6 +225,13 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     id<MTLRenderCommandEncoder> _enc;
     id<MTLTexture> _target, _targetDepth;
     MTLWinding _winding; // D3D9's front faces (C32_METAL_WINDING=ccw flips the convention)
+
+    // Headless frame dumps (C32_METAL_SNAPSHOT=<path>, C32_METAL_SNAPSHOT_EVERY=<N> frames):
+    // writes the composited back buffer (before window scaling) as a raw RGBA8 file with an
+    // 8-byte (u32 width, u32 height) header, for inspecting a run with no window on screen.
+    NSString *_snapshotPath;
+    uint64_t _snapshotEvery;
+    uint64_t _frameNumber;
 }
 
 - (instancetype)initWithPath:(NSString *)path layer:(CAMetalLayer *)layer {
@@ -251,6 +259,13 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         atomic_init(&_stop, false);
         const char *wind = getenv("C32_METAL_WINDING");
         _winding = (wind && strcmp(wind, "ccw") == 0) ? MTLWindingCounterClockwise : MTLWindingClockwise;
+        const char *snap = getenv("C32_METAL_SNAPSHOT");
+        if (snap) {
+            _snapshotPath = [NSString stringWithUTF8String:snap];
+            [[NSFileManager defaultManager] createDirectoryAtPath:_snapshotPath withIntermediateDirectories:YES attributes:nil error:NULL];
+            const char *every = getenv("C32_METAL_SNAPSHOT_EVERY");
+            _snapshotEvery = MAX(1, every ? atoi(every) : 1);
+        }
         [self setUpResources];
     }
     return self;
@@ -434,6 +449,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
             uint32_t length = *(uint32_t *)(_shm + 32 + 16 * k + 8);
             const uint8_t *data = _shm + kHeaderSize + (size_t)k * _slotSize;
             if (length <= _slotSize) {
+                _frameNumber = best;
                 [self drawFrame:data length:length];
             }
             atomic_store(state, 0);
@@ -950,6 +966,33 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     [_enc drawIndexedPrimitives:primitiveType(prim) indexCount:nIdx indexType:MTLIndexTypeUInt32 indexBuffer:ib indexBufferOffset:off];
 }
 
+// writeSnapshot blits the composited back buffer (before window scaling) into a shared buffer
+// and writes it, once the GPU is done, as a raw RGBA8 file with an 8-byte (u32 width, u32
+// height) header, named by the emulator's frame number (C32_METAL_SNAPSHOT=<directory>): a way
+// to inspect a run with no window on screen, and to find an exact frame afterwards.
+- (void)writeSnapshot {
+    uint32_t w = (uint32_t)_backBuffer.width, h = (uint32_t)_backBuffer.height;
+    NSUInteger rowBytes = (NSUInteger)w * 4, size = rowBytes * h;
+    id<MTLBuffer> staging = [_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> blit = [_cb blitCommandEncoder];
+    [blit copyFromTexture:_backBuffer sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+         sourceSize:MTLSizeMake(w, h, 1) toBuffer:staging destinationOffset:0
+         destinationBytesPerRow:rowBytes destinationBytesPerImage:size];
+    [blit endEncoding];
+    NSString *path = [_snapshotPath stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"frame_%06llu.raw", _frameNumber]];
+    [_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        NSString *tmp = [path stringByAppendingString:@".tmp"];
+        FILE *f = fopen(tmp.fileSystemRepresentation, "wb");
+        if (!f) return;
+        uint32_t hdr[2] = {w, h};
+        fwrite(hdr, sizeof hdr, 1, f);
+        fwrite(staging.contents, size, 1, f);
+        fclose(f);
+        rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
+    }];
+}
+
 - (void)present {
     [self endPass];
     id<CAMetalDrawable> drawable = [_layer nextDrawable];
@@ -961,6 +1004,9 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         float fullUV[4] = {0, 0, 1, 1};
         [self copyFrom:_backBuffer to:drawable.texture pipeline:_presentPipe viewport:vp uv:fullUV load:MTLLoadActionClear];
         [_cb presentDrawable:drawable];
+    }
+    if (_snapshotPath && _framesPresented % _snapshotEvery == 0) {
+        [self writeSnapshot];
     }
     _framesPresented++;
     if (!_active) {

@@ -617,10 +617,14 @@ static int macKeyCodeToDIK(unsigned short kc) {
         [_renderer start];
     }
 
-    [_window makeKeyAndOrderFront:nil];
-    [_window makeFirstResponder:_glView ? _glView : _fbView];
     [_glRenderer start];
-    [NSApp activateIgnoringOtherApps:YES];
+    // C32_HEADLESS=1: never show the window (Metal still renders into the offscreen back
+    // buffer; C32_METAL_SNAPSHOT dumps it to a file for inspection without a screen).
+    if (!(getenv("C32_HEADLESS") && strcmp(getenv("C32_HEADLESS"), "1") == 0)) {
+        [_window makeKeyAndOrderFront:nil];
+        [_window makeFirstResponder:_glView ? _glView : _fbView];
+        [NSApp activateIgnoringOtherApps:YES];
+    }
 
     AudioStreamBasicDescription fmt = {0};
     fmt.mSampleRate = 44100.0;
@@ -687,7 +691,8 @@ static void setUpMainMenu(void) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
-        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        BOOL headless = getenv("C32_HEADLESS") && strcmp(getenv("C32_HEADLESS"), "1") == 0;
+        [app setActivationPolicy:headless ? NSApplicationActivationPolicyProhibited : NSApplicationActivationPolicyRegular];
         setUpMainMenu();
         id<NSApplicationDelegate> del = nil;
         /* (Old macOS versions pass -psn_... to apps opened from the Finder: not a path.) */
