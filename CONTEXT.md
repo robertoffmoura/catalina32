@@ -45,6 +45,9 @@ bugs.
 
   `--build-app` builds a `.app`. Saves go to
   `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData`.
+- **Branches.** `master` is the product. `debug` is `master` plus debugging-only tools (a
+  session journal to record a live session and replay it headless, and Metal frame snapshots
+  without a window), documented in `debug`'s copy of these files; it stays ahead of `master`.
 - **Other Claude sessions** sometimes work in `/workspace/catalina32` at the same time (for
   example a session running on the Mac). Before editing, check `git status` and
   `git worktree list`.
