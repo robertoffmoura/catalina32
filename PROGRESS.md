@@ -13,7 +13,7 @@ explain each change); keep this file to what is true now.
 | Rendering (software) | Reference renderer for headless runs and Linux. Doesn't draw render targets other than screen size (bloom buffers). |
 | Audio | Works (DirectSound mixing → shared memory → AudioQueue). |
 | Input | Keyboard and controllers (USB/Bluetooth, players 1 and 2, hot-plug) confirmed on the Mac. |
-| Speed | Metal: levels 35–50 FPS, Cantina ~57. The emulator is the limit there (~110M x86 instructions/s; 60 FPS needs ~170M). Short hitches (0.4–0.7 s) when new shaders compile. The near-zero freezes when moving between areas came from the game's level-data decompressor running emulated; it now runs natively (`pkg/lh5`, branch `lzhuf-native`, to be confirmed on the Mac). |
+| Speed | Metal: levels 35–50 FPS, Cantina ~57. The emulator is the limit there (~110M x86 instructions/s; 60 FPS needs ~170M). Shaders now compile in the background (no more 0.4–0.7 s stalls; untested on the Mac). The near-zero freezes when moving between areas came from the game's level-data decompressor running emulated; it now runs natively. Profile-guided optimisation and lazy texture decoding: 10–13% less time for the same emulated work (headless, GPU path). |
 | Platforms | Tested on an Intel MacBook Pro only. Apple Silicon builds exist but won't be tested (the user's decision). |
 
 ## Open
@@ -22,28 +22,32 @@ explain each change); keep this file to what is true now.
    - **Cause:** the game streams LHA `-lh5-` compressed level data as the player moves
      between areas, and its decoder ran emulated. Profiled over the user's session: more
      than half the guest instructions of those frames, 2–7 s per freeze.
-   - **Fix (branch `lzhuf-native`, not yet confirmed on the Mac):** a native decoder
-     (`pkg/lh5`) replaces `NuLZHUF_Decompress`, leaving the game's state exactly as its own code
-     would. `TestLZHUFMatchesGuest` checked all 3,724 blocks the session decompressed (output
+   - **Fix (in `master`, not yet confirmed on the Mac):** a native decoder (`pkg/lh5`)
+     replaces `NuLZHUF_Decompress`, found by signature (`pkg/crt/lzhuf.go`, so any game built
+     with this decoder gets it), leaving the game's state exactly as its own code would. `TestLZHUFMatchesGuest` checked all 3,724 blocks the session decompressed (output
      and decoder state identical) and, by default, a sample plus damaged and random input.
      About 145× faster than the emulated decoder there. `C32_NO_NATIVE_LZHUF=1` switches it off.
 2. **Heavy areas run at 20–30 FPS** (the emulator at full speed). Compiled code already runs
    83% of the instructions there; the other 17% is spread over hundreds of interpreted
-   functions and takes about 37% of the host time. Next lever: choose the AOT list
-   automatically from profiles of several scenes (backlog).
+   functions and takes about 37% of the host time. The AOT compiler can't fix this for users
+   (see Speed in the backlog); the generic answer is a JIT.
 
 ## Backlog
 
 - **Play further:** other chapters and episodes, vehicle levels, Free Play, bonus areas. Expect
   unimplemented calls to show up as crashes or drawing errors (logged once by name).
-- **Speed** (on hold until the user asks):
-  - compile shaders in the background and keep Metal's shader cache between runs (fixes the
-    hitches; generic);
-  - choose the AOT function list automatically from a profile instead of the hand-picked
-    list in `pkg/games/lswsaga/aot.go`;
-  - better AOT code (values kept in registers, flags skipped across blocks);
-  - a JIT, much later if ever (likely `pkg/cpu` rewritten in Rust behind the same
-    interface).
+- **Speed.** Everything here must work for users with no developer tools and no per-game work.
+  - **A JIT** (hot guest code compiled to machine code at run time, on the user's own copy):
+    the real answer for the heavy areas. Large; likely `pkg/cpu` in Rust behind the same
+    interface. The interpreter's dispatch loop is near what plain Go allows (precomputed
+    addresses and batched step counts measured as noise).
+  - **The AOT compiler (`cmd/c32aot`) is a developer tool.** It translates the game's code to
+    Go, which needs Go on the user's machine and can't be distributed (it is game code), so a
+    shipped app can't count on it; hand-picking or auto-choosing its function list doesn't
+    change that.
+  - Native replacements bind by signature (`cmd/sigmake`, `pkg/profile/signatures*.go`) so
+    they reach every game with the same code; refresh `cmd/catalina32/default.pgo` after large
+    `pkg/cpu` changes (`docs/DEBUGGING.md`).
 - **Rendering gaps:**
   - mip chains for cube maps (they have one level; D3DX would generate more);
   - the game's own mip levels where a file has them (the viewer generates them instead);
