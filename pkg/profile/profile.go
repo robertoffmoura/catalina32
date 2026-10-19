@@ -34,6 +34,9 @@ type Profile struct {
 	ModInitLimit uint32
 	// DataDir is the game data folder's name, next to the .app (the default data root).
 	DataDir string
+	// SaveDir names the game's folder under the user's catalina32 settings directory, which
+	// holds its SaveData (the profile ID when empty).
+	SaveDir string
 	// ModulePath is what GetModuleFileNameA reports (a Windows path).
 	ModulePath string
 	// UnmappedStubs lists engine->platform boundary functions that should return 1 and be logged

@@ -66,7 +66,11 @@ func main() {
 	saveRoot := os.Getenv("C32_SAVE_ROOT")
 	if saveRoot == "" {
 		dir, _ := os.UserConfigDir()
-		saveRoot = filepath.Join(dir, "catalina32", game.ID, "SaveData")
+		name := prof.SaveDir
+		if name == "" {
+			name = game.ID
+		}
+		saveRoot = filepath.Join(dir, "catalina32", name, "SaveData")
 	}
 	var modInits []uint32
 	for _, fn := range img.ModInitFuncs {

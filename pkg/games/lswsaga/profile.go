@@ -12,6 +12,7 @@ var Profile = &profile.Profile{
 	// replaced by the runtime; only the game's own (NuEngine) initialisers are run.
 	ModInitLimit:  0x002e3be0,
 	DataDir:       "LEGOStarWarsSagaData",
+	SaveDir:       "LEGO Star Wars Saga", // where run_on_mac.sh and the .app have always kept saves
 	ModulePath:    `C:\LEGOStarWarsSaga\LEGOStarWarsSaga.exe`,
 	UnmappedStubs: unmappedStubs,
 	Globals: map[string]uint32{
