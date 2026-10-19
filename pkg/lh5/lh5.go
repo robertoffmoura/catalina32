@@ -15,7 +15,7 @@ import "errors"
 const (
 	DicBits    = 13
 	DicSize    = 1 << DicBits              // the window
-	NC         = 256 + 256 + 2 - Threshold // literal and match-length codes (510)
+	NC         = 255 + 256 + 2 - Threshold // literal and match-length codes (510)
 	NP         = DicBits + 1               // position codes
 	NT         = 16 + 3                    // code-length codes
 	NPT        = NT                        // max(NT, NP)
