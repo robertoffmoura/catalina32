@@ -825,7 +825,9 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     [_enc setVertexBuffer:_defaultAttr offset:0 atIndex:kDefaultAttrBuffer];
     id<MTLBuffer> vb = [self upload:vconst length:(NSUInteger)nVC * 16 offset:&off];
     [_enc setVertexBuffer:vb offset:off atIndex:0];
-    float vstate[4] = {-1.0f / (float)_target.width, 1.0f / (float)_target.height, 0, 0}; // D3D9 pixel centres
+    // D3D9 pixel centres: D3D9 samples pixel (i, j) at viewport position (i, j), Metal at
+    // (i + 0.5, j + 0.5), so geometry moves half a pixel right and down (+x, -y in clip space).
+    float vstate[4] = {(float)(1.0 / vw), (float)(-1.0 / vh), 0, 0};
     [_enc setVertexBytes:vstate length:sizeof vstate atIndex:1];
     id<MTLBuffer> pb = [self upload:pconst length:(NSUInteger)nPC * 16 offset:&off];
     [_enc setFragmentBuffer:pb offset:off atIndex:0];
