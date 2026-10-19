@@ -31,9 +31,15 @@ explain each change); keep this file to what is true now.
      - lock/discard staleness.
    - **Fixed along the way** (not the cause): `SetViewport` was ignored, which made the bloom
      chain smear.
-   - **Next:** find the draw that paints the overexposed pixels with the software renderer's
-     per-pixel footprints (`C32_DRAW_LOG=<frame>`; see `docs/DEBUGGING.md`), using a recorded
-     session (`run_on_mac.sh --record`) to reach the room headless.
+   - **Likely cause, fix on branch `pixel-centres` (untested on the Mac):** the viewer's D3D9
+     half-pixel offset pointed the wrong way (left/up instead of right/down), a whole pixel off
+     per pass. Found by replaying `recordings/20261019-164028` (outside the Cantina) to frame
+     1800 with `C32_DRAW_LOG`: the scene goes into a 1280x720 texture, is StretchRect'd to
+     512x512, blurred four times (ping-pong between two 512x512 targets) and added back onto
+     the scene. Four passes at 512 put the glow about 10 px left of and 6 px above the image.
+     The software renderer can't show this: it skips targets that aren't screen-sized.
+   - **If it persists:** the overexposed faces/hands may be a separate problem; next step
+     would be the draw footprints in the pillar room (`C32_DRAW_LOG=<frame>`).
 2. **Unmerged branches.** The newest Metal work is on `metal-gaps`, ahead of `debug`:
    - scissor rectangles;
    - viewport reset on `SetRenderTarget`;
