@@ -9,7 +9,7 @@ explain each change); keep this file to what is true now.
 |---|---|
 | Boot, menus, saving and loading | Works. Saves land in `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData` and load after relaunch. |
 | Gameplay | Cantina hub and all of Episode I Chapter 1 (Negotiations) played through by the user without crashes. Nothing past that has been tried. |
-| Rendering (Metal) | Default on the Mac. The user confirmed: room and door transitions, pause-menu background, cut-scenes, TC-14's chrome (cube maps). One open bug (double vision, below). |
+| Rendering (Metal) | Default on the Mac. The user confirmed: room and door transitions, pause-menu background, cut-scenes, TC-14's chrome (cube maps), the `metal-gaps` work (mipmaps, scissor, viewport reset, fog). One open bug (double vision, below). |
 | Rendering (software) | Reference renderer for headless runs and Linux. Doesn't draw render targets other than screen size (bloom buffers). |
 | Audio | Works (DirectSound mixing → shared memory → AudioQueue). |
 | Input | Keyboard and controllers (USB/Bluetooth, players 1 and 2, hot-plug) confirmed on the Mac. |
@@ -40,8 +40,8 @@ explain each change); keep this file to what is true now.
    - mipmaps;
    - fixed-function fog.
 
-   Each passed the headless checks but none has been seen on the Mac yet. `debug` is ahead of
-   `master`. Nothing is pushed.
+   The user tested it on the Mac: no crashes or new bugs; the double vision is still there.
+   `docs` contains `metal-gaps`. `debug` is ahead of `master`. Nothing is pushed.
 3. **Two save locations.** `run_on_mac.sh` saves under `.../catalina32/LEGO Star Wars Saga/`,
    the bare binary under `.../catalina32/lswsaga/`. Pick one.
 
