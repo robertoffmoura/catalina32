@@ -13,13 +13,24 @@ explain each change); keep this file to what is true now.
 | Rendering (software) | Reference renderer for headless runs and Linux. Doesn't draw render targets other than screen size (bloom buffers). |
 | Audio | Works (DirectSound mixing → shared memory → AudioQueue). |
 | Input | Keyboard and controllers (USB/Bluetooth, players 1 and 2, hot-plug) confirmed on the Mac. |
-| Speed | Metal: levels 35–50 FPS, Cantina ~57. The emulator is the limit there (~110M x86 instructions/s; 60 FPS needs ~170M). Short hitches when new shaders compile or textures upload. Some scenes drop to near 0 FPS (below). |
+| Speed | Metal: levels 35–50 FPS, Cantina ~57. The emulator is the limit there (~110M x86 instructions/s; 60 FPS needs ~170M). Short hitches (0.4–0.7 s) when new shaders compile. The near-zero freezes when moving between areas came from the game's level-data decompressor running emulated; it now runs natively (`pkg/lh5`, branch `lzhuf-native`, to be confirmed on the Mac). |
 | Platforms | Tested on an Intel MacBook Pro only. Apple Silicon builds exist but won't be tested (the user's decision). |
 
 ## Open
 
-1. **Frame rate near zero in some scenes** of the chapter after Negotiations, in gameplay and
-   in cut-scenes (reported by the user; not yet reproduced).
+1. **Frame rate near zero when moving between areas** of the chapter after Negotiations.
+   - **Cause:** the game streams LHA `-lh5-` compressed level data as the player moves
+     between areas, and its decoder ran emulated. Profiled over the user's session: more
+     than half the guest instructions of those frames, 2–7 s per freeze.
+   - **Fix (branch `lzhuf-native`, not yet confirmed on the Mac):** a native decoder
+     (`pkg/lh5`) replaces `NuLZHUF_Decompress`, leaving the game's state exactly as its own code
+     would. `TestLZHUFMatchesGuest` checked all 3,724 blocks the session decompressed (output
+     and decoder state identical) and, by default, a sample plus damaged and random input.
+     About 145× faster than the emulated decoder there. `C32_NO_NATIVE_LZHUF=1` switches it off.
+2. **Heavy areas run at 20–30 FPS** (the emulator at full speed). Compiled code already runs
+   83% of the instructions there; the other 17% is spread over hundreds of interpreted
+   functions and takes about 37% of the host time. Next lever: choose the AOT list
+   automatically from profiles of several scenes (backlog).
 
 ## Backlog
 
