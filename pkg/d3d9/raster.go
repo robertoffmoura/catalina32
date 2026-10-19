@@ -84,6 +84,8 @@ type queuedTri struct {
 	copyDstDesc  *BufferDesc
 	copySrc      []byte
 	copyDst      []byte
+	copySrcRect  [4]int32  // copyOp: x0, y0, x1, y1 (inclusive), within the source/destination's own
+	copyDstRect  [4]int32  // pixel space (StretchRect: the whole surface unless the game gave rects)
 	draw         *drawCmd  // real-shader draw, expanded into triangles on the render goroutine
 	pdraw        *progDraw // bytecode-shader draw, expanded into prog triangles on the render goroutine
 	prog         *progTri  // bytecode-shader triangle (rasterized with its pixel shader)
@@ -97,6 +99,29 @@ type queuedTri struct {
 	additive     bool
 	x2           bool
 	id           int32 // draw call within the frame (C32_DRAW_LOG)
+}
+
+// blitRectRGBA nearest-neighbour scales srcRect of a stride-wide RGBA8 buffer into dstRect of
+// another (both x0, y0, x1, y1 inclusive): StretchRect, when the two rects differ in size or
+// position (real StretchRect calls copy only the requested sub-rect, not the whole surface).
+func blitRectRGBA(dst, src []byte, dstRect, srcRect [4]int32, stride int) {
+	dw, dh := dstRect[2]-dstRect[0]+1, dstRect[3]-dstRect[1]+1
+	sw, sh := srcRect[2]-srcRect[0]+1, srcRect[3]-srcRect[1]+1
+	if dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 {
+		return
+	}
+	for dy := int32(0); dy < dh; dy++ {
+		sy := srcRect[1] + dy*sh/dh
+		for dx := int32(0); dx < dw; dx++ {
+			sx := srcRect[0] + dx*sw/dw
+			so := (int(sy)*stride + int(sx)) * 4
+			do := (int(dstRect[1]+dy)*stride + int(dstRect[0]+dx)) * 4
+			if so < 0 || so+4 > len(src) || do < 0 || do+4 > len(dst) {
+				continue
+			}
+			copy(dst[do:do+4], src[so:so+4])
+		}
+	}
 }
 
 // nearW is the minimum clip-space w accepted before perspective divide. Triangles crossing it are clipped.
@@ -1060,7 +1085,7 @@ func (s *Subsystem) drawOps(ops []queuedTri, ids []int32) {
 			if src == nil {
 				src = s.Framebuffer.Pix
 			}
-			copy(ops[i].copyDst, src)
+			blitRectRGBA(ops[i].copyDst, src, ops[i].copyDstRect, ops[i].copySrcRect, ScreenWidth)
 			start = i + 1
 		}
 	}

@@ -11,7 +11,7 @@
 
 enum {
     kMagic = 0x47323343, // "C32G"
-    kVersion = 4, // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog
+    kVersion = 5, // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog; 5: gpuCopy rects
     kHeaderSize = 4096,
     kCmdLibrary = 1,
     kCmdTexture = 2,
@@ -132,9 +132,10 @@ static NSString *const kUtilitySource = @
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct QOut { float4 pos [[position]]; float2 uv; };\n"
-    "vertex QOut quad_vs(uint vid [[vertex_id]], constant float4& r [[buffer(0)]]) {\n"
+    "vertex QOut quad_vs(uint vid [[vertex_id]], constant float4& r [[buffer(0)]], constant float4& uvRect [[buffer(1)]]) {\n"
     "    float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
-    "    QOut o; o.pos = float4(p * 2.0 - 1.0, r.x, 1.0); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
+    "    QOut o; o.pos = float4(p * 2.0 - 1.0, r.x, 1.0);\n"
+    "    o.uv = mix(uvRect.xy, uvRect.zw, float2(p.x, 1.0 - p.y)); return o;\n"
     "}\n"
     "fragment float4 clear_fs(constant float4& c [[buffer(0)]]) { return c; }\n"
     "fragment float4 copy_fs(QOut in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
@@ -570,7 +571,8 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     if (!m || !_cb) return t;
     [self endPass];
     MTLViewport vp = {0, 0, (double)t.width, (double)t.height, 0, 1};
-    [self copyFrom:t to:m pipeline:_copyPipe viewport:vp load:MTLLoadActionDontCare];
+    float fullUV[4] = {0, 0, 1, 1};
+    [self copyFrom:t to:m pipeline:_copyPipe viewport:vp uv:fullUV load:MTLLoadActionDontCare];
     id<MTLBlitCommandEncoder> blit = [_cb blitCommandEncoder];
     [blit generateMipmapsForTexture:m];
     [blit endEncoding];
@@ -624,8 +626,10 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     MTLScissorRect sc = {(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0 + 1), (NSUInteger)(y1 - y0 + 1)};
     [_enc setScissorRect:sc];
     float zv[4] = {z, 0, 0, 0};
+    float fullUV[4] = {0, 0, 1, 1};
     float cv[4] = {((color >> 16) & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f, (color & 0xFF) / 255.0f, (color >> 24) / 255.0f};
     [_enc setVertexBytes:zv length:sizeof zv atIndex:0];
+    [_enc setVertexBytes:fullUV length:sizeof fullUV atIndex:1];
     [_enc setFragmentBytes:cv length:sizeof cv atIndex:0];
     [_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     MTLScissorRect full = {0, 0, _target.width, _target.height};
@@ -636,8 +640,8 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     return tid == 0 ? _backBuffer : _textures[@(tid)];
 }
 
-// copyFrom draws src scaled over dst (no depth), as StretchRect does.
-- (void)copyFrom:(id<MTLTexture>)src to:(id<MTLTexture>)dst pipeline:(id<MTLRenderPipelineState>)pipe viewport:(MTLViewport)vp load:(MTLLoadAction)load {
+// copyFrom draws uvRect of src scaled over vp of dst (no depth), as StretchRect does.
+- (void)copyFrom:(id<MTLTexture>)src to:(id<MTLTexture>)dst pipeline:(id<MTLRenderPipelineState>)pipe viewport:(MTLViewport)vp uv:(const float *)uvRect load:(MTLLoadAction)load {
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = dst;
     rp.colorAttachments[0].loadAction = load;
@@ -648,6 +652,7 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     [e setRenderPipelineState:pipe];
     float zv[4] = {0, 0, 0, 0};
     [e setVertexBytes:zv length:sizeof zv atIndex:0];
+    [e setVertexBytes:uvRect length:4 * sizeof(float) atIndex:1];
     [e setFragmentTexture:src atIndex:0];
     [e setFragmentSamplerState:_linear atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -656,12 +661,19 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
 
 - (void)copy:(Reader *)r {
     uint32_t srcID = rd32(r), dstID = rd32(r), w = rd32(r), h = rd32(r);
+    int32_t sx0 = (int32_t)rd32(r), sy0 = (int32_t)rd32(r), sx1 = (int32_t)rd32(r), sy1 = (int32_t)rd32(r);
+    int32_t dx0 = (int32_t)rd32(r), dy0 = (int32_t)rd32(r), dx1 = (int32_t)rd32(r), dy1 = (int32_t)rd32(r);
     id<MTLTexture> src = [self textureForID:srcID];
     id<MTLTexture> dst = dstID == 0 ? _backBuffer : [self renderTargetForID:dstID width:w height:h];
     if (!src || !dst || src == dst) return;
     [self endPass];
-    MTLViewport vp = {0, 0, (double)dst.width, (double)dst.height, 0, 1};
-    [self copyFrom:src to:dst pipeline:_copyPipe viewport:vp load:MTLLoadActionDontCare];
+    // The destination is Y-down (row 0 at the top, as D3D9 surfaces are); the viewport's origin
+    // is also top-left, so dst rows map directly. The source is sampled by quad_vs's UV, which
+    // already flips Y (see quad_vs), so the source rect's Y range is used as-is too.
+    double sw = (double)src.width, sh = (double)src.height;
+    float uvRect[4] = {(float)(sx0 / sw), (float)(sy0 / sh), (float)((sx1 + 1) / sw), (float)((sy1 + 1) / sh)};
+    MTLViewport vp = {(double)dx0, (double)dy0, (double)(dx1 - dx0 + 1), (double)(dy1 - dy0 + 1), 0, 1};
+    [self copyFrom:src to:dst pipeline:_copyPipe viewport:vp uv:uvRect load:MTLLoadActionDontCare];
 }
 
 - (id<MTLSamplerState>)samplerU:(uint32_t)u v:(uint32_t)v w:(uint32_t)w mag:(uint32_t)mag min:(uint32_t)mn mip:(uint32_t)mip {
@@ -861,7 +873,8 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
         double scale = MIN(ds.width / 1280.0, ds.height / 720.0);
         double w = 1280.0 * scale, h = 720.0 * scale;
         MTLViewport vp = {(ds.width - w) / 2, (ds.height - h) / 2, w, h, 0, 1};
-        [self copyFrom:_backBuffer to:drawable.texture pipeline:_presentPipe viewport:vp load:MTLLoadActionClear];
+        float fullUV[4] = {0, 0, 1, 1};
+        [self copyFrom:_backBuffer to:drawable.texture pipeline:_presentPipe viewport:vp uv:fullUV load:MTLLoadActionClear];
         [_cb presentDrawable:drawable];
     }
     _framesPresented++;

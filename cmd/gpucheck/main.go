@@ -166,8 +166,8 @@ func (c *checker) frame(frame uint64, d []byte) {
 			}
 		case 5: // clear
 			c.clears++
-		case 6: // copy (the destination becomes a render target)
-			if n != 16 || u(2) == 0 || u(3) == 0 {
+		case 6: // copy (the destination becomes a render target), then source and destination rects
+			if n != 48 || u(2) == 0 || u(3) == 0 {
 				c.fail("frame %d: copy command of %d bytes, size %dx%d", frame, n, u(2), u(3))
 			}
 			if dst := u(1); dst != 0 {

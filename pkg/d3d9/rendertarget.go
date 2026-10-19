@@ -3,6 +3,8 @@ package d3d9
 import (
 	"fmt"
 	"unsafe"
+
+	"catalina32/pkg/cpu"
 )
 
 // Render targets: SetRenderTarget(0, surface) queues a target switch; the render goroutine draws
@@ -97,9 +99,35 @@ func (s *Subsystem) clearClip() (x0, y0, x1, y1 int) {
 	return x0, y0, x1, y1
 }
 
-// stretchRect handles StretchRect(src, srcRect, dst, dstRect, filter) between screen-sized surfaces
-// (whole surfaces): a copy queued in order with the draws.
-func (s *Subsystem) stretchRect(src, dst uint32) {
+// readRect reads a Win32 RECT {LONG left, top, right, bottom} (right/bottom exclusive, as D3D9
+// RECTs are) and returns it as inclusive x0, y0, x1, y1; nil for a NULL pointer (the whole surface).
+func (s *Subsystem) readRect(c *cpu.CPU, p uint32) *[4]int32 {
+	if p == 0 {
+		return nil
+	}
+	r := [4]int32{int32(c.Read32(p)), int32(c.Read32(p + 4)), int32(c.Read32(p+8)) - 1, int32(c.Read32(p+12)) - 1}
+	return &r
+}
+
+// wholeRect is x0, y0, x1, y1 (inclusive) covering a w x h surface.
+func wholeRect(w, h uint32) [4]int32 { return [4]int32{0, 0, int32(w) - 1, int32(h) - 1} }
+
+// clampRect clamps r (x0, y0, x1, y1 inclusive) to a w x h surface, defaulting to the whole
+// surface when r is nil (the D3D9 meaning of a NULL pRect).
+func clampRect(r *[4]int32, w, h uint32) [4]int32 {
+	if r == nil {
+		return wholeRect(w, h)
+	}
+	x0, y0, x1, y1 := r[0], r[1], r[2], r[3]
+	x0, y0 = max(x0, 0), max(y0, 0)
+	x1, y1 = min(x1, int32(w)-1), min(y1, int32(h)-1)
+	return [4]int32{x0, y0, x1, y1}
+}
+
+// stretchRect handles StretchRect(src, srcRect, dst, dstRect, filter): a copy, scaled if the two
+// rects differ in size, queued in order with the draws. srcRect/dstRect are nil for a NULL pRect
+// (the whole surface, as D3D9 defines it).
+func (s *Subsystem) stretchRect(src, dst uint32, srcRect, dstRect *[4]int32) {
 	sd, dd := s.Resources[src], s.Resources[dst]
 	if s.gpuFrame {
 		op := queuedTri{copyOp: true, copySrcDesc: sd, copyDstDesc: dd}
@@ -109,6 +137,15 @@ func (s *Subsystem) stretchRect(src, dst uint32) {
 		if dst == s.defaultBackBuf {
 			op.copyDstDesc = nil
 		}
+		sw, sh := uint32(ScreenWidth), uint32(ScreenHeight)
+		if op.copySrcDesc != nil {
+			sw, sh = op.copySrcDesc.Width, op.copySrcDesc.Height
+		}
+		dw, dh := uint32(ScreenWidth), uint32(ScreenHeight)
+		if op.copyDstDesc != nil {
+			dw, dh = op.copyDstDesc.Width, op.copyDstDesc.Height
+		}
+		op.copySrcRect, op.copyDstRect = clampRect(srcRect, sw, sh), clampRect(dstRect, dw, dh)
 		for _, d := range []*BufferDesc{op.copySrcDesc, op.copyDstDesc} {
 			if d != nil {
 				d.IsRT = true
@@ -125,7 +162,8 @@ func (s *Subsystem) stretchRect(src, dst uint32) {
 	if dd == nil || dst == s.defaultBackBuf || dd.Width != ScreenWidth || dd.Height != ScreenHeight {
 		return
 	}
-	op := queuedTri{copyOp: true, copyDst: s.renderTargetFor(dd).pix}
+	op := queuedTri{copyOp: true, copyDst: s.renderTargetFor(dd).pix,
+		copySrcRect: clampRect(srcRect, ScreenWidth, ScreenHeight), copyDstRect: clampRect(dstRect, ScreenWidth, ScreenHeight)}
 	if sd != nil {
 		op.copySrc = s.renderTargetFor(sd).pix
 	}

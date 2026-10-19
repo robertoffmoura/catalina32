@@ -32,8 +32,10 @@ package d3d9
 //	            on (created on first use; render targets are also textures with the same id)
 //	gpuClear    u32 flags (1 colour, 2 depth), u32 colour (ARGB), f32 depth, i32 x0, y0, x1, y1
 //	            (inclusive)
-//	gpuCopy     u32 source id, u32 destination id, u32 destination width, height (whole
-//	            targets, scaled; the destination becomes a render target if it is not one)
+//	gpuCopy     u32 source id, u32 destination id, u32 destination width, height (of the whole
+//	            destination surface; it becomes a render target if it is not one), u32
+//	            srcX0,Y0,X1,Y1, dstX0,Y0,X1,Y1 (inclusive, each in its own surface's pixel
+//	            space; scaled if the rects differ in size)
 //	gpuDraw     see encodeDraw
 //	gpuFrameEnd (no payload): present the back buffer
 
@@ -56,7 +58,7 @@ import (
 
 const (
 	gpuMagic      = 0x47323343 // "C32G"
-	gpuVersion    = 4          // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog
+	gpuVersion    = 5          // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog; 5: gpuCopy rects
 	gpuHeaderSize = 4096
 	gpuSlots      = 2
 	gpuSlotSize   = 48 << 20
@@ -740,6 +742,12 @@ func (g *gpuEncoder) encodeFrame(ops []queuedTri, frame uint64) bool {
 			}
 			g.u32(w)
 			g.u32(h)
+			for _, v := range op.copySrcRect {
+				g.u32(uint32(v))
+			}
+			for _, v := range op.copyDstRect {
+				g.u32(uint32(v))
+			}
 			g.end(l)
 		default:
 			skipped++

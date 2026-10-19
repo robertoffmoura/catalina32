@@ -889,7 +889,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		}
 		c.Regs[cpu.RegEAX] = 0
 	case 34: // StretchRect(this, pSourceSurface, pSourceRect, pDestSurface, pDestRect, Filter)
-		s.stretchRect(c.Arg(1), c.Arg(3))
+		s.stretchRect(c.Arg(1), c.Arg(3), s.readRect(c, c.Arg(2)), s.readRect(c, c.Arg(4)))
 		c.Regs[cpu.RegEAX] = 0
 	case 37: // SetRenderTarget(this, RenderTargetIndex, pRenderTarget)
 		if c.Arg(1) == 0 {
