@@ -56,7 +56,7 @@ import (
 
 const (
 	gpuMagic      = 0x47323343 // "C32G"
-	gpuVersion    = 4 // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog
+	gpuVersion    = 4          // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog
 	gpuHeaderSize = 4096
 	gpuSlots      = 2
 	gpuSlotSize   = 48 << 20
@@ -111,8 +111,8 @@ type gpuDrawCmd struct {
 	vsKey, psKey any // shader identities for library caching (psKey nil: fixed function)
 	elems        []VertexElement
 	streams      [16]streamSnap
-	indices      []uint32 // relative to the first vertex of the snapshots
-	prim         uint32   // D3DPRIMITIVETYPE (fans become lists)
+	indices      []uint32  // relative to the first vertex of the snapshots
+	prim         uint32    // D3DPRIMITIVETYPE (fans become lists)
 	viewport     [4]uint32 // SetViewport: x, y, width, height (the target's full size by default)
 	scissor      [5]uint32 // scissor test: enabled, x, y, width, height
 	fog          [5]uint32 // fixed-function fog: mode (msl.Fog*), start, end, density (float bits), colour

@@ -170,45 +170,45 @@ type Subsystem struct {
 	padPacket         [ShmPads]uint32
 
 	// Real shader pipeline (shaders.go)
-	RealShaders         bool
-	shaderCache         map[string]*compiledShader
-	shaderBlobs         map[uint32]*compiledShader // ID3DXBuffer data -> shader
-	shaderObjs          map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
-	constTables         map[uint32]*compiledShader
-	curVS, curPS        *compiledShader
-	curVSObj, curPSObj  uint32             // bound shader objects (as the game sees them)
-	drawSeq             int32              // draw calls so far in the frame being recorded
-	curRT               uint32             // render target 0 as set by the game (0: back buffer)
-	viewportX, viewportY, viewportW, viewportH uint32 // SetViewport (GPU path only; defaults to the screen)
-	scissor             [4]uint32          // SetScissorRect: left, top, right, bottom (GPU path only; the target by default)
-	refs                map[uint32]*comRef // reference counts of device resources (refs.go)
-	origin              map[uint32]string  // C32_DRAW_LOG: how each texture/surface was created
-	devCalls            [128]int           // C32_DRAW_LOG: device method calls in the inspected frame
-	renderTargets       map[*BufferDesc]*renderTarget
-	curTargetPix        []byte // emulation side: target of the operations being queued (nil: back buffer)
-	curTargetSkip       bool
-	loggedRTSize        bool
-	costMu              sync.Mutex
-	bins                [numBands][]int32 // per-band operation lists (render goroutine)
-	bandShaders         []*progShader
-	drawCosts           map[int32]*drawCost
-	gpu                 *gpuEncoder // GPU path (C32_GPU_SHM): frames go to the Metal viewer
-	gpuFrame            bool        // the frame being recorded goes to the GPU
-	curTargetDesc       *BufferDesc // GPU path: target of the operations being queued
-	drawPix             []byte      // render goroutine: current target (nil: back buffer)
-	drawSkip            bool
-	dumpedTex           map[uint32]bool
-	shadeWorkers        []*shadeWorker            // render goroutine only
-	expanded            []queuedTri               // render goroutine only
-	expandedProg        []queuedTri               // render goroutine only
-	progObjs            map[uint32]*d3dsm.Program // shader objects created from bytecode
-	stubBlobs           map[uint32]bool           // placeholder bytecode returned by D3DXCompileShader (not executable)
-	curVSProg           *d3dsm.Program
-	curPSProg           *d3dsm.Program
-	samplerStates       [16][14]uint32
-	sampSet             [16][14]bool
-	shaderErrors        int
-	loggedConstTableSet bool // emulator time blocked on the previous frame's drawing
+	RealShaders                                bool
+	shaderCache                                map[string]*compiledShader
+	shaderBlobs                                map[uint32]*compiledShader // ID3DXBuffer data -> shader
+	shaderObjs                                 map[uint32]*compiledShader // IDirect3D{Vertex,Pixel}Shader9 -> shader
+	constTables                                map[uint32]*compiledShader
+	curVS, curPS                               *compiledShader
+	curVSObj, curPSObj                         uint32             // bound shader objects (as the game sees them)
+	drawSeq                                    int32              // draw calls so far in the frame being recorded
+	curRT                                      uint32             // render target 0 as set by the game (0: back buffer)
+	viewportX, viewportY, viewportW, viewportH uint32             // SetViewport (GPU path only; defaults to the screen)
+	scissor                                    [4]uint32          // SetScissorRect: left, top, right, bottom (GPU path only; the target by default)
+	refs                                       map[uint32]*comRef // reference counts of device resources (refs.go)
+	origin                                     map[uint32]string  // C32_DRAW_LOG: how each texture/surface was created
+	devCalls                                   [128]int           // C32_DRAW_LOG: device method calls in the inspected frame
+	renderTargets                              map[*BufferDesc]*renderTarget
+	curTargetPix                               []byte // emulation side: target of the operations being queued (nil: back buffer)
+	curTargetSkip                              bool
+	loggedRTSize                               bool
+	costMu                                     sync.Mutex
+	bins                                       [numBands][]int32 // per-band operation lists (render goroutine)
+	bandShaders                                []*progShader
+	drawCosts                                  map[int32]*drawCost
+	gpu                                        *gpuEncoder // GPU path (C32_GPU_SHM): frames go to the Metal viewer
+	gpuFrame                                   bool        // the frame being recorded goes to the GPU
+	curTargetDesc                              *BufferDesc // GPU path: target of the operations being queued
+	drawPix                                    []byte      // render goroutine: current target (nil: back buffer)
+	drawSkip                                   bool
+	dumpedTex                                  map[uint32]bool
+	shadeWorkers                               []*shadeWorker            // render goroutine only
+	expanded                                   []queuedTri               // render goroutine only
+	expandedProg                               []queuedTri               // render goroutine only
+	progObjs                                   map[uint32]*d3dsm.Program // shader objects created from bytecode
+	stubBlobs                                  map[uint32]bool           // placeholder bytecode returned by D3DXCompileShader (not executable)
+	curVSProg                                  *d3dsm.Program
+	curPSProg                                  *d3dsm.Program
+	samplerStates                              [16][14]uint32
+	sampSet                                    [16][14]bool
+	shaderErrors                               int
+	loggedConstTableSet                        bool // emulator time blocked on the previous frame's drawing
 
 	KeyMu        sync.Mutex
 	KeyHoldUntil [256]uint64
