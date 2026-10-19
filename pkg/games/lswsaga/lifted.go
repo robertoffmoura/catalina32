@@ -13,6 +13,7 @@ import (
 // functions in this binary (LZHUF archive decompression, string helpers, SSE matrix math, and
 // buffer copy/search routines).
 func registerLifted(c *cpu.CPU) {
+	c.RegisterIntercept(lzhufDecompress, "native::NuLZHUF_Decompress_002734f0", nativeNuLZHUFDecompress)
 	c.RegisterIntercept(0x0027ce00, "lifted::NuLZHUF_DecodeC_0027ce00", liftedNuLZHUFDecodeC)
 	c.RegisterIntercept(0x0027d9d0, "lifted::NuLZHUF_DecodeP_0027d9d0", liftedNuLZHUFDecodeP)
 	c.RegisterIntercept(0x00270500, "lifted::NuStrLen_00270500", liftedNuStrLen)

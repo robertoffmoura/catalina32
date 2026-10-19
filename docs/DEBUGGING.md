@@ -77,6 +77,7 @@ scripts/gpuroute.sh EXE GPUCHECK OUTDIR ROUTE MAXSTEPS [VAR=value...]  # GPU pat
 go test ./...                                    # everything that needs no game files
 C32_BIN_PATH=".../LEGO Star Wars Saga" go test ./pkg/d3dsm ./pkg/games/lswsaga ./pkg/d3d9
 HLSL_TEST_DIR=<C32_DUMP_SHADERS dir> go test ./pkg/hlsl -run TestMSLMatchesEvaluator
+LZHUF_TEST_DIR=<C32_DUMP_LZHUF dir> C32_BIN_PATH=... go test ./pkg/games/lswsaga -run TestLZHUFMatchesGuest
 ```
 
 - **Translators.** The MSL tests compile the generated Metal code as C++20 with clang,
@@ -134,6 +135,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_PORT` | HTTP preview port (browser viewer); `0` picks a free one |
 | `C32_NO_AOT` | `1`: don't install the AOT-compiled functions |
 | `C32_NO_DCACHE` | `1`: disable the decoded-instruction cache |
+| `C32_NO_NATIVE_LZHUF` | `1`: decompress level data with the game's own (emulated) decoder |
 
 **Diagnostics**
 
@@ -141,6 +143,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 |---|---|
 | `C32_DRAW_LOG` | per-draw log for the listed frames |
 | `C32_DUMP_SHADERS` | dump HLSL sources |
+| `C32_DUMP_LZHUF` | save every compressed block the game decompresses (`NNNNN_<size>.lh5`) |
 | `C32_CPUPROF`, `C32_CPUPROF_AFTER`, `C32_CPUPROF_FRAMES` | host CPU profile |
 | `C32_GUEST_PROF`, `C32_PROF_TOP` | guest call-stack sampling |
 | `C32_TRACE_CALLS` | track guest calls (slow) |
@@ -160,4 +163,5 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | Variable | Effect |
 |---|---|
 | `HLSL_TEST_DIR` | a `C32_DUMP_SHADERS` directory for the HLSL tests |
+| `LZHUF_TEST_DIR` | a `C32_DUMP_LZHUF` directory for `TestLZHUFMatchesGuest` |
 | `C32_BIN_PATH` | enables tests that read shaders or code from the game executable |
