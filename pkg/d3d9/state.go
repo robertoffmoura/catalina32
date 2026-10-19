@@ -12,6 +12,12 @@ const (
 	rsAlphaRef               = 24
 	rsAlphaFunc              = 25
 	rsAlphaBlendEnable       = 27
+	rsFogEnable              = 28
+	rsFogColor               = 34
+	rsFogTableMode           = 35
+	rsFogStart               = 36
+	rsFogEnd                 = 37
+	rsFogDensity             = 38
 	rsColorWriteEnable       = 168
 	rsScissorTestEnable      = 174
 	rsBlendOp                = 171
@@ -32,6 +38,8 @@ var rsDefaults = [256]uint32{
 	rsColorWriteEnable: 0xF,
 	rsBlendOp:          1, // ADD
 	rsBlendFactor:      0xFFFFFFFF,
+	rsFogEnd:           0x3F800000, // 1.0
+	rsFogDensity:       0x3F800000, // 1.0
 }
 
 // renderState returns the effective value of a render state: what the game set, or the device

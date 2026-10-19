@@ -95,7 +95,8 @@ type Shader interface {
 //
 //	buffer(0): float constant registers (float4[256])
 //	buffer(1): renderer state: S[0].xy = D3D9 half-pixel offset in clip units (vertex);
-//	           S[0].x = alpha test function (D3DCMPFUNC, 8 = always), S[0].y = reference (fragment)
+//	           S[0].x = alpha test function (D3DCMPFUNC, 8 = always), S[0].y = reference,
+//	           S[1], S[2] = fixed-function fog (see FogStage) (fragment)
 //	buffer(2+i): vertex stream i
 //	texture(n)/sampler(n): sampler register n
 const (
@@ -103,3 +104,32 @@ const (
 	StateBuffer       = 1
 	FirstVertexBuffer = 2
 )
+
+// FogVarying is the varying carrying a vertex shader's fog output (oFog / FOG semantic).
+const FogVarying = "FOG0"
+
+// Fog modes in S[1].x: off, vertex fog (the fog factor the vertex function writes), and table
+// (per-pixel) fog from the pixel's depth with D3DRS_FOGTABLEMODE's EXP, EXP2 or LINEAR curve.
+const (
+	FogOff = iota
+	FogVertex
+	FogExp
+	FogExp2
+	FogLinear
+)
+
+// FogStage is D3D9's fixed-function fog, applied to colour 0 o.c0 after a pixel shader older
+// than ps_3_0 (or the fixed fragment function): S[1] = (mode, start, end, density), S[2].rgb =
+// fog colour; factor is the expression giving the vertex fog factor (1 when the vertex function
+// writes none). Colour = f * colour + (1 - f) * fog colour, alpha unchanged.
+func FogStage(factor string) string {
+	return `	if (S[1].x != 0) { // fixed-function fog
+		int mode = int(S[1].x);
+		float d = pin.pos.z, f = ` + factor + `;
+		if (mode == 2) f = exp(-d * S[1].w);
+		else if (mode == 3) f = exp(-(d * S[1].w) * (d * S[1].w));
+		else if (mode == 4) f = S[1].z != S[1].y ? (S[1].z - d) / (S[1].z - S[1].y) : 1.0f;
+		o.c0.rgb = mix(S[2].rgb, o.c0.rgb, saturate(f));
+	}
+`
+}

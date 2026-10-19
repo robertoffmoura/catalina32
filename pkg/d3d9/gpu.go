@@ -56,7 +56,7 @@ import (
 
 const (
 	gpuMagic      = 0x47323343 // "C32G"
-	gpuVersion    = 3 // 2: gpuDraw gained a per-draw viewport; 3: and a scissor rectangle
+	gpuVersion    = 4 // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog
 	gpuHeaderSize = 4096
 	gpuSlots      = 2
 	gpuSlotSize   = 48 << 20
@@ -115,6 +115,7 @@ type gpuDrawCmd struct {
 	prim         uint32   // D3DPRIMITIVETYPE (fans become lists)
 	viewport     [4]uint32 // SetViewport: x, y, width, height (the target's full size by default)
 	scissor      [5]uint32 // scissor test: enabled, x, y, width, height
+	fog          [5]uint32 // fixed-function fog: mode (msl.Fog*), start, end, density (float bits), colour
 	state        gpuState
 	vsC, psC     [][4]float32
 	tex          []gpuTexRef
@@ -252,6 +253,25 @@ func (s *Subsystem) gpuState() gpuState {
 	return st
 }
 
+// gpuFog is a draw's fixed-function fog: D3D9 applies it after pixel shaders older than
+// ps_3_0 (and the fixed fragment function) while D3DRS_FOGENABLE is on, per pixel from depth
+// with D3DRS_FOGTABLEMODE's curve, else from the vertex shader's fog output.
+func (s *Subsystem) gpuFog(psModel int) [5]uint32 {
+	if s.renderState(rsFogEnable) == 0 || psModel >= 3 {
+		return [5]uint32{msl.FogOff}
+	}
+	mode := uint32(msl.FogVertex)
+	switch s.renderState(rsFogTableMode) {
+	case 1: // D3DFOG_EXP
+		mode = msl.FogExp
+	case 2: // D3DFOG_EXP2
+		mode = msl.FogExp2
+	case 3: // D3DFOG_LINEAR
+		mode = msl.FogLinear
+	}
+	return [5]uint32{mode, s.renderState(rsFogStart), s.renderState(rsFogEnd), s.renderState(rsFogDensity), s.renderState(rsFogColor)}
+}
+
 // gpuSampler returns a sampler state with D3D's defaults (wrap, point, no mipmaps).
 func (s *Subsystem) gpuSampler(st, ty int) uint32 {
 	if s.sampSet[st][ty] {
@@ -282,6 +302,7 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 		sc := s.scissor
 		d.scissor = [5]uint32{1, sc[0], sc[1], sc[2] - min(sc[0], sc[2]), sc[3] - min(sc[1], sc[3])}
 	}
+	psModel := 0 // pixel shader model (0: the fixed fragment function)
 	switch {
 	case s.progShading():
 		d.vs, d.vsKey = s.curVSProg, s.curVSProg
@@ -290,6 +311,7 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 		s.curVSProg.ApplyDefs(d.vsC)
 		if ps := s.curPSProg; ps != nil {
 			d.ps, d.psKey = ps, ps
+			psModel = ps.Shader.Major
 			d.psC = make([][4]float32, max(ps.MaxConst, 1))
 			copy(d.psC, s.PSConstants[:])
 			if ps.Shader.Major < 2 { // ps_1_x constants are clamped to [-1, 1]
@@ -316,6 +338,7 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 				return
 			}
 			d.psKey = ps
+			psModel = ps.model
 			if ps.maxReg < 0 {
 				ps.maxReg = maxFloatReg(ps.prog)
 			}
@@ -324,6 +347,7 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 	default:
 		return
 	}
+	d.fog = s.gpuFog(psModel)
 	// Every unit a function declares gets a binding (desc nil: nothing bound; the viewer binds
 	// a white placeholder of the declared kind).
 	units := map[int]msl.TextureKind{}
@@ -547,6 +571,8 @@ func varyingKey(v []msl.Varying) string {
 //	state: u32 blend enable, src, dst, op, src alpha, dst alpha, op alpha (D3DBLEND/D3DBLENDOP),
 //	    blend factor (ARGB), colour write mask (D3DCOLORWRITEENABLE), z enable, z write, z func
 //	    (D3DCMPFUNC), cull (D3DCULL), alpha func, f32 alpha reference
+//	fog: u32 mode (msl.FogOff, FogVertex, FogExp, FogExp2, FogLinear), f32 start, end, density,
+//	    u32 colour (ARGB)
 //	attributes: u32 attribute index, stream (gpuDefaultAttr: none), offset, D3DDECLTYPE
 //	streams: u32 stream, stride, byte length, bytes (padded); bound at buffer FirstVertexBuffer+stream
 //	textures: u32 unit, texture id (0: none bound), kind (msl.TextureKind), address U, V, W
@@ -613,6 +639,9 @@ func (g *gpuEncoder) encodeDraw(d *gpuDrawCmd) {
 	g.u32(st.cull)
 	g.u32(st.alphaFunc)
 	g.f32(st.alphaRef)
+	for _, v := range d.fog {
+		g.u32(v)
+	}
 	for i, k := range matched {
 		g.u32(uint32(i))
 		if k < 0 {

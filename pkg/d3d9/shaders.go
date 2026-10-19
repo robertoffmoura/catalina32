@@ -30,6 +30,7 @@ type compiledShader struct {
 	modErr  error
 	prog    *hlsl.Program
 	ps      bool
+	model   int                       // shader model of the profile (ps_2_0: 2)
 	handles map[uint32]*hlsl.Constant // D3DXHANDLE (guest pointer to the name) -> constant
 	byName  map[string]uint32
 	ordered []uint32 // handles in table order
@@ -60,7 +61,7 @@ func (s *Subsystem) compileHLSL(c *cpu.CPU, src []byte, entry, profile string) (
 	if err != nil {
 		return nil, err
 	}
-	cs := &compiledShader{file: file, prog: prog, ps: len(profile) > 1 && profile[0] == 'p', handles: map[uint32]*hlsl.Constant{},
+	cs := &compiledShader{file: file, prog: prog, ps: len(profile) > 1 && profile[0] == 'p', model: profileModel(profile), handles: map[uint32]*hlsl.Constant{},
 		byName: map[string]uint32{}, texUnit: -1, maxReg: -1}
 	for _, k := range prog.Constants {
 		h := c.Malloc(uint32(len(k.Name) + 1))
@@ -274,4 +275,12 @@ func (s *Subsystem) realTexture(c *cpu.CPU) *BufferDesc {
 // realShading reports whether the current draw goes through the real shader pipeline.
 func (s *Subsystem) realShading() bool {
 	return s.RealShaders && s.curVS != nil && s.CurrentVD != nil && len(s.CurrentVD.Elements) > 0
+}
+
+// profileModel is the shader model of a D3DX profile name ("ps_2_0", "vs_3_0": 2, 3; 0 if none).
+func profileModel(profile string) int {
+	if len(profile) >= 4 && profile[2] == '_' && profile[3] >= '0' && profile[3] <= '9' {
+		return int(profile[3] - '0')
+	}
+	return 0
 }

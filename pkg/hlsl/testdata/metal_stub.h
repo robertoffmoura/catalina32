@@ -220,6 +220,9 @@ template <typename T> struct texture3d {
 extern bool harness_discarded;
 inline void discard_fragment() { harness_discarded = true; }
 
+// MSL's mix (the fixed-function fog stage blends with it).
+template <typename V, typename T> inline V mix(V a, V b, T t) { return a + (b - a) * t; }
+
 // Helpers the generated prelude defines for MSL.
 template <typename T> inline T h_lerp(T a, T b, T s) { return a + s * (b - a); }
 template <typename T> inline T h_clamp(T x, T lo, T hi) { return min(max(x, lo), hi); }

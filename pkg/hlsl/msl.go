@@ -1286,6 +1286,14 @@ func (m *MSLModule) FragmentMSL(vsOut []msl.Varying) string {
 			fmt.Fprintf(&b, "\t%s %s [[user(%s)]];\n", vl.TypeName(), n, n)
 		}
 	}
+	fog := "1.0f" // vertex fog factor for the fixed-function fog stage
+	if v, ok := provided[msl.FogVarying]; ok {
+		if !used[msl.FogVarying] {
+			used[msl.FogVarying] = true
+			fmt.Fprintf(&b, "\t%s %s [[user(%s)]];\n", v.TypeName(), msl.FogVarying, msl.FogVarying)
+		}
+		fog = widen("pin."+msl.FogVarying, varyingType(v)) + ".x"
+	}
 	b.WriteString("};\nstruct POut {\n")
 	colors := 0
 	for _, l := range m.Outputs {
@@ -1318,6 +1326,7 @@ func (m *MSLModule) FragmentMSL(vsOut []msl.Varying) string {
 			fmt.Fprintf(&b, "\to.c%d = %s;\n", l.Index, widen(m.outputRef(l), l.Type))
 		}
 	}
+	b.WriteString(msl.FogStage(fog))
 	b.WriteString(alphaTestMSL)
 	b.WriteString("\treturn o;\n}\n")
 	return b.String()

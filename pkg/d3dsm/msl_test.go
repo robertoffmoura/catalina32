@@ -310,3 +310,65 @@ func close32(a, b float32) bool {
 	d := math.Abs(float64(a - b))
 	return d <= 1e-4 || d <= 1e-4*math.Max(math.Abs(float64(a)), math.Abs(float64(b)))
 }
+
+// TestFixedFunctionFog runs the fog stage (msl.FogStage, here in the fixed fragment function)
+// for each mode and compares it with D3D9's formulas.
+func TestFixedFunctionFog(t *testing.T) {
+	if _, err := exec.LookPath("clang++"); err != nil {
+		t.Skip("clang++ not installed")
+	}
+	stub, _ := filepath.Abs("../hlsl/testdata")
+	src := FixedFragmentMSL([]msl.Varying{{Name: "COLOR0", Cols: 4}, {Name: msl.FogVarying, Cols: 4}})
+	src = strings.Replace(src, "#include <metal_stdlib>\nusing namespace metal;\n", "", 1)
+	const depth, vertexFog, start, end, density = 0.5, 0.25, 0.2, 0.7, 2.0
+	col, fogCol := [3]float64{0.8, 0.6, 0.4}, [3]float64{0.1, 0.2, 0.3}
+	modes := []struct {
+		mode int
+		f    float64
+	}{
+		{msl.FogOff, 1}, {msl.FogVertex, vertexFog}, {msl.FogExp, math.Exp(-depth * density)},
+		{msl.FogExp2, math.Exp(-(depth * density) * (depth * density))}, {msl.FogLinear, (end - depth) / (end - start)},
+	}
+	var h strings.Builder
+	h.WriteString("#include \"metal_stub.h\"\n" + src + harnessCpp)
+	h.WriteString("static float4 Cv[256];\nstatic float4 Sv[4];\nint main() {\n\tSv[0].x = 8.0f;\n")
+	fmt.Fprintf(&h, "\tSv[2] = float4(%#gf, %#gf, %#gf, 0.0f);\n", fogCol[0], fogCol[1], fogCol[2])
+	for _, m := range modes {
+		fmt.Fprintf(&h, "\t{\n\t\tSv[1] = float4(%d.0f, %#gf, %#gf, %#gf);\n", m.mode, start, end, density)
+		fmt.Fprintf(&h, "\t\tPIn pin;\n\t\tpin.pos = float4(10.5f, 20.5f, %#gf, 1.0f);\n", depth)
+		fmt.Fprintf(&h, "\t\tpin.COLOR0 = float4(%#gf, %#gf, %#gf, 0.5f);\n\t\tpin.FOG0 = float4(%#gf, 0.0f, 0.0f, 1.0f);\n", col[0], col[1], col[2], vertexFog)
+		h.WriteString("\t\tPOut o = ps_main(pin, Cv, Sv, texture2d<float>{0}, sampler{});\n")
+		h.WriteString("\t\tprintf(\"%.9g %.9g %.9g %.9g\\n\", o.c0.x, o.c0.y, o.c0.z, o.c0.w);\n\t}\n")
+	}
+	h.WriteString("\treturn 0;\n}\n")
+	dir := t.TempDir()
+	srcPath, bin := filepath.Join(dir, "fog.cpp"), filepath.Join(dir, "fog")
+	if err := os.WriteFile(srcPath, []byte(h.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("clang++", "-std=c++20", "-O1", "-w", "-I", stub, "-o", bin, srcPath).CombinedOutput(); err != nil {
+		t.Fatalf("clang: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != len(modes) {
+		t.Fatalf("%d lines, want %d", len(lines), len(modes))
+	}
+	for i, m := range modes {
+		var got [4]float64
+		if _, err := fmt.Sscan(lines[i], &got[0], &got[1], &got[2], &got[3]); err != nil {
+			t.Fatal(err)
+		}
+		for k := 0; k < 3; k++ {
+			if want := m.f*col[k] + (1-m.f)*fogCol[k]; math.Abs(got[k]-want) > 1e-5 {
+				t.Errorf("mode %d channel %d: %v, want %v", m.mode, k, got[k], want)
+			}
+		}
+		if got[3] != 0.5 {
+			t.Errorf("mode %d: alpha %v, want 0.5 (fog leaves it)", m.mode, got[3])
+		}
+	}
+}

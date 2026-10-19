@@ -96,6 +96,7 @@ type checker struct {
 	cubeDraws, cubeBound           int                  // cube samplers in draws; those bound to an uploaded cube
 	scissorDraws                   int                  // draws with the scissor test on
 	partialViewport                int                  // draws whose viewport is not their whole target
+	fogDraws                       int                  // draws with fixed-function fog
 	targetW, targetH               uint32               // the current target's size
 	textures                       map[uint32][2]uint32 // id -> size (0 for targets)
 	out                            string
@@ -208,8 +209,13 @@ func (c *checker) draw(frame uint64, b []byte) {
 	if vp := [4]uint32{u(9), u(10), u(11), u(12)}; vp != [4]uint32{0, 0, c.targetW, c.targetH} {
 		c.partialViewport++
 	}
-	p := 4 * (9 + 4 + 5 + 1 + 15) // header, viewport, scissor, fixed-texture flag, state
-	streams := map[uint32]int{}   // stream -> vertex count
+	if fog := u(9 + 4 + 5 + 1 + 15); fog > 4 {
+		c.fail("frame %d: fog mode %d", frame, fog)
+	} else if fog != 0 {
+		c.fogDraws++
+	}
+	p := 4 * (9 + 4 + 5 + 1 + 15 + 5) // header, viewport, scissor, fixed-texture flag, state, fog
+	streams := map[uint32]int{}       // stream -> vertex count
 	type attr struct{ stream, offset, typ uint32 }
 	var attrs []attr
 	for i := 0; i < nAttr; i++ {
@@ -276,5 +282,5 @@ func (c *checker) report() {
 		float64(c.bytes)/float64(c.frames)/(1<<20), float64(c.maxFrame)/(1<<20), float64(c.texBytes)/(1<<20), c.errors)
 	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3; +0x100 cube, +0x200 mip chain): %v\n", c.formats)
 	fmt.Printf("gpucheck: %d cube samplers in draws, %d bound to an uploaded cube map\n", c.cubeDraws, c.cubeBound)
-	fmt.Printf("gpucheck: %d draws with the scissor test on, %d with a viewport other than their whole target\n", c.scissorDraws, c.partialViewport)
+	fmt.Printf("gpucheck: %d draws with the scissor test on, %d with a viewport other than their whole target, %d with fog\n", c.scissorDraws, c.partialViewport, c.fogDraws)
 }

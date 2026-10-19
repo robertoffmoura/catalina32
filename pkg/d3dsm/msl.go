@@ -472,6 +472,7 @@ func (p *Program) FragmentMSL(provided []msl.Varying) string {
 		fmt.Fprintf(b, "\t%s %s [[user(%s)]];\n", v.TypeName(), in.name, in.name)
 		assigns = append(assigns, fmt.Sprintf("\t%s = %s;\n", in.reg, widenVarying("pin."+in.name, v)))
 	}
+	fog := fogInput(b, have)
 	b.WriteString("};\nstruct POut {\n\tfloat4 c0 [[color(0)]];\n")
 	wr := p.written()
 	for i := 1; i < 4; i++ {
@@ -498,6 +499,9 @@ func (p *Program) FragmentMSL(provided []msl.Varying) string {
 			fmt.Fprintf(b, "\to.c%d = OC%d;\n", i, i)
 		}
 	}
+	if p.Shader.Major < 3 { // ps_3_0 has no fixed-function fog
+		b.WriteString(msl.FogStage(fog))
+	}
 	b.WriteString(alphaTest)
 	b.WriteString("\treturn o;\n}\n")
 	return b.String()
@@ -523,13 +527,26 @@ func FixedFragmentMSL(provided []msl.Varying) string {
 		fmt.Fprintf(&b, "\t%s TEXCOORD0 [[user(TEXCOORD0)]];\n", v.TypeName())
 		uv = widenVarying("pin.TEXCOORD0", v)
 	}
+	fog := fogInput(&b, have)
 	b.WriteString("};\nstruct POut {\n\tfloat4 c0 [[color(0)]];\n};\n")
 	fmt.Fprintf(&b, "fragment POut ps_main(PIn pin [[stage_in]], constant float4* C [[buffer(%d)]], constant float4* S [[buffer(%d)]], texture2d<float> t0 [[texture(0)]], sampler s0 [[sampler(0)]]) {\n",
 		msl.ConstantsBuffer, msl.StateBuffer)
 	fmt.Fprintf(&b, "\tPOut o;\n\to.c0 = %s;\n\tif (S[0].z != 0) o.c0 *= t0.sample(s0, (%s).xy);\n", col, uv)
+	b.WriteString(msl.FogStage(fog))
 	b.WriteString(alphaTest)
 	b.WriteString("\treturn o;\n}\n")
 	return b.String()
+}
+
+// fogInput declares the vertex function's fog output as a fragment input when it has one and
+// returns the vertex fog factor expression for msl.FogStage (1 without one).
+func fogInput(b *strings.Builder, have map[string]msl.Varying) string {
+	v, ok := have[msl.FogVarying]
+	if !ok {
+		return "1.0f"
+	}
+	fmt.Fprintf(b, "\t%s %s [[user(%s)]];\n", v.TypeName(), msl.FogVarying, msl.FogVarying)
+	return widenVarying("pin."+msl.FogVarying, v) + ".x"
 }
 
 // widenVarying makes a float4 of a varying (missing components 0, w 1).

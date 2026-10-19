@@ -11,7 +11,7 @@
 
 enum {
     kMagic = 0x47323343, // "C32G"
-    kVersion = 3, // 2: gpuDraw gained a per-draw viewport; 3: and a scissor rectangle
+    kVersion = 4, // 2: gpuDraw gained a per-draw viewport; 3: a scissor rectangle; 4: fog
     kHeaderSize = 4096,
     kCmdLibrary = 1,
     kCmdTexture = 2,
@@ -694,6 +694,9 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
              factor = rd32(r), cw = rd32(r), zEnable = rd32(r), zWrite = rd32(r), zFunc = rd32(r), cull = rd32(r),
              alphaFunc = rd32(r);
     float alphaRef = rdf(r);
+    uint32_t fogMode = rd32(r);
+    float fogStart = rdf(r), fogEnd = rdf(r), fogDensity = rdf(r);
+    uint32_t fogColor = rd32(r);
 
     typedef struct { uint32_t index, stream, offset, type; } Attr;
     Attr attrs[32];
@@ -826,7 +829,9 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     [_enc setVertexBytes:vstate length:sizeof vstate atIndex:1];
     id<MTLBuffer> pb = [self upload:pconst length:(NSUInteger)nPC * 16 offset:&off];
     [_enc setFragmentBuffer:pb offset:off atIndex:0];
-    float pstate[4] = {(float)alphaFunc, alphaRef, fixedTex ? 1.0f : 0.0f, 0};
+    float pstate[12] = {(float)alphaFunc, alphaRef, fixedTex ? 1.0f : 0.0f, 0, // S[0]: alpha test, texture 0 bound
+                        (float)fogMode, fogStart, fogEnd, fogDensity,         // S[1], S[2]: fixed-function fog (msl.FogStage)
+                        ((fogColor >> 16) & 0xFF) / 255.0f, ((fogColor >> 8) & 0xFF) / 255.0f, (fogColor & 0xFF) / 255.0f, 0};
     [_enc setFragmentBytes:pstate length:sizeof pstate atIndex:1];
 
     for (uint32_t i = 0; i < nt; i++) {
