@@ -177,6 +177,7 @@ type Subsystem struct {
 	curVSObj, curPSObj  uint32             // bound shader objects (as the game sees them)
 	drawSeq             int32              // draw calls so far in the frame being recorded
 	curRT               uint32             // render target 0 as set by the game (0: back buffer)
+	viewportX, viewportY, viewportW, viewportH uint32 // SetViewport (GPU path only; defaults to the screen)
 	refs                map[uint32]*comRef // reference counts of device resources (refs.go)
 	origin              map[uint32]string  // C32_DRAW_LOG: how each texture/surface was created
 	devCalls            [128]int           // C32_DRAW_LOG: device method calls in the inspected frame
@@ -247,6 +248,8 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		VertexDecls:    make(map[uint32]*VertexDecl),
 		AutoKeysMode:   autoKeys,
 		TraceLog:       os.Getenv("C32_LIVE") != "1",
+		viewportW:      ScreenWidth,
+		viewportH:      ScreenHeight,
 	}
 
 	s.vtD3D9 = s.buildVTable(c, "IDirect3D9", 32, s.handleIDirect3D9)
@@ -930,13 +933,20 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			}
 		}
 		c.Regs[cpu.RegEAX] = 0
+	case 47: // SetViewport(this, pViewport): D3DVIEWPORT9{X, Y, Width, Height, MinZ, MaxZ}
+		vp := c.Arg(1)
+		if vp != 0 && c.Read32(vp+8) != 0 && c.Read32(vp+12) != 0 {
+			s.viewportX, s.viewportY = c.Read32(vp+0), c.Read32(vp+4)
+			s.viewportW, s.viewportH = c.Read32(vp+8), c.Read32(vp+12)
+		}
+		c.Regs[cpu.RegEAX] = 0
 	case 48: // GetViewport(this, pViewport)
 		vp := c.Arg(1)
 		if vp != 0 {
-			c.Write32(vp+0, 0)
-			c.Write32(vp+4, 0)
-			c.Write32(vp+8, 1280)
-			c.Write32(vp+12, 720)
+			c.Write32(vp+0, s.viewportX)
+			c.Write32(vp+4, s.viewportY)
+			c.Write32(vp+8, s.viewportW)
+			c.Write32(vp+12, s.viewportH)
 			c.WriteF32(vp+16, 0.0)
 			c.WriteF32(vp+20, 1.0)
 		}

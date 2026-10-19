@@ -11,7 +11,7 @@
 
 enum {
     kMagic = 0x47323343, // "C32G"
-    kVersion = 1,
+    kVersion = 2, // bumped when gpuDraw gained a per-draw viewport
     kHeaderSize = 4096,
     kCmdLibrary = 1,
     kCmdTexture = 2,
@@ -652,7 +652,9 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
 
 - (void)draw:(Reader *)r {
     uint32_t vsID = rd32(r), psID = rd32(r), prim = rd32(r), nIdx = rd32(r), nAttr = rd32(r), nStream = rd32(r),
-             nTex = rd32(r), nVC = rd32(r), nPC = rd32(r), fixedTex = rd32(r);
+             nTex = rd32(r), nVC = rd32(r), nPC = rd32(r);
+    uint32_t vpX = rd32(r), vpY = rd32(r), vpW = rd32(r), vpH = rd32(r);
+    uint32_t fixedTex = rd32(r);
     uint32_t blend = rd32(r), src = rd32(r), dst = rd32(r), op = rd32(r), srcA = rd32(r), dstA = rd32(r), opA = rd32(r),
              factor = rd32(r), cw = rd32(r), zEnable = rd32(r), zWrite = rd32(r), zFunc = rd32(r), cull = rd32(r),
              alphaFunc = rd32(r);
@@ -759,6 +761,10 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     if (pipe == [NSNull null]) return;
 
     [self ensurePass];
+    double vx = MIN((double)vpX, (double)_target.width), vy = MIN((double)vpY, (double)_target.height);
+    double vw = MAX(1.0, MIN((double)vpW, (double)_target.width - vx));
+    double vh = MAX(1.0, MIN((double)vpH, (double)_target.height - vy));
+    [_enc setViewport:(MTLViewport){vx, vy, vw, vh, 0, 1}];
     [_enc setRenderPipelineState:pipe];
     [_enc setDepthStencilState:[self depthStateCompare:zEnable ? compareFunc(zFunc) : MTLCompareFunctionAlways write:zEnable && zWrite]];
     [_enc setCullMode:cull == 2 ? MTLCullModeFront : (cull == 3 ? MTLCullModeBack : MTLCullModeNone)];

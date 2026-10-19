@@ -54,7 +54,7 @@ import (
 
 const (
 	gpuMagic      = 0x47323343 // "C32G"
-	gpuVersion    = 1
+	gpuVersion    = 2 // bumped when gpuDraw gained a per-draw viewport
 	gpuHeaderSize = 4096
 	gpuSlots      = 2
 	gpuSlotSize   = 48 << 20
@@ -111,6 +111,7 @@ type gpuDrawCmd struct {
 	streams      [16]streamSnap
 	indices      []uint32 // relative to the first vertex of the snapshots
 	prim         uint32   // D3DPRIMITIVETYPE (fans become lists)
+	viewport     [4]uint32 // SetViewport: x, y, width, height (the target's full size by default)
 	state        gpuState
 	vsC, psC     [][4]float32
 	tex          []gpuTexRef
@@ -272,7 +273,8 @@ func (s *Subsystem) queueGPUDraw(c *cpu.CPU, primType uint32, order []uint32, ba
 	if maxI-minI > 1<<20 {
 		return
 	}
-	d := &gpuDrawCmd{elems: s.CurrentVD.Elements, prim: primType, state: s.gpuState()}
+	d := &gpuDrawCmd{elems: s.CurrentVD.Elements, prim: primType, state: s.gpuState(),
+		viewport: [4]uint32{s.viewportX, s.viewportY, s.viewportW, s.viewportH}}
 	switch {
 	case s.progShading():
 		d.vs, d.vsKey = s.curVSProg, s.curVSProg
@@ -515,7 +517,9 @@ func varyingKey(v []msl.Varying) string {
 //
 //	u32 vertex library, fragment library, primitive type (D3DPRIMITIVETYPE), index count,
 //	    attribute count, stream count, texture count, vertex constant count, fragment constant
-//	    count, fixed-texture flag
+//	    count
+//	viewport: u32 x, y, width, height (SetViewport; the target's full size by default)
+//	u32 fixed-texture flag
 //	state: u32 blend enable, src, dst, op, src alpha, dst alpha, op alpha (D3DBLEND/D3DBLENDOP),
 //	    blend factor (ARGB), colour write mask (D3DCOLORWRITEENABLE), z enable, z write, z func
 //	    (D3DCMPFUNC), cull (D3DCULL), alpha func, f32 alpha reference
@@ -565,6 +569,9 @@ func (g *gpuEncoder) encodeDraw(d *gpuDrawCmd) {
 	l := g.begin(gpuDraw)
 	for _, v := range []uint32{vsLib, psLib, d.prim, uint32(len(d.indices)), uint32(len(matched)), uint32(nStreams),
 		uint32(len(d.tex)), uint32(len(d.vsC)), uint32(len(d.psC))} {
+		g.u32(v)
+	}
+	for _, v := range d.viewport {
 		g.u32(v)
 	}
 	g.b32(d.fixedTex)
