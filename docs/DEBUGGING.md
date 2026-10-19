@@ -51,10 +51,33 @@ scripts/gpuroute.sh EXE GPUCHECK OUTDIR ROUTE MAXSTEPS [VAR=value...]  # GPU pat
   partial-viewport and fog draws, and **errors**. Anything other than 0 errors after a
   stream-format change usually means `cmd/gpucheck`'s parser is out of date.
 
+## Record a live session, replay it headless (`pkg/journal`)
+
+- **Record on the Mac:** `./run_on_mac.sh --record`. This writes
+  `recordings/<date-time>/` next to the script: `journal.gz`, plus a copy of the save folder
+  as it was at launch. Record from launch; a replay always starts at the beginning.
+- **Replay** with route `off` and `C32_REPLAY`:
+
+  ```sh
+  scripts/runroute.sh /tmp/c32 OUT off 3000000000 C32_REPLAY=/workspace/recordings/<dir>
+  ```
+
+  The recorded saves are restored into the run's empty save folder.
+- **Requirements.** The replay must use the same build and settings as the recording. If the
+  game asks for a value of a different kind than the recording has, or the frame numbers
+  disagree, the log says `[journal] replay ended after frame N: …` and the run continues with
+  live input.
+- **What's recorded:** clock readings (`timeGetTime`, `QueryPerformanceCounter`), keyboard
+  buffers, controller reads, audio frames per Present.
+
 ## Seeing what was drawn
 
 - **Software renderer PNGs.** Headless runs write `OUTDIR/frames/frame_NNNN.png`: every 5th
   frame once in the game, plus `latest.png`. `C32_RENDER_EVERY=1` exports every rendered frame.
+- **Metal frames without a window** (on the Mac): run the viewer with `C32_HEADLESS=1` and
+  `C32_METAL_SNAPSHOT=<dir>` (optionally `C32_METAL_SNAPSHOT_EVERY=N`). Each frame becomes a
+  raw RGBA8 file with an 8-byte header (u32 width, u32 height), named by frame number.
+  Combine with `C32_REPLAY` to capture a recorded session's frames.
 - **Draw-level log:** `C32_DRAW_LOG=<frame>[,<frame>...]` (`pkg/d3d9/drawlog.go`). For each
   listed frame it prints:
   - every draw: shaders, textures, blend/depth/alpha state, first vertex;
@@ -167,6 +190,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_REAL_SHADERS` | `0`: legacy heuristic renderer instead of the game's shaders |
 | `C32_REAL_HLSL` | `1`: run the engine's own HLSL generator even with real shaders off |
 | `C32_PORT` | HTTP preview port (browser viewer); `0` picks a free one |
+| `C32_RECORD` / `C32_REPLAY` | record a session into / replay one from a directory |
 | `C32_NO_AOT` | `1`: don't install the AOT-compiled functions |
 | `C32_NO_DCACHE` | `1`: disable the decoded-instruction cache |
 | `C32_NO_JIT` | `1`: no JIT (interpreter and block cache only) |
@@ -193,6 +217,8 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 |---|---|
 | `C32_RENDERER` | `software`: show the software framebuffer instead of Metal (`run_on_mac.sh` then doesn't set `C32_GPU_SHM`) |
 | `C32_HUD` | `1`: a line of stats above the game in the developer window (frame, FPS, draw calls, triangles, instructions, controllers) |
+| `C32_HEADLESS` | `1`: never show the window |
+| `C32_METAL_SNAPSHOT`, `C32_METAL_SNAPSHOT_EVERY` | dump Metal frames to a directory |
 | `C32_METAL_WINDING` | `ccw`: flip the front-face convention |
 | `C32_METAL_SYNC_SHADERS` | `1`: compile shaders on the render thread, waiting for each (by default they compile in the background and draws needing one are skipped until it is ready) |
 | `C32_PAD_DEBUG` | `1`: print raw controller events |

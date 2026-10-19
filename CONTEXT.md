@@ -53,6 +53,7 @@ Release 0.2.0 makes game apps for both. See `PROGRESS.md` for open work.
   3. compiles the viewer (`viewer/*.m`) into `/tmp/catalina32-mac-preview/C32Window`;
   4. starts both.
 
+  `--record` records the session for replay (see `docs/DEBUGGING.md`; `debug` branch only);
   `--build-app` builds an old-style `.app`; `scripts/build-app.sh` (in the repository) builds
   Catalina32.app, the product (`docs/ARCHITECTURE.md`). Saves go to
   `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData` (`run_on_mac.sh` sets
@@ -128,6 +129,8 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
     the PCM ring with AudioQueue.
   - Headless runs use a deterministic clock (derived from the instruction count), live runs
     the wall clock.
+  - `pkg/journal` records every outside value the game reads (clock, keys, pads, audio
+    pacing) so a live session can be replayed headless exactly.
 
 ## Working conventions
 
@@ -166,7 +169,7 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
 | Need | Look in |
 |---|---|
 | Status, open bugs, backlog | `PROGRESS.md` |
-| Environment variables, routes, logs, profilers, gpucheck | `docs/DEBUGGING.md` |
+| Environment variables, routes, logs, profilers, gpucheck, record/replay | `docs/DEBUGGING.md` |
 | Game addresses, input layout, how it loads/draws things | `docs/LSWSAGA.md` |
 | The JIT: how it works, its tests, results | `docs/JIT.md` |
 | Portal / Valve Source games: how it runs, tests, lessons, next | `docs/PORTAL.md` |
