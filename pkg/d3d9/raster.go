@@ -378,6 +378,10 @@ func decodeTexturePixels(data []byte, w, h, fmtCode uint32) []uint32 {
 				}
 			}
 		}
+	case 32: // D3DFMT_A8B8G8R8
+		for i := uint32(0); i < w*h && int(i*4+4) <= len(data); i++ {
+			out[i] = packRGBA(data[i*4], data[i*4+1], data[i*4+2], data[i*4+3])
+		}
 	case 50, 28: // D3DFMT_L8 / D3DFMT_A8
 		for i := uint32(0); i < w*h && int(i) < len(data); i++ {
 			v := data[i]
@@ -408,19 +412,68 @@ func (s *Subsystem) decodeDDSInMemory(c *cpu.CPU, pSrc uint32, srcSize uint32) (
 	if magic != 0x20534444 { // "DDS "
 		return 64, 64, 21, nil, nil
 	}
-	h = c.Read32(pSrc + 12)
-	w = c.Read32(pSrc + 16)
-	pfFlags := c.Read32(pSrc + 80)
-	fourCC := c.Read32(pSrc + 84)
-	bitCount := c.Read32(pSrc + 88)
-	fmtCode = 21
-	if (pfFlags & 0x4) != 0 { // DDPF_FOURCC
-		fmtCode = fourCC
-	} else if bitCount == 8 {
-		fmtCode = 50
-	}
+	hd, _ := readDDSHeader(c, pSrc, srcSize)
 	raw = c.Mem[pSrc+128 : pSrc+srcSize]
-	return w, h, fmtCode, decodeTexturePixels(raw, w, h, fmtCode), raw
+	return hd.w, hd.h, hd.format, decodeTexturePixels(raw, hd.w, hd.h, hd.format), raw
+}
+
+// ddsHeader is what the texture loaders use from a DDS file's header.
+type ddsHeader struct{ w, h, format, mips, caps2 uint32 }
+
+const ddsAllFaces = 0xFE00 // DDSCAPS2_CUBEMAP and its six DDSCAPS2_CUBEMAP_* face flags
+
+// readDDSHeader reads the header of the DDS file at pSrc (false if it is not one).
+func readDDSHeader(c *cpu.CPU, pSrc, srcSize uint32) (ddsHeader, bool) {
+	if pSrc == 0 || srcSize < 128 || uint64(pSrc)+uint64(srcSize) > uint64(len(c.Mem)) || c.Read32(pSrc) != 0x20534444 { // "DDS "
+		return ddsHeader{w: 64, h: 64, format: 21, mips: 1}, false
+	}
+	hd := ddsHeader{h: c.Read32(pSrc + 12), w: c.Read32(pSrc + 16), format: 21, mips: 1, caps2: c.Read32(pSrc + 112)}
+	if c.Read32(pSrc+8)&0x20000 != 0 { // DDSD_MIPMAPCOUNT
+		hd.mips = max(c.Read32(pSrc+28), 1)
+	}
+	pfFlags, fourCC, bitCount := c.Read32(pSrc+80), c.Read32(pSrc+84), c.Read32(pSrc+88)
+	switch {
+	case pfFlags&0x4 != 0: // DDPF_FOURCC
+		hd.format = fourCC
+	case bitCount == 8:
+		hd.format = 50
+	case bitCount == 32 && c.Read32(pSrc+92) == 0xFF: // red in the low byte
+		hd.format = 32 // D3DFMT_A8B8G8R8
+	}
+	return hd, true
+}
+
+// ddsLevelsSize is the size of a w x h image with its mip chain (one face of a DDS cube map).
+func ddsLevelsSize(w, h, format, levels uint32) uint32 {
+	n := uint32(0)
+	for l := range max(levels, 1) {
+		lw, lh := max(w>>l, 1), max(h>>l, 1)
+		n += texPitch(lw, format) * texRows(lh, format)
+	}
+	return n
+}
+
+// decodeCube decodes the six faces of a cube texture, faceStride bytes apart in data, into one
+// slice of six edge x edge images; raw (GPU path, DXT formats) holds their compressed data.
+func (s *Subsystem) decodeCube(data []byte, edge, format, faceStride uint32) (pixels []uint32, raw []byte) {
+	n := int(edge * edge)
+	if n == 0 || int(5*faceStride+texPitch(edge, format)*texRows(edge, format)) > len(data) {
+		return nil, nil
+	}
+	pixels = make([]uint32, 6*n)
+	for f := range uint32(6) {
+		face := data[f*faceStride:]
+		copy(pixels[int(f)*n:], decodeTexturePixels(face, edge, edge, format))
+		if r := s.gpuRaw(face, edge, edge, format); r != nil {
+			raw = append(raw, r...)
+		} else {
+			raw = nil
+		}
+	}
+	if len(raw) != 6*int(texPitch(edge, format)*texRows(edge, format)) {
+		raw = nil
+	}
+	return pixels, raw
 }
 
 // gpuRaw keeps a copy of a DXT image's level 0 for compressed upload (GPU path only).
@@ -445,8 +498,12 @@ func (s *Subsystem) ensureTextureDecoded(c *cpu.CPU, texObj uint32) *BufferDesc 
 		// A texture never written through a lock is decoded only once something is in it.
 		if data != nil && (res.Unlocked || slices.ContainsFunc(data[:min(len(data), 256)], func(b byte) bool { return b != 0 })) {
 			// A new slice: frames already queued keep sampling the old pixels (texSnap).
-			res.Pixels = decodeTexturePixels(data, res.Width, res.Height, res.Format)
-			res.Raw = s.gpuRaw(data, res.Width, res.Height, res.Format)
+			if res.Cube {
+				res.Pixels, res.Raw = s.decodeCube(data, res.Width, res.Format, lockSize(res.Pitch, res.Height, res.Format))
+			} else {
+				res.Pixels = decodeTexturePixels(data, res.Width, res.Height, res.Format)
+				res.Raw = s.gpuRaw(data, res.Width, res.Height, res.Format)
+			}
 			res.Stale = false
 		}
 	}

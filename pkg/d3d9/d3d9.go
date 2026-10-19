@@ -42,6 +42,7 @@ type BufferDesc struct {
 	RefCount      int
 	IsDuplicate   bool
 	IsRT          bool // texture used as a render target: Pixels is its colour buffer
+	Cube          bool // cube texture: Pixels (and Raw) hold the six faces, +X -X +Y -Y +Z -Z
 	Unlocked      bool // the game has written level 0 through a lock at least once
 	Stale         bool // level 0 changed since Pixels was decoded
 }
@@ -820,7 +821,7 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		pitch := texPitch(edge, fmtCode)
 		size := max(65536, 6*lockSize(pitch, edge, fmtCode)) // six faces, one after another
 		buf := c.Malloc(size)
-		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: edge, Height: edge, Pitch: pitch}
+		s.Resources[tex] = &BufferDesc{DataPtr: buf, Length: size, Format: fmtCode, Width: edge, Height: edge, Pitch: pitch, Cube: true}
 		if pp != 0 {
 			c.Write32(pp, tex)
 		}
@@ -1529,16 +1530,27 @@ func (s *Subsystem) allocD3DXBuffer(c *cpu.CPU, size uint32) uint32 {
 	return obj
 }
 
-// D3DXCreateCubeTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppCubeTexture): cube maps
-// are not sampled yet, so this returns an empty cube texture.
+// D3DXCreateCubeTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppCubeTexture): a DDS cube
+// map (six faces, +X -X +Y -Y +Z -Z, each followed by its mip chain); level 0 of each face is
+// kept. Anything else gives an empty cube texture (sampled as white).
 func (s *Subsystem) thunkD3DXCreateCubeTextureFromFileInMemory(c *cpu.CPU) {
 	s.CubeTexCount++
-	ppCubeTex := c.Arg(3)
+	pSrc, size, ppCubeTex := c.Arg(1), c.Arg(2), c.Arg(3)
+	hd, ok := readDDSHeader(c, pSrc, size)
+	ok = ok && hd.caps2&ddsAllFaces == ddsAllFaces && hd.w == hd.h
 	if ppCubeTex != 0 {
-		c.Write32(ppCubeTex, s.allocCOMObject(c, s.vtCubeTex9, 32))
+		tex := s.allocCOMObject(c, s.vtCubeTex9, 32)
+		if ok {
+			pitch := texPitch(hd.w, hd.format)
+			res := &BufferDesc{Length: 6 * lockSize(pitch, hd.h, hd.format), Format: hd.format, Width: hd.w, Height: hd.h, Pitch: pitch, Cube: true}
+			res.Pixels, res.Raw = s.decodeCube(c.Mem[pSrc+128:pSrc+size], hd.w, hd.format, ddsLevelsSize(hd.w, hd.h, hd.format, hd.mips))
+			s.Resources[tex] = res
+		}
+		c.Write32(ppCubeTex, tex)
 	}
 	if s.TraceLog {
-		fmt.Printf("[D3DX9] D3DXCreateCubeTextureFromFileInMemory(size=%d, count=%d) -> S_OK\n", c.Arg(2), s.CubeTexCount)
+		fmt.Printf("[D3DX9] D3DXCreateCubeTextureFromFileInMemory(size=%d, count=%d) -> %dx%d format %#x, %d levels, decoded=%v\n",
+			size, s.CubeTexCount, hd.w, hd.h, hd.format, hd.mips, ok)
 	}
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()

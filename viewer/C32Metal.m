@@ -526,6 +526,8 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
 
 - (void)texture:(Reader *)r {
     uint32_t texID = rd32(r), w = rd32(r), h = rd32(r), fmt = rd32(r);
+    BOOL cube = (fmt & 0x100) != 0; // six faces, +X -X +Y -Y +Z -Z, one after another
+    fmt &= 0xFF;
     MTLPixelFormat pf = kColorFormat;
     size_t rowBytes = (size_t)w * 4, size = rowBytes * h;
     if (fmt >= 2 && fmt <= 4) { // BC1/BC2/BC3: rows of 4x4 blocks
@@ -535,13 +537,22 @@ static const uint8_t *rdbytes(Reader *r, size_t n) {
     } else if (fmt != 1) {
         return;
     }
+    size_t faceSize = size;
+    if (cube) {
+        if (w != h) return;
+        size *= 6;
+    }
     const uint8_t *px = rdbytes(r, size);
     if (!px || w == 0 || h == 0) return;
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+    MTLTextureDescriptor *d = cube ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pf size:w mipmapped:NO]
+                                   : [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
     d.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> t = [_device newTextureWithDescriptor:d]; // a new texture: frames in flight keep the old one
     if (!t) return; // BC formats need a GPU that supports them (every Mac with Metal 2 does)
-    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:rowBytes];
+    for (NSUInteger face = 0; face < (cube ? 6 : 1); face++) {
+        [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 slice:face withBytes:px + face * faceSize
+             bytesPerRow:rowBytes bytesPerImage:0]; // one image per call (0 except for 3D and array textures)
+    }
     _textures[@(texID)] = t;
 }
 

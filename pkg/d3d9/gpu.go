@@ -24,7 +24,8 @@ package d3d9
 //
 //	gpuLibrary  u32 id, u32 stage (0 vertex, 1 fragment), u32 byte length, MSL source (padded)
 //	gpuTexture  u32 id, u32 width, u32 height, u32 format, data: 1 = RGBA8 (red first),
-//	            2/3/4 = BC1/BC2/BC3 (the game's DXT1/DXT3/DXT5 blocks, width and height multiples of 4)
+//	            2/3/4 = BC1/BC2/BC3 (the game's DXT1/DXT3/DXT5 blocks, width and height multiples of 4);
+//	            format | 0x100 (gpuCubeFlag): a cube texture, its six faces (+X -X +Y -Y +Z -Z) one after another
 //	gpuTexFree  u32 id
 //	gpuTarget   u32 id (0 = back buffer), u32 width, u32 height: draw into this target from now
 //	            on (created on first use; render targets are also textures with the same id)
@@ -434,13 +435,20 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, raw []byte, form
 		g.textures[desc] = e
 	}
 	g.mu.Unlock()
-	if len(pixels) == 0 || len(pixels) < int(w*h) {
+	faces := 1
+	if desc != nil && desc.Cube {
+		faces = 6
+	}
+	if len(pixels) == 0 || len(pixels) < int(w*h)*faces {
 		return e.id
 	}
 	if p := unsafe.Pointer(&pixels[0]); p != e.uploaded {
-		kind, data := uint32(1), unsafe.Slice((*byte)(unsafe.Pointer(&pixels[0])), int(w*h*4))
+		kind, data := uint32(1), unsafe.Slice((*byte)(unsafe.Pointer(&pixels[0])), int(w*h*4)*faces)
 		if bc := bcFormat(format); bc != 0 && raw != nil && w%4 == 0 && h%4 == 0 {
 			kind, data = bc, raw
+		}
+		if faces == 6 {
+			kind |= gpuCubeFlag
 		}
 		if !g.room(len(data) + 32) {
 			g.full = true
@@ -457,6 +465,9 @@ func (g *gpuEncoder) texture(desc *BufferDesc, pixels []uint32, raw []byte, form
 	}
 	return e.id
 }
+
+// gpuCubeFlag marks a gpuTexture format word whose data is the six faces of a cube texture.
+const gpuCubeFlag = 0x100
 
 // bcFormat is the stream's compressed texture format for a D3DFORMAT (0: none).
 func bcFormat(format uint32) uint32 {

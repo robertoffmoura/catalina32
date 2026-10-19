@@ -54,7 +54,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	c := &checker{libs: map[uint32]bool{}, formats: map[uint32]int{}, textures: map[uint32][2]uint32{}, out: *out}
+	c := &checker{libs: map[uint32]bool{}, formats: map[uint32]int{}, cubes: map[uint32]bool{}, textures: map[uint32][2]uint32{}, out: *out}
 	var lastFrame uint64
 	for n := 0; *frames == 0 || n < *frames; {
 		select {
@@ -92,6 +92,8 @@ func main() {
 type checker struct {
 	libs                           map[uint32]bool
 	formats                        map[uint32]int       // texture uploads by format
+	cubes                          map[uint32]bool      // texture id -> uploaded as a cube
+	cubeDraws, cubeBound           int                  // cube samplers in draws; those bound to an uploaded cube
 	textures                       map[uint32][2]uint32 // id -> size (0 for targets)
 	out                            string
 	frames, draws, clears, targets int
@@ -139,11 +141,15 @@ func (c *checker) frame(frame uint64, d []byte) {
 			}
 		case 2: // texture
 			id, w, h, f := u(0), u(1), u(2), u(3)
-			size := map[uint32]int{1: int(w * h * 4), 2: int(w * h / 2), 3: int(w * h), 4: int(w * h)}[f]
-			if size == 0 || 16+size > n || (f != 1 && (w%4 != 0 || h%4 != 0)) {
-				c.fail("texture %d: %dx%d format %d in %d bytes", id, w, h, f, n)
+			size := map[uint32]int{1: int(w * h * 4), 2: int(w * h / 2), 3: int(w * h), 4: int(w * h)}[f&0xFF]
+			if f&0x100 != 0 { // cube: six faces
+				size *= 6
+			}
+			if size == 0 || f&^0x1FF != 0 || 16+size > n || (f&0xFF != 1 && (w%4 != 0 || h%4 != 0)) || (f&0x100 != 0 && w != h) {
+				c.fail("texture %d: %dx%d format %#x in %d bytes", id, w, h, f, n)
 			}
 			c.textures[id] = [2]uint32{w, h}
+			c.cubes[id] = f&0x100 != 0
 			c.texBytes += size
 			c.formats[f]++
 		case 3: // texture free
@@ -192,7 +198,7 @@ func (c *checker) draw(frame uint64, b []byte) {
 	if prim < 1 || prim > 5 {
 		c.fail("frame %d: primitive type %d", frame, prim)
 	}
-	p := 4 * (10 + 15)
+	p := 4 * (9 + 4 + 1 + 15) // header, viewport, fixed-texture flag, state
 	streams := map[uint32]int{} // stream -> vertex count
 	type attr struct{ stream, offset, typ uint32 }
 	var attrs []attr
@@ -221,6 +227,12 @@ func (c *checker) draw(frame uint64, b []byte) {
 		id, kind := le.Uint32(b[p+4:]), le.Uint32(b[p+8:])
 		if kind > 2 {
 			c.fail("frame %d: texture kind %d", frame, kind)
+		}
+		if kind == 1 { // msl.TexCube
+			c.cubeDraws++
+			if c.cubes[id] {
+				c.cubeBound++
+			}
 		}
 		if _, ok := c.textures[id]; !ok && id != 0 {
 			// A texture whose pixels did not fit yet is referenced before its upload.
@@ -252,5 +264,6 @@ func (c *checker) report() {
 	fmt.Printf("gpucheck: %d frames, %d draws (%.0f per frame), %d clears, %d target switches; %d libraries; average %.2f MB per frame (max %.2f MB), %.1f MB of texture uploads; %d errors\n",
 		c.frames, c.draws, float64(c.draws)/float64(c.frames), c.clears, c.targets, len(c.libs),
 		float64(c.bytes)/float64(c.frames)/(1<<20), float64(c.maxFrame)/(1<<20), float64(c.texBytes)/(1<<20), c.errors)
-	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3): %v\n", c.formats)
+	fmt.Printf("gpucheck: texture uploads by format (1 RGBA, 2 BC1, 3 BC2, 4 BC3; +0x100 cube): %v\n", c.formats)
+	fmt.Printf("gpucheck: %d cube samplers in draws, %d bound to an uploaded cube map\n", c.cubeDraws, c.cubeBound)
 }
