@@ -43,8 +43,8 @@ bugs.
   3. compiles the viewer (`viewer/*.m`) into `/tmp/catalina32-mac-preview/C32Window`;
   4. starts both.
 
-  `--record` records the session for replay (see `docs/DEBUGGING.md`); `--build-app` builds
-  a `.app`. Saves go to `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData`.
+  `--build-app` builds a `.app`. Saves go to
+  `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData`.
 - **Other Claude sessions** sometimes work in `/workspace/catalina32` at the same time (for
   example a session running on the Mac). Before editing, check `git status` and
   `git worktree list`.
@@ -108,8 +108,6 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
     the PCM ring with AudioQueue.
   - Headless runs use a deterministic clock (derived from the instruction count), live runs
     the wall clock.
-  - `pkg/journal` records every outside value the game reads (clock, keys, pads, audio
-    pacing) so a live session can be replayed headless exactly.
 
 ## Working conventions
 
@@ -142,7 +140,7 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
 | Need | Look in |
 |---|---|
 | Status, open bugs, backlog | `PROGRESS.md` |
-| Environment variables, routes, logs, profilers, gpucheck, record/replay | `docs/DEBUGGING.md` |
+| Environment variables, routes, logs, profilers, gpucheck | `docs/DEBUGGING.md` |
 | Game addresses, input layout, how it loads/draws things | `docs/LSWSAGA.md` |
 | GPU stream format | top of `pkg/d3d9/gpu.go` |
 | History and reasons for past decisions | `git log` (commit messages explain the why) |

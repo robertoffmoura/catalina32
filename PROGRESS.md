@@ -19,8 +19,7 @@ explain each change); keep this file to what is true now.
 ## Open
 
 1. **Frame rate near zero in some scenes** of the chapter after Negotiations, in gameplay and
-   in cut-scenes (reported by the user; not yet reproduced). Record one with
-   `run_on_mac.sh --record` to replay it headless and profile it.
+   in cut-scenes (reported by the user; not yet reproduced).
 
 ## Backlog
 
@@ -41,7 +40,7 @@ explain each change); keep this file to what is true now.
   - fixed-function vertex fog without a vertex shader (not used by this game);
   - the legacy heuristic renderer (`C32_REAL_SHADERS=0`) still mis-places skies.
 - **Packaging:** `run_on_mac.sh --build-app` makes a `.app`, but it isn't polished for
-  non-developers and can't record sessions.
+  non-developers.
 - **General tool:** only this game has a profile. Game-specific logic still inside
   `pkg/d3d9`: the legacy renderer's heuristics (2D detection by vertex stride, the skin
   matrix and c0..c3/c16..c19 layout in `transformVertex`) and the fixed 1280×720 back buffer.
@@ -52,5 +51,5 @@ explain each change); keep this file to what is true now.
 |---|---|
 | 2026-10-16 | Runtime snapshot: interpreter, Win32/D3D9 shims, green threads, software renderer; title screen and menus |
 | 2026-10-16/17 | Cantina hub, audio (Ogg Vorbis music, sound effects), Episode I entry, controllers, real shaders (the game's HLSL and bytecode), AOT-compiled hot functions, decoded-instruction cache, pipelined parallel renderer |
-| 2026-10-18 | Two code-review passes (crash safety, cross-host determinism, reference-counted resources, saves); HLSL and bytecode translation to Metal; GPU command stream; Metal viewer in the repository; record/replay journal |
+| 2026-10-18 | Two code-review passes (crash safety, cross-host determinism, reference-counted resources, saves); HLSL and bytecode translation to Metal; GPU command stream; Metal viewer in the repository |
 | 2026-10-19 | White-screen fixes (copies into textures, compressed uploads); SetViewport; cube maps; scissor, viewport reset, mipmaps, fog; double vision fixed (half-pixel offset); StretchRect rectangles; one save folder; docs split into `CONTEXT.md`, `PROGRESS.md`, `docs/` |
