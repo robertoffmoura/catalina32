@@ -116,6 +116,7 @@ func engineMain(binPath string) {
 	}
 	w32.RegisterBoundaryThunks(vm, prof)
 	d3d := d3d9.NewSubsystem(vm)
+	w32.OnCursor = d3d.SetWin32Cursor // the viewer hides the pointer when the game doesn't want it
 	d3d.RegisterIndirectXThunks(vm, prof)
 	game.Install(vm, d3d, prof)
 	fmt.Printf("[catalina32] %s\n", prof.Report())

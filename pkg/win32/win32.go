@@ -45,6 +45,12 @@ type Win32Env struct {
 	peekCount       uint64
 	// InputScript, when set, returns a window message (msg, wParam, lParam) to inject on the given PeekMessageA call.
 	InputScript func(n uint64) (msg, wParam, lParam uint32, ok bool)
+	// OnCursor, when set, hears whether the game shows the Win32 cursor (ShowCursor count >= 0
+	// and SetCursor not NULL).
+	OnCursor    func(visible bool)
+	cursorCount int32  // ShowCursor's display count (visible from 0 up)
+	cursor      uint32 // SetCursor's cursor (cursorSet: the game called it at all)
+	cursorSet   bool
 }
 
 func NewWin32Env(c *cpu.CPU, dataRoot, saveRoot string) *Win32Env {
@@ -267,7 +273,8 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, prof *profile.Profile) {
 	prof.Bind(c, "GetFileAttributesA", env.thunkGetFileAttributesA)
 	prof.Bind(c, "GetDiskFreeSpaceExA", env.thunkGetDiskFreeSpaceExA)
 	prof.Bind(c, "SHGetFolderPathA", env.thunkSHGetFolderPathA)
-	prof.Bind(c, "ShowCursor", env.thunkReturnOne)
+	prof.Bind(c, "ShowCursor", env.thunkShowCursor)
+	prof.Bind(c, "SetCursor", env.thunkSetCursor)
 
 	// MacdozeFile (stdio wrappers)
 	prof.Bind(c, "MacdozeFile::fopen", env.thunkFopen)
@@ -325,6 +332,33 @@ func (env *Win32Env) thunkShowWindow(c *cpu.CPU) {
 func (env *Win32Env) thunkReturnZero(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
+}
+
+// ShowCursor(bShow): the display count goes up or down; the cursor shows from 0 up.
+func (env *Win32Env) thunkShowCursor(c *cpu.CPU) {
+	if c.Arg(0) != 0 {
+		env.cursorCount++
+	} else {
+		env.cursorCount--
+	}
+	env.cursorChanged()
+	c.Regs[cpu.RegEAX] = uint32(env.cursorCount)
+	c.Ret()
+}
+
+// SetCursor(hCursor): NULL hides the cursor; returns the previous one.
+func (env *Win32Env) thunkSetCursor(c *cpu.CPU) {
+	prev := env.cursor
+	env.cursor, env.cursorSet = c.Arg(0), true
+	env.cursorChanged()
+	c.Regs[cpu.RegEAX] = prev
+	c.Ret()
+}
+
+func (env *Win32Env) cursorChanged() {
+	if env.OnCursor != nil {
+		env.OnCursor(env.cursorCount >= 0 && (!env.cursorSet || env.cursor != 0))
+	}
 }
 
 func (env *Win32Env) thunkReturnOne(c *cpu.CPU) {

@@ -37,7 +37,10 @@ const (
 	// ShmHotplugPads slots are announced to the game even when empty (players 1 and 2).
 	ShmHotplugPads = 2
 	ShmPadSize     = 16
-	ShmTotalSize   = ShmPadOffset + 4 + ShmPads*ShmPadSize
+	// Game state written by the engine for the viewer: u32 flags, bit 0 = the game wants the
+	// system mouse pointer (see pointerWanted).
+	ShmGameOffset = ShmPadOffset + 4 + ShmPads*ShmPadSize
+	ShmTotalSize  = ShmGameOffset + 4
 )
 
 type screenVertex struct {
@@ -185,6 +188,7 @@ func (s *Subsystem) initRasterizer(framesDir string) {
 			_, _ = f.WriteAt(modeByte[:], 32)
 			if m, err := mapShm(f, ShmTotalSize); err == nil {
 				s.shm = m
+				s.publishGameState()
 			} else {
 				fmt.Printf("[Display] cannot map %s: %v\n", shmPath, err)
 			}

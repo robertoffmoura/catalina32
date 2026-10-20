@@ -22,7 +22,10 @@
 #define SHM_PAD_OFFSET (SHM_AUDIO_OFFSET + 8 + SHM_AUDIO_FRAMES * 4)
 #define SHM_PAD_READY 0x50323343u /* "C32P" */
 #define MAX_PADS 4
-#define SHM_SIZE (SHM_PAD_OFFSET + 4 + MAX_PADS * 16)
+/* Game state from the engine: u32 flags, bit 0 = the game wants the system mouse pointer. */
+#define SHM_GAME_OFFSET (SHM_PAD_OFFSET + 4 + MAX_PADS * 16)
+#define SHM_GAME_POINTER 1u
+#define SHM_SIZE (SHM_GAME_OFFSET + 4)
 
 static uint8_t *g_shm = NULL;
 static uint64_t g_audioReadIdx = 0;
@@ -421,6 +424,7 @@ static int macKeyCodeToDIK(unsigned short kc) {
     double _fps;
     C32GameLaunch *_game; /* game mode: the engine we started (nil: viewer mode) */
     BOOL _quitting;
+    BOOL _pointerHidden; /* we called [NSCursor hide] (balanced by one unhide) */
 }
 - (instancetype)initWithShmPath:(NSString *)path;
 - (instancetype)initWithGame:(C32GameLaunch *)game;
@@ -469,6 +473,16 @@ static int macKeyCodeToDIK(unsigned short kc) {
     close(fd);
 }
 
+- (void)setPointerHidden:(BOOL)hidden {
+    if (hidden == _pointerHidden) return;
+    _pointerHidden = hidden;
+    if (hidden) {
+        [NSCursor hide];
+    } else {
+        [NSCursor unhide];
+    }
+}
+
 - (void)tick:(NSTimer *)timer {
     [self tryMapShm];
     if (!g_shm) return;
@@ -491,6 +505,12 @@ static int macKeyCodeToDIK(unsigned short kc) {
             @"Frame: %llu (%.1f FPS)  |  DrawCalls: %llu  |  Triangles: %llu  |  Steps: %.1fM  |  Controllers: %d  |  Keys: WASD / Enter / U H J K",
             frame, _fps, draws, tris, (double)steps / 1e6, pads]];
     }
+
+    /* In full screen, hide the pointer unless the game wants it (the engine decides from what the
+       game asks for: Win32 ShowCursor/SetCursor, a Direct3D device cursor, a windowed device). */
+    uint32_t gameFlags = *(volatile uint32_t *)(g_shm + SHM_GAME_OFFSET);
+    BOOL fullScreen = ([_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+    [self setPointerHidden:fullScreen && [NSApp isActive] && !(gameFlags & SHM_GAME_POINTER)];
 
     if (_renderer && [_renderer active] && [_metalView isHidden]) {
         [_metalView setHidden:NO]; /* the GPU renderer draws from now on */

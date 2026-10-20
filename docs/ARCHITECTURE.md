@@ -48,7 +48,9 @@ Games        profiles: checksums, names, folders, original save location, rare q
 - **Host** (`viewer/`): one Objective-C executable with two modes. In a game app it is the
   game's window: it starts the engine as a child process, maps the shared memory, draws with
   Metal, reads keyboard and controllers, plays audio, and stops the engine when the window
-  closes. In Catalina32.app it is the wizard. Its output goes to
+  closes. In full screen it hides the mouse pointer unless the game wants it; the engine
+  decides that from what the game asks for (Win32 `ShowCursor`/`SetCursor`, a Direct3D device
+  cursor, a windowed device), never from which game it is. In Catalina32.app it is the wizard. Its output goes to
   `~/Library/Logs/catalina32/<game>.log`.
 - **Front-ends**: the `catalina32` binary is both the engine and the command line. The wizard
   calls the command line (`list --json`, `wrap`), so all the logic (finding games, deciding

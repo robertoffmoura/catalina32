@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/d3dsm"
@@ -214,6 +215,13 @@ type Subsystem struct {
 	KeyMu        sync.Mutex
 	KeyHoldUntil [256]uint64
 	AutoKeysMode string
+
+	// The mouse pointer, as the game sets it (pointerWanted): the Win32 cursor (ShowCursor
+	// count, SetCursor), the Direct3D device cursor, and whether the device is windowed
+	// (-1: no device yet).
+	cursorWin32  bool
+	cursorDevice bool
+	windowed     int8
 	// InputScript, when set by the game profile, presses scripted keys (DIK-indexed, 0x80 = down)
 	// for the C32_AUTO_KEYS mode in effect; used for unattended test runs.
 	InputScript  func(s *Subsystem, mode string, keys []byte)
@@ -251,6 +259,8 @@ func NewSubsystem(c *cpu.CPU) *Subsystem {
 		Resources:      make(map[uint32]*BufferDesc),
 		VertexDecls:    make(map[uint32]*VertexDecl),
 		AutoKeysMode:   autoKeys,
+		cursorWin32:    true,
+		windowed:       -1,
 		TraceLog:       os.Getenv("C32_LIVE") != "1",
 		viewportW:      ScreenWidth,
 		viewportH:      ScreenHeight,
@@ -674,6 +684,7 @@ func (s *Subsystem) handleIDirect3D9(c *cpu.CPU, winSlot int) {
 	case 15: // GetAdapterMonitor
 		c.Regs[cpu.RegEAX] = 1
 	case 16: // CreateDevice(this, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface)
+		s.setPresentParams(c, c.Arg(5))
 		ppDev := c.Arg(6)
 		if s.device9Obj == 0 {
 			s.device9Obj = s.allocCOMObject(c, s.vtDevice9, 64)
@@ -740,7 +751,8 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 		c.Regs[cpu.RegEAX] = 0
 	case 15: // GetNumberOfSwapChains
 		c.Regs[cpu.RegEAX] = 1
-	case 16: // Reset
+	case 16: // Reset(this, pPresentationParameters)
+		s.setPresentParams(c, c.Arg(1))
 		c.Regs[cpu.RegEAX] = 0
 	case 17: // Present
 		s.FrameCount++
@@ -1234,7 +1246,15 @@ func (s *Subsystem) handleIDirect3DDevice9(c *cpu.CPU, winSlot int) {
 			c.Write32(pp, s.allocCOMObject(c, s.vtQuery9, 16))
 		}
 		c.Regs[cpu.RegEAX] = 0
-	case 12, 41, 42: // ShowCursor, BeginScene, EndScene: nothing to do
+	case 12: // ShowCursor(this, bShow): returns whether it was shown
+		prev := s.cursorDevice
+		s.cursorDevice = c.Arg(1) != 0
+		s.publishGameState()
+		c.Regs[cpu.RegEAX] = 0
+		if prev {
+			c.Regs[cpu.RegEAX] = 1
+		}
+	case 41, 42: // BeginScene, EndScene: nothing to do
 		c.Regs[cpu.RegEAX] = 0
 	default:
 		s.unimplemented(c, "IDirect3DDevice9", winSlot)
@@ -2131,4 +2151,47 @@ func (s *Subsystem) thunkXInputGetCapabilities(c *cpu.CPU) {
 	}
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
+}
+
+// setPresentParams notes what the viewer needs from D3DPRESENT_PARAMETERS (CreateDevice, Reset).
+func (s *Subsystem) setPresentParams(c *cpu.CPU, pp uint32) {
+	if pp == 0 {
+		return
+	}
+	w := int8(0)
+	if c.Read32(pp+32) != 0 { // Windowed
+		w = 1
+	}
+	if w != s.windowed {
+		s.windowed = w
+		fmt.Printf("[D3D9] device: windowed=%v\n", w == 1)
+		s.publishGameState()
+	}
+}
+
+// SetWin32Cursor records whether the game shows the Win32 cursor (ShowCursor count >= 0 and
+// SetCursor not NULL).
+func (s *Subsystem) SetWin32Cursor(visible bool) {
+	s.cursorWin32 = visible
+	s.publishGameState()
+}
+
+// pointerWanted reports whether the game wants the system mouse pointer. Direct3D 9 doesn't show
+// the Windows cursor over a full-screen device: there a game shows a pointer through the
+// device (SetCursorProperties, ShowCursor) or draws its own. Windowed (or before any device),
+// the Win32 cursor decides.
+func (s *Subsystem) pointerWanted() bool {
+	return s.cursorDevice || (s.cursorWin32 && s.windowed != 0)
+}
+
+// publishGameState writes the game state the viewer reads (ShmGameOffset).
+func (s *Subsystem) publishGameState() {
+	if s.shm == nil {
+		return
+	}
+	var flags uint32
+	if s.pointerWanted() {
+		flags |= 1
+	}
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(&s.shm[ShmGameOffset])), flags)
 }
