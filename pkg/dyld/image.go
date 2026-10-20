@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // Segment is one LC_SEGMENT of an image (addresses before sliding).
@@ -55,6 +56,7 @@ type Image struct {
 	extRelOff, nExtRel, locRelOff, nLocRel uint32
 	splitSegs, flat                        bool // MH_SPLIT_SEGS: relocation addresses are from the first writable segment
 	exports                                map[string]export
+	syms                                   []symAt // SymbolAt's table
 }
 
 type export struct {
@@ -375,4 +377,37 @@ func (img *Image) textBase() uint32 {
 		}
 	}
 	return 0
+}
+
+type symAt struct {
+	addr uint32
+	name string
+}
+
+// SymbolAt names the symbol (exported or local) at or below the slid address a, and a's offset
+// from it, for diagnostics.
+func (img *Image) SymbolAt(a uint32) (string, uint32) {
+	if img.syms == nil {
+		img.forSymbols(func(i uint32, name string, typ, sect uint8, desc uint16, value uint32) {
+			if typ&0x0e == 0x0e && typ&0xe0 == 0 && name != "" {
+				img.syms = append(img.syms, symAt{value, name})
+			}
+		})
+		sort.Slice(img.syms, func(i, j int) bool { return img.syms[i].addr < img.syms[j].addr })
+	}
+	u := a - img.Slide
+	i := sort.Search(len(img.syms), func(i int) bool { return img.syms[i].addr > u }) - 1
+	if i < 0 {
+		return "", 0
+	}
+	return img.syms[i].name, u - img.syms[i].addr
+}
+
+// ForEachSymbol calls fn with every code or data symbol of the image (exported or local) and
+// its slid address, for diagnostics.
+func (img *Image) ForEachSymbol(fn func(name string, addr uint32)) {
+	img.SymbolAt(0)
+	for _, s := range img.syms {
+		fn(s.name, s.addr+img.Slide)
+	}
 }
