@@ -1,8 +1,10 @@
 package source
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"os"
 	"sync/atomic"
@@ -79,6 +81,16 @@ func RunGLCheck(path string, stop <-chan struct{}) (*GLCheck, error) {
 		k.Questions++
 	}
 	locations := uint32(0)
+	var trace *bufio.Writer // C32_GLTRACE: each command: name, hash of its bytes, arguments (for diffing two runs)
+	if p := os.Getenv("C32_GLTRACE"); p != "" {
+		f, err := os.Create(p)
+		if err != nil {
+			return k, err
+		}
+		trace = bufio.NewWriter(f)
+		defer f.Close()
+		defer trace.Flush()
+	}
 	for {
 		w := atomic.LoadUint64(dword(32))
 		if r == w {
@@ -110,6 +122,9 @@ func RunGLCheck(path string, stop <-chan struct{}) (*GLCheck, error) {
 			c := &calls[id]
 			k.PerCall[c.Name]++
 			args, used, err := walkGLArgs(c, p)
+			if trace != nil {
+				fmt.Fprintf(trace, "%s %08x %x\n", c.Name, crc32.ChecksumIEEE(p), args)
+			}
 			if err != nil {
 				k.fail("%s: %v", c.Name, err)
 			} else if int(n)-used >= 8 || used > int(n) {
