@@ -9,8 +9,10 @@ import (
 )
 
 const (
-	ArenaSize     = 0x20000000 // 512 MB 32-bit guest address space
-	HeapStartAddr = 0x04000000
+	// ArenaSize is the guest address space: 3 GB, reserved up front but only backed by memory
+	// where the guest touches it (newArena). Games set their own heap range (SetHeap).
+	ArenaSize     = 0xC0000000
+	HeapStartAddr = 0x04000000 // the default heap range (LEGO Star Wars' layout)
 	HeapEndAddr   = 0x1e000000
 	// Host-reserved guest region (D3D vtable + trampoline arenas live here); the heap must never allocate inside it.
 	ReservedLo        = 0x0f000000
@@ -77,6 +79,8 @@ type CPU struct {
 
 	// Heap allocator state
 	HeapPtr     uint32
+	HeapStart   uint32 // the heap range: [HeapStart, HeapEnd), minus ReservedLo..ReservedHi
+	HeapEnd     uint32
 	AllocSize   map[uint32]uint32
 	FreeBlocks  map[uint32][]uint32 // size class -> free list
 	freeExtents []extent            // free blocks above smallBlock, by address
@@ -154,18 +158,20 @@ func (c *CPU) SetPreemptInterval(interval uint64) {
 
 func NewCPU() *CPU {
 	c := &CPU{
-		Mem:           make([]byte, ArenaSize),
+		Mem:           newArena(ArenaSize),
 		Flags:         0x00000002,
 		FPUCW:         0x037F,
 		MXCSR:         0x1F80,
 		HeapPtr:       HeapStartAddr,
+		HeapStart:     HeapStartAddr,
+		HeapEnd:       HeapEndAddr,
 		AllocSize:     make(map[uint32]uint32),
 		FreeBlocks:    make(map[uint32][]uint32),
 		Intercepts:    make(map[uint32]ThunkFunc),
 		InterceptTag:  make(map[uint32]string),
 		UnmappedCalls: make(map[uint32]uint64),
 		VisitedFuncs:  make(map[uint32]uint64),
-		icept:         make([]uint64, ArenaSize/64),
+		icept:         newBitmap(ArenaSize / 64),
 		readLimit:     ArenaSize - 8,
 		writeSpan:     ArenaSize - 7,
 		FSBase:        0x03004000,
@@ -183,7 +189,7 @@ func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 		fn  ThunkFunc
 	}{}
 	if c.icept == nil {
-		c.icept = make([]uint64, ArenaSize/64)
+		c.icept = newBitmap(ArenaSize / 64)
 	}
 	if addr < ArenaSize {
 		c.icept[addr>>6] |= 1 << (addr & 63)
@@ -582,13 +588,18 @@ type extent struct{ addr, size uint32 }
 func (c *CPU) HeapInUse() uint64 { return c.heapInUse }
 
 // HeapPeak returns the bump pointer's distance from the heap start (the high-water mark).
-func (c *CPU) HeapPeak() uint32 { return c.HeapPtr - HeapStartAddr }
+func (c *CPU) HeapPeak() uint32 { return c.HeapPtr - c.HeapStart }
+
+// SetHeap moves the (still empty) heap to [lo, hi).
+func (c *CPU) SetHeap(lo, hi uint32) {
+	c.HeapStart, c.HeapEnd, c.HeapPtr = lo, hi, lo
+}
 
 func (c *CPU) Malloc(size uint32) uint32 {
 	if size == 0 {
 		size = 16
 	}
-	if size > HeapEndAddr {
+	if size > c.HeapEnd {
 		return c.heapExhausted(size)
 	}
 	aligned := (size + 15) & ^uint32(15)
@@ -603,7 +614,7 @@ func (c *CPU) Malloc(size uint32) uint32 {
 		if c.HeapPtr < ReservedHi && c.HeapPtr+aligned > ReservedLo {
 			c.HeapPtr = ReservedHi // skip the host-reserved region
 		}
-		if c.HeapPtr+aligned <= HeapEndAddr {
+		if uint64(c.HeapPtr)+uint64(aligned) <= uint64(c.HeapEnd) {
 			ptr = c.HeapPtr
 			c.HeapPtr += aligned
 		} else if ptr = c.takeExtent(aligned); ptr == 0 {
@@ -661,7 +672,7 @@ func (c *CPU) putExtent(addr, size uint32) {
 
 func (c *CPU) Calloc(num, size uint32) uint32 {
 	total := uint64(num) * uint64(size)
-	if total > HeapEndAddr {
+	if total > uint64(c.HeapEnd) {
 		return c.heapExhausted(uint32(min(total, 1<<32-1)))
 	}
 	ptr := c.Malloc(uint32(total))
