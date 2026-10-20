@@ -38,13 +38,18 @@ type padInput struct {
 	last    [d3d9.ShmPads]padState
 	pending [][]byte           // SDL events not yet delivered
 	heard   [d3d9.ShmPads]bool // the first input from each slot was logged
+	polling bool               // the game has polled its events (controllers show from then on)
 	handles map[uint32]int     // SDL_GameController / SDL_Joystick handles -> slot
 }
 
-// readPad reads slot i's state from the window's shared memory.
+// readPad reads slot i's state from the window's shared memory. Until the game first polls
+// its events no controller shows: one there at launch then arrives as a newly connected one.
+// (inputsystem finds controllers at its start, before the client exists: it can't switch the
+// client's "joystick" on then, and config.cfg's "joystick 0" stays. A controller connected
+// later, it switches on.)
 func (m *Machine) readPad(i int) padState {
 	fb := m.input.fb
-	if fb == nil || atomic.LoadUint32((*uint32)(unsafe.Pointer(&fb[d3d9.ShmPadOffset]))) != d3d9.ShmPadReady {
+	if fb == nil || !m.pads.polling || atomic.LoadUint32((*uint32)(unsafe.Pointer(&fb[d3d9.ShmPadOffset]))) != d3d9.ShmPadReady {
 		return padState{}
 	}
 	r := fb[d3d9.ShmPadOffset+4+i*d3d9.ShmPadSize:]
@@ -67,6 +72,7 @@ func (m *Machine) readPad(i int) padState {
 // pollPads turns controller changes into pending SDL events.
 func (m *Machine) pollPads() {
 	pi := &m.pads
+	pi.polling = true
 	ev := func(typ uint32, fill func(e []byte)) {
 		e := make([]byte, sdlEventSize)
 		binary.LittleEndian.PutUint32(e, typ)

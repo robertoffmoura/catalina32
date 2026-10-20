@@ -14,22 +14,34 @@ import (
 )
 
 // C32_SOURCE_DIR=<Portal> go test ./pkg/source -run Controller -v: plays the first chamber with a
-// controller, the left stick pushed right and A pressed on and off, and follows them through
-// the game: inputsystem's axis and button handling, the client's joystick move, the player's
-// command (sidemove). The controller is connected from the start, as when the game is launched
-// with it.
+// controller connected before the game starts, the left stick pushed right and A pressed on and
+// off, and follows them through the game: inputsystem's axis and button handling, the client's
+// joystick move, the player's command (sidemove). C32_CTL_LOAD=<save> loads a saved game from
+// the menu first (with C32_OVERLAY holding it).
 func TestController(t *testing.T) {
 	dir := os.Getenv("C32_SOURCE_DIR")
 	if dir == "" {
 		t.Skip("C32_SOURCE_DIR not set")
 	}
-	const injectFrom, end = 6_500_000_000, 9_000_000_000
-	m, finish := withWindow(t, dir, "+map", "testchmb_a_00")
+	var injectFrom, end uint64 = 6_500_000_000, 9_000_000_000
+	args := []string{"+map", "testchmb_a_00"}
+	var console func(*cpu.CPU)
+	if save := os.Getenv("C32_CTL_LOAD"); save != "" { // from the menu, load a saved game (in C32_OVERLAY), as a player does
+		args = nil
+		injectFrom, end = 10_000_000_000, 12_500_000_000
+	}
+	m, finish := withWindow(t, dir, args...)
+	if save := os.Getenv("C32_CTL_LOAD"); save != "" {
+		console = consoleAt(t, m, "6500000000:load "+save)
+	}
+	if v := os.Getenv("C32_CMDS"); v != "" { // more console commands (consoleAt)
+		console = consoleAt(t, m, v)
+	}
 	f32 := func(c *cpu.CPU, a uint32) float32 { return math.Float32frombits(c.Read32(a)) }
 
 	calls := map[string]int{}
 	var axes, buttons []string
-	m.Watch(regexp.MustCompile(`^__ZN12CInputSystem(18JoystickAxisMotionEiii|22PostButtonPressedEvent.*|12PollJoystickEv)$|^__ZN6CInput(18ControllerCommandsEv|19Joystick_GetForwardEv|16Joystick_GetSideEv|17Joystick_AdvancedEv)$`),
+	m.Watch(regexp.MustCompile(`^__ZN12CInputSystem(18JoystickAxisMotionEiii|22PostButtonPressedEvent.*|12PollJoystickEv)$|^__ZN6CInput(18ControllerCommandsEv|19Joystick_GetForwardEv|16Joystick_GetSideEv)$`),
 		func(name string, c *cpu.CPU) {
 			calls[name]++
 			switch {
@@ -52,10 +64,15 @@ func TestController(t *testing.T) {
 		}
 	})
 
-	m.OnPoll = func(c *cpu.CPU) { // connected from the start, as when the game is launched with it
-		r := m.input.fb[d3d9.ShmPadOffset+4:]
-		binary.LittleEndian.PutUint32(m.input.fb[d3d9.ShmPadOffset:], d3d9.ShmPadReady)
-		binary.LittleEndian.PutUint32(r, 1)
+	// Controller 1 is there before the game starts, as when it is launched with one connected
+	// (the window finds controllers within its first ticks).
+	binary.LittleEndian.PutUint32(m.input.fb[d3d9.ShmPadOffset:], d3d9.ShmPadReady)
+	r := m.input.fb[d3d9.ShmPadOffset+4:]
+	binary.LittleEndian.PutUint32(r, 1)
+	m.OnPoll = func(c *cpu.CPU) {
+		if console != nil {
+			console(c)
+		}
 		if c.Steps < injectFrom {
 			return
 		}

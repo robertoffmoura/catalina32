@@ -137,16 +137,21 @@ func TestMenuSound(t *testing.T) {
 func withWindow(t *testing.T, dir string, args ...string) (*Machine, func(end uint64)) {
 	tmp := t.TempDir()
 	glPath := filepath.Join(tmp, "gl.shm")
-	t.Setenv("C32_GL_SHM", glPath)
-	t.Setenv("C32_SHM_FILE", filepath.Join(tmp, "framebuffer.shm"))
 	stop := make(chan struct{})
 	checked := make(chan struct{})
-	go func() {
-		if _, err := RunGLCheck(glPath, stop); err != nil {
-			t.Errorf("glcheck: %v", err)
-		}
+	if p := os.Getenv("C32_VIEWER_SHM"); p != "" { // another viewer (tools/glreplay, to see frames) reads the stream there
+		glPath = p
 		close(checked)
-	}()
+	} else {
+		go func() {
+			if _, err := RunGLCheck(glPath, stop); err != nil {
+				t.Errorf("glcheck: %v", err)
+			}
+			close(checked)
+		}()
+	}
+	t.Setenv("C32_GL_SHM", glPath)
+	t.Setenv("C32_SHM_FILE", filepath.Join(tmp, "framebuffer.shm"))
 	logPath := filepath.Join(tmp, "game.log")
 	if p := os.Getenv("C32_LOG"); p != "" {
 		logPath = p
