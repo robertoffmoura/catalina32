@@ -22,6 +22,8 @@ import "strings"
 //	       offset into a bound buffer
 //
 // Flags after the name: E the emulator encodes it by hand; V the viewer decodes it by hand.
+// A call whose arguments here differ from the GL function's needs V (cmd/glgen's
+// TestSpecMatchesRegistry checks the others against Khronos's registry).
 // Names starting with c32 are not GL functions: presenting, the window size, and the questions
 // the emulator waits for an answer to (the first argument is the reply token; see glremote.go).
 // Calls answered in the emulator (glGetError, fences, compile status...) aren't listed.
@@ -153,7 +155,7 @@ glRenderbufferStorageMultisample: i i i i i
 glRenderbufferStorageMultisampleEXT: i i i i i
 glSampleCoverage: f i
 glScissor: i i i i
-glShaderSourceARB E: H s
+glShaderSourceARB EV: H s
 glStencilFunc: i i i
 glStencilFuncSeparate: i i i i
 glStencilMask: i

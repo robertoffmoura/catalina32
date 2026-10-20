@@ -202,6 +202,7 @@ static void c32gl_glDrawBuffer(C32GLDecoder *d, uint32_t a0);
 static void c32gl_glReadBuffer(C32GLDecoder *d, uint32_t a0);
 static void c32gl_glLinkProgramARB(C32GLDecoder *d, void * a0);
 static void c32gl_glPixelStorei(C32GLDecoder *d, uint32_t a0, uint32_t a1);
+static void c32gl_glShaderSourceARB(C32GLDecoder *d, void * a0, const char * a1);
 static void c32gl_c32Present(C32GLDecoder *d, uint32_t a0);
 static void c32gl_c32ClientArray(C32GLDecoder *d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6, const void * a7);
 static void c32gl_c32WindowSize(C32GLDecoder *d, uint32_t a0, uint32_t a1);
@@ -1006,7 +1007,7 @@ static int c32glDecode(C32GLDecoder *d, uint32_t id, const uint8_t *p) {
     case 120: { /* glShaderSourceARB */
         void * a0 = c32ObjH(d, c32RdU(&p));
         const char * a1 = c32RdStr(&p);
-        if (c32glFn[id]) ((void (*)(void *, const char *))c32glFn[id])(a0, a1);
+        c32gl_glShaderSourceARB(d, a0, a1);
         return 1;
     }
     case 121: { /* glStencilFunc */

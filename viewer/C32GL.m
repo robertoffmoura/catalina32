@@ -1,5 +1,6 @@
 // OpenGL renderer for a Source game's GL stream (see C32GL.h). Compiled with ARC.
 #define GL_SILENCE_DEPRECATION 1
+#pragma clang diagnostic ignored "-Wdeprecated-declarations" /* NSOpenGL: deprecated with OpenGL, still there */
 #import "C32GL.h"
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
@@ -274,6 +275,12 @@ static void c32gl_glLinkProgramARB(C32GLDecoder *d, void *prog) {
         d->errors++;
         atomic_fetch_add((_Atomic uint32_t *)(d->shm + kOffErrors), 1);
     }
+}
+
+/* The stream carries the source as one string. */
+static void c32gl_glShaderSourceARB(C32GLDecoder *d, void *shader, const char *src) {
+    (void)d;
+    if (src) glShaderSourceARB((GLhandleARB)(uintptr_t)shader, 1, &src, NULL);
 }
 
 static void c32gl_glPixelStorei(C32GLDecoder *d, uint32_t pname, uint32_t v) {
@@ -751,6 +758,8 @@ static void c32SetMouseMode(int relative) {
     _Atomic uint64_t *readIdx = (_Atomic uint64_t *)(shm + kOffRead);
     uint64_t r = atomic_load(readIdx);
     int idle = 0;
+    const char *dbg = getenv("C32_GL_DEBUG"); /* 1: check for GL errors after every call */
+    int debug = dbg && dbg[0] == '1';
     while (!atomic_load(&_stop)) {
         uint64_t w = atomic_load_explicit(writeIdx, memory_order_acquire);
         if (r == w) {
@@ -779,6 +788,12 @@ static void c32SetMouseMode(int relative) {
                     fprintf(stderr, "[C32GL] unknown call %u: stopping\n", id);
                     atomic_store(&_stop, 1);
                     break;
+                }
+                if (debug) {
+                    GLenum err;
+                    while ((err = glGetError()) != GL_NO_ERROR) {
+                        if (d->errors++ < 200) fprintf(stderr, "[C32GL] GL error 0x%x in %s\n", err, d->lastCall);
+                    }
                 }
                 r += 8 + (uint64_t)len;
             }
