@@ -45,8 +45,10 @@ bugs.
   3. compiles the viewer (`viewer/*.m`) into `/tmp/catalina32-mac-preview/C32Window`;
   4. starts both.
 
-  `--build-app` builds a `.app`. Saves go to
-  `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData`.
+  `--build-app` builds an old-style `.app`; `scripts/build-app.sh` (in the repository) builds
+  Catalina32.app, the product (`docs/ARCHITECTURE.md`). Saves go to
+  `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData` until the profile
+  names the original game's folder (`OriginalSaves`).
 - **Branches.** `master` is the product. `debug` is `master` plus debugging-only tools (a
   session journal to record a live session and replay it headless, and Metal frame snapshots
   without a window), documented in `debug`'s copy of these files; it stays ahead of `master`.

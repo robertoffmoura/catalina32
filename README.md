@@ -7,8 +7,8 @@ players still own. catalina32 runs those games' original code on today's Macs: i
 the 32-bit x86 code, replaces the old system libraries underneath it, and draws with Metal.
 You need your own copy of each game; catalina32 never copies or changes it.
 
-> **Status: early.** One game is supported and plays well. The app described below is being
-> built; today the way to play is the developer setup at the end of this page.
+> **Status: early.** One game is supported and plays well. The app below is new: build it with
+> `scripts/build-app.sh` (see For developers) until there are releases to download.
 
 ## Supported games
 
@@ -19,7 +19,7 @@ You need your own copy of each game; catalina32 never copies or changes it.
 Ports by Feral Interactive are the first target: they share one runtime layer, which
 catalina32 replaces, so each new Feral game should need little work.
 
-## Playing *(the app is in progress)*
+## Playing
 
 1. Download **Catalina32.app** and open it.
 2. It finds your games (Steam library, Applications folders) and shows which are supported.
@@ -44,7 +44,7 @@ Most of the game runs at 35–60 FPS on a recent Intel MacBook Pro; the busiest 
 
 - The game app says the game moved or changed: Steam updated it or the library moved.
   Create the game app again from Catalina32.
-- Logs: `~/Library/Logs/catalina32/` *(planned)*. Please include them when reporting a problem.
+- Logs: `~/Library/Logs/catalina32/`. Please include them when reporting a problem.
 
 ## FAQ
 
@@ -56,9 +56,11 @@ Most of the game runs at 35–60 FPS on a recent Intel MacBook Pro; the busiest 
 
 ## For developers
 
-- **Building and running:** `go build ./cmd/catalina32` builds the engine and command line;
-  the window app is `viewer/*.m` (clang, macOS frameworks). `run_on_mac.sh` (outside the
-  repository) is the current development loop: it builds both and starts a game.
+- **Building and running:** `scripts/build-app.sh` builds `build/Catalina32.app` (macOS, Go,
+  Xcode command-line tools). `go build ./cmd/catalina32` builds the engine and command line
+  (`catalina32 list`, `info`, `wrap`, `run`) on any system. `run_on_mac.sh` (outside the
+  repository) is the development loop: it builds both and starts a game with the developer
+  HUD.
 - **Tests:** `go test ./...`; with a game executable (`C32_BIN_PATH`), more tests run against
   the game's own code.
 - **Documentation:**

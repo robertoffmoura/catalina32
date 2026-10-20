@@ -32,6 +32,21 @@ explain each change); keep this file to what is true now.
    functions and takes about 37% of the host time. The AOT compiler can't fix this for users
    (see Speed in the backlog); the generic answer is a JIT.
 
+## The app (branch `app`, untested on a Mac)
+
+Catalina32.app and game apps, as designed in `docs/ARCHITECTURE.md`:
+- `pkg/gamelib` (identify, scan, wrap, manifest, saves, backups) and the `catalina32 list`,
+  `info`, `wrap`, `run` commands: tested here, including on the user's copy of the game.
+- The window app's game mode and the wizard (`viewer/C32Launch.m`, `C32Wizard.m`): checked
+  with clang against stub headers only.
+- `scripts/build-app.sh`: needs a Mac; the engine cross-compiles here.
+- Not done:
+  - the original save folder for this game (`OriginalSaves`): waiting for the layout under
+    `~/Library/Application Support/Feral Interactive/LEGO Star Wars Saga/`;
+  - an app icon for Catalina32 itself;
+  - the Feral family layer (MacDoze entry points by signature): needs a second 32-bit Feral
+    game to check the signatures against.
+
 ## Backlog
 
 - **Play further:** other chapters and episodes, vehicle levels, Free Play, bonus areas. Expect

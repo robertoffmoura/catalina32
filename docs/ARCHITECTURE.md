@@ -48,17 +48,18 @@ Games        profiles: checksums, names, folders, original save location, rare q
 - **Host** (`viewer/`): one Objective-C executable with two modes. In a game app it is the
   game's window: it starts the engine as a child process, maps the shared memory, draws with
   Metal, reads keyboard and controllers, plays audio, and stops the engine when the window
-  closes. In Catalina32.app it is the wizard *(planned)*.
+  closes. In Catalina32.app it is the wizard. Its output goes to
+  `~/Library/Logs/catalina32/<game>.log`.
 - **Front-ends**: the `catalina32` binary is both the engine and the command line. The wizard
   calls the command line (`list --json`, `wrap`), so all the logic (finding games, deciding
   support, building game apps, save locations) is Go and testable without a Mac.
 
 ## User flows
 
-1. **Wizard** *(planned)*. Open Catalina32 → it scans the Steam library folders
+1. **Wizard.** Open Catalina32 → it scans the Steam library folders
    (`libraryfolders.vdf`), `/Applications` and `~/Applications`, and lists what it finds with
-   a status: supported, not supported yet, or not a 32-bit game. **Create app** (default
-   `~/Applications`, option "Add to Dock") → **Play**. **Choose game…** or dropping a game
+   a status: supported, or not supported yet. **Create App** (in `~/Applications`) → **Play**
+   or **Show in Finder** (from where it can go in the Dock). **Choose game…** or dropping a game
    on the window or the Dock icon covers games elsewhere. An unsupported game gets a plain
    message and its identity for a report; it is never run on a guess.
 2. **Game app.** On launch it checks the game is still where it was and unchanged (same
@@ -120,8 +121,9 @@ The game's own code writes the save files, so they are compatible with the origi
   stop non-sandboxed apps (the Steam versions of these games, and catalina32) from using each
   other's folders in `~/Library/Application Support`; only sandboxed apps' containers
   (`~/Library/Containers`, the Mac App Store versions) ask the player for permission first.
-- **Backup.** Before the first run, and from time to time after, the folder is copied to
-  `~/Library/Application Support/catalina32/Backups/<profile>/<date>` *(planned)*.
+- **Backup.** Before a game starts, if the newest backup is more than a week old, the folder
+  is copied to `~/Library/Application Support/catalina32/Backups/<profile>/<date>` (the five
+  newest are kept).
 - **Separate folder** (`~/Library/Application Support/catalina32/<game>/SaveData`): for a
   game whose original location isn't known, or by choice (`C32_SAVE_ROOT` overrides both).
 
@@ -129,9 +131,10 @@ The game's own code writes the save files, so they are compatible with the origi
 
 - **Developers:** `go build ./cmd/catalina32` (the engine and CLI), the viewer with clang
   (`viewer/*.m`), tests with `go test ./...`. `docs/DEBUGGING.md` has everything else.
-- **The app:** `scripts/build-app.sh` *(planned)* builds both and assembles Catalina32.app in
-  `dist/`. A build for your own use may include the AOT code generated from your own copy of
-  a game; a build for others must not (it is a translation of the game's code).
+- **The app:** `scripts/build-app.sh [--arch native|x86_64|arm64|universal] [--with-aot]`
+  builds both and assembles `build/Catalina32.app`. A build for your own use may include the
+  AOT code generated from your own copy of a game (`--with-aot`); a build for others must not
+  (it is a translation of the game's code), so by default it is left out (`-tags noaot`).
 
 ## Distribution and legal
 
