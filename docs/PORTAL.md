@@ -1,7 +1,35 @@
 # Portal (and Valve's Source games): findings and plan
 
-Status: **experiments done** (2026-10-20, branch `source`): Portal boots headless to its main
-menu and renders frames through the game's own ToGL into a null OpenGL. See [Results](#results-of-the-first-experiments).
+Status (2026-10-20, branch `source`): **first playable build to try on the Mac.** Portal boots
+to its main menu; its OpenGL calls stream to the window, which draws them with the Mac's
+OpenGL; text uses catalina32's fonts; keyboard and mouse reach the game. Verified here up to
+the menu headless (with a stand-in for the window); the window's OpenGL side is checked only
+for syntax. No sound yet. See [Running it](#running-it) and
+[Results](#results-of-the-first-experiments).
+
+## Running it
+
+On the Mac, from the repository: `scripts/run_source.sh [path/to/Portal]` (default: the
+`Portal` folder next to the repository). It builds the engine and the window, then runs
+`catalina32 source --window <window> <folder>`. What the game writes (settings, saves) goes
+to `~/Library/Application Support/catalina32/Portal`, never into the game folder.
+
+Pieces (all in `pkg/source` unless noted):
+
+- `pkg/dyld`: the dynamic linker. `machine.go`: memory layout (images 1–208 MB, heap
+  256 MB–3 GB, stack at the top of the 3 GB guest space), process start.
+- `libc.go`, `pthread.go`, `cxx.go`, `dl.go`, `frameworks.go`: the system libraries.
+- `glspec.go` (the calls), `glremote.go` (the stream, emulator side), `viewer/C32GL.m` (the
+  window side; its decoder `viewer/C32GLCalls.h` is generated: `go generate ./pkg/source`).
+  `cmd/glcheck` stands in for the window on Linux.
+- `hostfont.go` (fonts, replacing ATSUI), `patches.go` (where they plug in), `input.go`
+  (keyboard and mouse), `sdl.go` (window, events), `audio.go` (a silent OpenAL for now),
+  `steam.go` (Steam absent).
+
+Developer switches for `go test ./pkg/source -run Boot -v`: `C32_SOURCE_DIR` (the game
+folder), `C32_STEPS`, `C32_LOG`, `C32_ARGS`, `C32_OVERLAY`, `C32_GLCHECK=1` (stream checked by
+the stand-in), `C32_GLSTATS=1` (GL call counts), `C32_PROBE=<regexp>`, `C32_WATCH_NULL=1`;
+`-run HostFontSample` with `C32_FONT_PNG=out.png` renders a font sample.
 Survey of the user's copy at `/workspace/Portal` (the Steam build of Nov 25 2024, 4.1 GB;
 `steam_appid.txt` 400). Nothing of it is committed or uploaded. Portal 2 has not been surveyed.
 
@@ -139,14 +167,28 @@ text, but everything else runs. Ways forward:
 
 ### Revised plan (replaces the order below where they differ)
 
-1. Bigger guest address space (2–3 GB) and the image region moved out of the low 47 MB.
-2. OpenGL on the Mac: the null GL's entry points become calls to the system's OpenGL (legacy 2.1
-   profile, as ToGL expects), with guest pointers translated; the window and GL context from the
-   app (`SDL2` natively). First real frame of the menu.
-3. Fonts from the host (`IVGuiFontImpl`), input (mouse look: SDL relative mode), audio (OpenAL
-   into our ring).
-4. Game identity for folders (`pkg/gamelib`), the family layer, then the Steam bridge.
+1. ~~Bigger guest address space~~: done (3 GB, reserved with mmap; LEGO Star Wars unchanged).
+2. ~~OpenGL on the Mac~~: done as a stream to the window (the engine stays pure Go; the
+   window replays the calls on a legacy 2.1 context and scales the game's window into its own).
+   To verify on the Mac.
+3. ~~Fonts from the host~~ and ~~keyboard and mouse~~: done. Next: audio (OpenAL into the PCM
+   ring the window already plays), controllers (SDL game controllers from the pads in shared
+   memory), full screen.
+4. Game identity for folders (`pkg/gamelib`, so Portal gets a game app), the family layer, then
+   the Steam bridge.
 5. Speed: the JIT (`docs/JIT.md`).
+
+### The OpenGL stream: what to know
+
+- Measured headless to the menu (8e9 instructions): about 930k calls and 300–700 MB of
+  commands (mostly textures while loading, glyphs once text is drawn), 440 frames, no protocol
+  errors. Only uniform locations (at shader load), texture readbacks (921, while loading) and
+  a few strings and limits wait for the window; mapped buffers are copies in game memory sent
+  on flush; occlusion query results are posted asynchronously.
+- The game's framebuffer 0 is an offscreen framebuffer of the window size it asked for
+  (sRGB-capable, like a Mac window's); each present letterboxes it into the window.
+- Things to watch on the Mac: the colours (sRGB), missing GL entry points (the window logs
+  them at start), GL errors and failed shader links (logged with the call they followed).
 
 ## First experiments (as planned, before the results above)
 
