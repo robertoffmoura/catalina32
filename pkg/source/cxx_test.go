@@ -1,7 +1,11 @@
 package source
 
 import (
+	"encoding/binary"
+	"fmt"
 	"testing"
+
+	"catalina32/pkg/d3d9"
 
 	"catalina32/pkg/cpu"
 )
@@ -101,5 +105,28 @@ func TestSwscanf(t *testing.T) {
 	c.Write32(va+4, out+8)
 	if n := m.scan(c, []rune(" 0x1F  2.5"), []rune("%x %lf"), va, true); n != 2 || c.Read32(out) != 0x1f || c.ReadF64(out+8) != 2.5 {
 		t.Fatalf("hex/double: n=%d %#x %v", n, c.Read32(out), c.ReadF64(out+8))
+	}
+}
+
+func TestPadEvents(t *testing.T) {
+	m, err := New("", nil, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.input.fb = make([]byte, d3d9.ShmTotalSize)
+	le := binary.LittleEndian
+	le.PutUint32(m.input.fb[d3d9.ShmPadOffset:], d3d9.ShmPadReady)
+	r := m.input.fb[d3d9.ShmPadOffset+4:]
+	le.PutUint32(r, 1)           // connected
+	le.PutUint16(r[4:], 0x1000)  // A
+	le.PutUint16(r[10:], 0x7fff) // left stick up
+	m.pollPads()
+	var got []string
+	for _, e := range m.pads.pending {
+		got = append(got, fmt.Sprintf("%#x:%d:%d:%d", le.Uint32(e), e[12], e[13], int16(le.Uint16(e[16:]))))
+	}
+	want := "[0x653:0:0:0 0x651:0:1:0 0x650:1:0:-32767]" // added, A down, left y = up
+	if fmt.Sprint(got) != want {
+		t.Fatalf("events %v, want %s", got, want)
 	}
 }

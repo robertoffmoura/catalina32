@@ -113,8 +113,14 @@ func (m *Machine) nextEvent() []byte {
 
 // pollEvent writes the next event as an SDL_Event at p; false when there is none.
 func (m *Machine) pollEvent(c *cpu.CPU, p uint32) bool {
+	m.pollPads()
 	if p == 0 { // SDL_PollEvent(NULL): is there one?
-		return m.glr != nil && m.glOn && atomic.LoadUint32(m.glr.word(128)) != atomic.LoadUint32(m.glr.word(132))
+		return len(m.pads.pending) > 0 || m.glr != nil && m.glOn && atomic.LoadUint32(m.glr.word(128)) != atomic.LoadUint32(m.glr.word(132))
+	}
+	if q := m.pads.pending; len(q) > 0 {
+		copy(c.WBytes(p, sdlEventSize), q[0])
+		m.pads.pending = q[1:]
+		return true
 	}
 	for {
 		e := m.nextEvent()

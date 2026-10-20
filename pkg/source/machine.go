@@ -79,6 +79,7 @@ type Machine struct {
 	Live      bool      // wall-clock time (a player is watching), else time from the instruction count
 	start     time.Time
 	input     inputState
+	pads      padInput
 	hostFonts fontRegistry
 	cfStrings map[uint32]string
 	sdl       sdlState

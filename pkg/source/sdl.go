@@ -119,7 +119,6 @@ func (m *Machine) registerSDLShims() {
 			m.sleepFor(uint64(ms) * 1000)
 		},
 		"_SDL_AddEventWatch": retVoid, "_SDL_DelEventWatch": retVoid,
-		"_SDL_NumJoysticks": ret0,
 		"_SDL_ShowCursor": func(c *cpu.CPU) { // (toggle: 1 show, 0 hide, -1 query) -> the previous state
 			was := b2u(!m.input.hidden)
 			if t := int32(c.Arg(0)); t >= 0 {
