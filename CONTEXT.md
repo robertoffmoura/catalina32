@@ -47,8 +47,8 @@ bugs.
 
   `--build-app` builds an old-style `.app`; `scripts/build-app.sh` (in the repository) builds
   Catalina32.app, the product (`docs/ARCHITECTURE.md`). Saves go to
-  `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData` until the profile
-  names the original game's folder (`OriginalSaves`).
+  `~/Library/Application Support/catalina32/LEGO Star Wars Saga/SaveData` (`run_on_mac.sh` sets
+  it); game apps use the original game's folder (`OriginalSaves` in the profile).
 - **Branches.** `master` is the product. `debug` is `master` plus debugging-only tools (a
   session journal to record a live session and replay it headless, and Metal frame snapshots
   without a window), documented in `debug`'s copy of these files; it stays ahead of `master`.

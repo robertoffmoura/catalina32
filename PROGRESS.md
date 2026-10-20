@@ -41,8 +41,6 @@ Catalina32.app and game apps, as designed in `docs/ARCHITECTURE.md`:
   with clang against stub headers only.
 - `scripts/build-app.sh`: needs a Mac; the engine cross-compiles here.
 - Not done:
-  - the original save folder for this game (`OriginalSaves`): waiting for the layout under
-    `~/Library/Application Support/Feral Interactive/LEGO Star Wars Saga/`;
   - an app icon for Catalina32 itself;
   - the Feral family layer (MacDoze entry points by signature): needs a second 32-bit Feral
     game to check the signatures against.

@@ -11,9 +11,12 @@ var Profile = &profile.Profile{
 	EntryPoint: "WinMain",
 	// Static initialisers at or above this address belong to Feral's platform layer and are
 	// replaced by the runtime; only the game's own (NuEngine) initialisers are run.
-	ModInitLimit:  0x002e3be0,
-	DataDir:       "LEGOStarWarsSagaData",
-	SaveDir:       "LEGO Star Wars Saga", // where run_on_mac.sh and the .app have always kept saves
+	ModInitLimit: 0x002e3be0,
+	DataDir:      "LEGOStarWarsSagaData",
+	SaveDir:      "LEGO Star Wars Saga", // where run_on_mac.sh and the .app have always kept saves
+	// The original game's ${AppSaveData}: it holds LucasArts/LEGO Star Wars - The Complete Saga,
+	// as SaveData does (seen on the user's Mac).
+	OriginalSaves: "~/Library/Application Support/Feral Interactive/LEGO Star Wars Saga/VFS/User/AppData/Roaming",
 	ModulePath:    `C:\LEGOStarWarsSaga\LEGOStarWarsSaga.exe`,
 	UnmappedStubs: unmappedStubs,
 	Globals: map[string]uint32{
