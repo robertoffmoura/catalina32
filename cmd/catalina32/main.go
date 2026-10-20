@@ -38,17 +38,27 @@ func appParent(bin string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		os.Exit(runCommand(os.Args[1], os.Args[2:]))
+	}
+	// The engine alone, on an executable (the development flow: run_on_mac.sh, scripts/).
 	gameFlag := flag.String("game", "", "path to the game's i386 Mach-O executable (default: $C32_BIN_PATH)")
+	flag.Usage = usage
 	flag.Parse()
 	binPath := os.Getenv("C32_BIN_PATH")
 	if *gameFlag != "" {
 		binPath = *gameFlag
 	}
 	if binPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: catalina32 -game <path to the game's i386 executable> (or set C32_BIN_PATH)")
+		usage()
 		os.Exit(2)
 	}
+	engineMain(binPath)
+}
 
+// engineMain runs a game's executable: folders and saves come from C32_DATA_ROOT and
+// C32_SAVE_ROOT, or default from the profile.
+func engineMain(binPath string) {
 	img, err := macho32.LoadImage(binPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load Mach-O image: %v\n", err)
