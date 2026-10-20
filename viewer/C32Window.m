@@ -2,6 +2,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
 #import "C32Metal.h"
+#import "C32App.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <IOKit/hid/IOHIDLib.h>
 #import <IOKit/hid/IOHIDKeys.h>
@@ -420,8 +421,11 @@ static int macKeyCodeToDIK(unsigned short kc) {
     uint64_t _fpsBaseFrame;
     CFAbsoluteTime _fpsBaseTime;
     double _fps;
+    C32GameLaunch *_game; /* game mode: the engine we started (nil: viewer mode) */
+    BOOL _quitting;
 }
 - (instancetype)initWithShmPath:(NSString *)path;
+- (instancetype)initWithGame:(C32GameLaunch *)game;
 @end
 
 @implementation AppDelegate
@@ -431,6 +435,26 @@ static int macKeyCodeToDIK(unsigned short kc) {
         _fpsBaseTime = CFAbsoluteTimeGetCurrent();
     }
     return self;
+}
+
+- (instancetype)initWithGame:(C32GameLaunch *)game {
+    if ((self = [self initWithShmPath:[game shmPath]])) {
+        _game = [game retain];
+    }
+    return self;
+}
+
+/* Game mode: when the engine stops, the app quits; if it stopped by itself with an error
+   (the game moved, changed, failed to start), say why first. */
+- (void)engineStopped:(int)status {
+    if (_quitting) return;
+    if (status != 0) {
+        NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+        [alert setMessageText:[NSString stringWithFormat:@"%@ stopped", [_game title]]];
+        [alert setInformativeText:[_game failureMessage]];
+        [alert runModal];
+    }
+    [NSApp terminate:nil];
 }
 
 - (void)tryMapShm {
@@ -516,18 +540,26 @@ static int macKeyCodeToDIK(unsigned short kc) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    NSRect winRect = NSMakeRect(0, 0, 1280, 764);
+    BOOL player = _game != nil; /* game mode: only the game, no developer HUD or buttons */
+    NSRect winRect = NSMakeRect(0, 0, 1280, player ? 720 : 764);
     _window = [[NSWindow alloc] initWithContentRect:winRect
                                           styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
     [_window center];
-    [_window setTitle:@"LEGO Star Wars: The Complete Saga — Native macOS 64-Bit Window"];
+    [_window setTitle:player ? [_game title] : @"catalina32 viewer"];
     [_window setBackgroundColor:[NSColor colorWithCalibratedRed:0.06 green:0.08 blue:0.11 alpha:1.0]];
     [_window setDelegate:self];
 
     NSView *content = [_window contentView];
 
+    if (player) {
+        __block AppDelegate *me = self;
+        [[_game engine] setTerminationHandler:^(NSTask *task) {
+            int status = [task terminationStatus];
+            dispatch_async(dispatch_get_main_queue(), ^{ [me engineStopped:status]; });
+        }];
+    } else {
     _hudLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 736, 700, 22)];
     [_hudLabel setEditable:NO];
     [_hudLabel setBezeled:NO];
@@ -567,8 +599,9 @@ static int macKeyCodeToDIK(unsigned short kc) {
     [_autoBtn setAction:@selector(cycleAutoKeys:)];
     [_autoBtn setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
     [content addSubview:_autoBtn];
+    } /* viewer mode */
 
-    _fbView = [[C32View alloc] initWithFrame:NSMakeRect(0, 0, 1280, 728)];
+    _fbView = [[C32View alloc] initWithFrame:NSMakeRect(0, 0, 1280, player ? 720 : 728)];
     [_fbView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [content addSubview:_fbView];
 
@@ -625,19 +658,38 @@ static int macKeyCodeToDIK(unsigned short kc) {
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    _quitting = YES;
     [_renderer stop]; /* tells the emulator to stop sending GPU frames */
+    if ([[_game engine] isRunning]) [[_game engine] terminate];
 }
 @end
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        NSString *shmPath = @"/tmp/catalina32-mac-preview/framebuffer.shm";
-        if (argc > 1) {
-            shmPath = [NSString stringWithUTF8String:argv[1]];
-        }
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-        AppDelegate *del = [[AppDelegate alloc] initWithShmPath:shmPath];
+        id<NSApplicationDelegate> del = nil;
+        /* (Old macOS versions pass -psn_... to apps opened from the Finder: not a path.) */
+        NSString *manifest = [[NSBundle mainBundle] pathForResource:@"game" ofType:@"json"];
+        if (argc > 1 && argv[1][0] != '-') {
+            /* Viewer mode: the engine was started by someone else (run_on_mac.sh, catalina32 run). */
+            del = [[AppDelegate alloc] initWithShmPath:[NSString stringWithUTF8String:argv[1]]];
+        } else if (manifest) {
+            /* Game mode: a game app. */
+            NSString *error = nil;
+            C32GameLaunch *game = [C32GameLaunch launchManifest:manifest error:&error];
+            if (!game) {
+                NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+                [alert setMessageText:@"The game can't start"];
+                [alert setInformativeText:error];
+                [alert runModal];
+                return 1;
+            }
+            del = [[AppDelegate alloc] initWithGame:game];
+        } else {
+            /* Wizard mode: Catalina32.app. */
+            del = [[C32Wizard alloc] init];
+        }
         [app setDelegate:del];
         [app run];
     }
