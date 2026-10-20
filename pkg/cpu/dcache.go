@@ -86,6 +86,11 @@ const (
 	dTestRMRJcc // 85 + Jcc
 	dTestRMIJcc // F6 /0 + Jcc
 	dCmpRMI8Jcc // 80 /7 + Jcc
+
+	dImulRRM32 // 0F AF: r32 *= r/m32
+	dNot32     // F7 /2
+	dNeg32     // F7 /3
+	dSetcc     // 0F 9x: r/m8 = condition (aux)
 )
 
 type dInst struct {
@@ -477,6 +482,12 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	case op == 0xEB:
 		d.imm = p + 1 + uint32(int32(int8(m[p])))
 		set(dJmp, p+1)
+	case op == 0xF7:
+		if n := decodeModRM(m, p, d); d.reg == 2 {
+			set(dNot32, p+n)
+		} else if d.reg == 3 {
+			set(dNeg32, p+n)
+		}
 	case op == 0xF6:
 		if n := decodeModRM(m, p, d); d.reg == 0 || d.reg == 1 {
 			d.imm = uint32(m[p+n])
@@ -494,6 +505,12 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			n := decodeModRM(m, p, d)
 			d.aux = op2 & 0x0F
 			set(dCmov, p+n)
+		case op2 >= 0x90 && op2 <= 0x9F:
+			n := decodeModRM(m, p, d)
+			d.aux = op2 & 0x0F
+			set(dSetcc, p+n)
+		case op2 == 0xAF:
+			set(dImulRRM32, p+decodeModRM(m, p, d))
 		case op2 == 0xB6:
 			set(dMovzx8, p+decodeModRM(m, p, d))
 		case op2 == 0xB7:
@@ -820,6 +837,40 @@ func (c *CPU) execBlock(insts []dInst) {
 				c.Write32(addr, c.shiftOp32(int(d.aux), c.Read32(addr), cnt))
 			} else {
 				c.Regs[d.rm] = c.shiftOp32(int(d.aux), c.Regs[d.rm], cnt)
+			}
+		case dImulRRM32:
+			prod := int64(int32(c.Regs[d.reg])) * int64(int32(c.rm32(d)))
+			res := uint32(prod)
+			c.Regs[d.reg] = res
+			c.SetFlag(FlagCF|FlagOF, prod != int64(int32(res)))
+		case dNot32, dNeg32:
+			var addr, val uint32
+			if d.isMem {
+				addr = c.ea(d)
+				val = c.Read32(addr)
+			} else {
+				val = c.Regs[d.rm]
+			}
+			res := ^val
+			if d.kind == dNeg32 {
+				res = -val
+				c.UpdateFlagsSub32(0, val, res)
+				c.SetFlag(FlagCF, val != 0)
+			}
+			if d.isMem {
+				c.Write32(addr, res)
+			} else {
+				c.Regs[d.rm] = res
+			}
+		case dSetcc:
+			v := uint8(0)
+			if c.EvalCond(d.aux) {
+				v = 1
+			}
+			if d.isMem {
+				c.Write8(c.ea(d), v)
+			} else {
+				c.SetReg8(int(d.rm), v)
 			}
 		case dImul32:
 			src := int64(int32(c.rm32(d)))
