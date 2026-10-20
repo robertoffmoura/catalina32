@@ -7,8 +7,9 @@ players still own. catalina32 runs those games' original code on today's Macs: i
 the 32-bit x86 code, replaces the old system libraries underneath it, and draws with Metal.
 You need your own copy of each game; catalina32 never copies or changes it.
 
-> **Status: early.** One game is supported and plays well. The app below is new: build it with
-> `scripts/build-app.sh` (see For developers) until there are releases to download.
+> **Status: early.** One game is supported and plays well. Download the app from
+> [Releases](https://github.com/robertoffmoura/catalina32/releases), or build it yourself
+> (see For developers).
 
 ## Supported games
 
@@ -21,7 +22,8 @@ catalina32 replaces, so each new Feral game should need little work.
 
 ## Playing
 
-1. Download **Catalina32.app** and open it.
+1. Download **Catalina32** from [Releases](https://github.com/robertoffmoura/catalina32/releases),
+   unzip it, move *Catalina32.app* to Applications and open it (see First launch).
 2. It finds your games (Steam library, Applications folders) and shows which are supported.
    A game somewhere else: **Choose game…**, or drop it on the window.
 3. **Create app** makes a game app, such as *LEGO Star Wars Saga.app*, with the game's icon.
@@ -33,12 +35,23 @@ they are; catalina32 backs them up before first use.
 **Controllers:** USB and Bluetooth controllers work, and can be connected at any time. The one
 that drives the menus is player 1; press a button on another to join as player 2.
 
-**Requirements:** macOS 10.15 or later. Tested on Intel Macs.
+**Requirements:** macOS 10.15 or later. Tested on Intel Macs; Apple Silicon is included in the
+download but hasn't been tested yet.
+
+## First launch
+
+Catalina32 isn't notarised by Apple yet, so macOS blocks it the first time:
+
+- **macOS 15 and later:** open it once and dismiss the warning, then go to *System Settings →
+  Privacy & Security*, click **Open Anyway** next to Catalina32, and confirm.
+- **macOS 10.15 to 14:** right-click *Catalina32.app* → **Open**, then **Open** again.
+
+You only do this once. Game apps made by Catalina32 open normally.
 
 ## Performance
 
-Most of the game runs at 35–60 FPS on a recent Intel MacBook Pro; the busiest areas drop to
-20–30. The emulator is the limit there, and that's where work continues.
+How smoothly a game runs depends on your Mac. The busiest scenes are the most demanding: the
+emulator is the limit there, and that's where work continues.
 
 ## Troubleshooting
 
@@ -61,6 +74,8 @@ Most of the game runs at 35–60 FPS on a recent Intel MacBook Pro; the busiest 
   (`catalina32 list`, `info`, `wrap`, `run`) on any system. `run_on_mac.sh` (outside the
   repository) is the development loop: it builds both and starts a game with the developer
   HUD.
+- **Releases:** `scripts/make_release.sh` builds, checks and zips the app and writes the release
+  notes; `--publish` then tags it and creates the GitHub release.
 - **Tests:** `go test ./...`; with a game executable (`C32_BIN_PATH`), more tests run against
   the game's own code.
 - **Documentation:**
@@ -73,3 +88,7 @@ Most of the game runs at 35–60 FPS on a recent Intel MacBook Pro; the busiest 
   until the Feral family layer lands, its table of runtime-layer addresses. Native
   replacements of hot functions bind by signature (`cmd/sigmake`), so they reach every game
   with the same code.
+
+## License
+
+MIT: see [LICENSE](LICENSE).
