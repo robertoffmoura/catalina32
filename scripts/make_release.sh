@@ -57,10 +57,17 @@ ENGINE="$APP/Contents/Helpers/catalina32"
 if strings -a "$ENGINE" | grep -q 'registerAOTGenerated'; then
   fail "the engine contains AOT-compiled game code: not releasing it"
 fi
-WANT=$(case "$ARCH" in universal) echo "x86_64 arm64" ;; native) uname -m ;; *) echo "$ARCH" ;; esac)
+# (No case inside $(...): macOS's bash 3.2 can't parse it.)
+if [[ "$ARCH" == universal ]]; then
+  WANT="x86_64 arm64"
+elif [[ "$ARCH" == native ]]; then
+  WANT="$(uname -m)"
+else
+  WANT="$ARCH"
+fi
 for a in $WANT; do
   for f in "$ENGINE" "$APP/Contents/MacOS/Catalina32"; do
-    lipo -archs "$f" | tr ' ' '\n' | grep -qx "$a" || fail "$(basename "$f") lacks $a"
+    lipo -info "$f" | grep -qw "$a" || fail "$(basename "$f") lacks $a"
   done
 done
 codesign --verify --deep "$APP" || fail "the app's signature doesn't verify"
@@ -104,10 +111,12 @@ ARCHS_TEXT="Intel Macs"
   fi
 } > "$NOTES"
 
+VERSION_HINT="[release] The version lives in cmd/catalina32/cli.go; bump it there before each later release."
 echo "[release] $ZIP ($(du -h "$ZIP" | cut -f1))"
 echo "[release] $NOTES"
 if [[ "$PUBLISH" != 1 ]]; then
   echo "[release] Not published. Check both, then run again with --publish (move the zip away first)."
+  echo "$VERSION_HINT"
   exit 0
 fi
 
@@ -117,3 +126,4 @@ FLAGS=()
 [[ "$PRERELEASE" == 1 ]] && FLAGS+=(--prerelease)
 gh release create "$TAG" "$ZIP" --title "Catalina32 $VERSION" --notes-file "$NOTES" ${FLAGS[@]+"${FLAGS[@]}"}
 echo "[release] Published $TAG"
+echo "$VERSION_HINT"
