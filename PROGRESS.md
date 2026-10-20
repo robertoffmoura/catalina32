@@ -45,8 +45,9 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
 - **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Branch `source`
   (`pkg/dyld`, `pkg/source`, `viewer/C32GL.m`): a 3 GB guest space, the game's OpenGL streamed
   to the window and drawn with the Mac's OpenGL, catalina32's fonts (which also fix the
-  current Mac build's broken font module), keyboard and mouse. To try on the Mac with
-  `scripts/run_source.sh`; no sound yet. Details and the plan: `docs/PORTAL.md`. The Feral
+  current Mac build's broken font module), keyboard, mouse look, sound and controllers. The
+  first chamber plays on the Mac (`scripts/run_source.sh`), slowly: speed now needs the JIT.
+  Details and the plan: `docs/PORTAL.md`. The Feral
   family layer waits for a second Feral game.
 
 ## Backlog

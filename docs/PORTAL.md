@@ -1,11 +1,13 @@
 # Portal (and Valve's Source games): findings and plan
 
-Status (2026-10-20, branch `source`): **first playable build to try on the Mac.** Portal boots
-to its main menu; its OpenGL calls stream to the window, which draws them with the Mac's
-OpenGL; text uses catalina32's fonts; keyboard and mouse reach the game. Verified here up to
-the menu headless (with a stand-in for the window); the window's OpenGL side is checked only
-for syntax. No sound yet. See [Running it](#running-it) and
-[Results](#results-of-the-first-experiments).
+Status (2026-10-20, branch `source`): **playable, slowly.** On the user's Mac (Intel, Radeon
+Pro 560X) Portal loads the first chamber and plays (moving, jumping) with no visible rendering
+defects. Since then, and verified headless only: mouse look, sound (OpenAL, MP3 music through
+Miles' plugins), game controllers, and a crash fix (C++ dynamic_cast) that also repaired HUD
+and menu casts. The limit now is speed: about 10 million guest instructions per frame in the
+chamber, against an interpreter doing ~75 million a second (a few frames per second). The
+answer is the JIT (`docs/JIT.md`); the decoded cache already covers all but ~4% of Source's
+instructions. See [Running it](#running-it) and [Results](#results-of-the-first-experiments).
 
 ## Running it
 
@@ -171,9 +173,8 @@ text, but everything else runs. Ways forward:
 2. ~~OpenGL on the Mac~~: done as a stream to the window (the engine stays pure Go; the
    window replays the calls on a legacy 2.1 context and scales the game's window into its own).
    To verify on the Mac.
-3. ~~Fonts from the host~~ and ~~keyboard and mouse~~: done. Next: audio (OpenAL into the PCM
-   ring the window already plays), controllers (SDL game controllers from the pads in shared
-   memory), full screen.
+3. ~~Fonts from the host~~, ~~keyboard and mouse~~, ~~audio~~, ~~controllers~~: done (rumble
+   not yet). Full screen uses the window's (Ctrl-Cmd-F), letterboxed.
 4. Game identity for folders (`pkg/gamelib`, so Portal gets a game app), the family layer, then
    the Steam bridge.
 5. Speed: the JIT (`docs/JIT.md`).
