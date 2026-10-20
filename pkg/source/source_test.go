@@ -72,7 +72,15 @@ func TestBoot(t *testing.T) {
 			}
 		})
 	}
+	if os.Getenv("C32_TRACECALLS") != "" {
+		m.C.TraceCalls = true
+	}
 	err = m.Run(steps)
+	if m.C.TraceCalls {
+		for _, f := range m.C.CallStack {
+			t.Logf("call %s -> %s", m.where(f.CallerEIP), m.where(f.TargetEIP))
+		}
+	}
 	close(stopCheck)
 	<-checked
 	if check != nil {

@@ -368,7 +368,15 @@ static void c32gl_c32GetValues(C32GLDecoder *d, uint32_t token, uint32_t pname, 
     const double sentinel = 1.2345e300;
     double v[16];
     for (int i = 0; i < 16; i++) v[i] = sentinel;
+    while (glGetError() != GL_NO_ERROR) {
+    }
     glGetDoublev(pname, v);
+    if (glGetError() != GL_NO_ERROR) { /* a query this GL doesn't know: no values (not a GL error to report) */
+        fprintf(stderr, "[C32GL] the game asked for GL value 0x%x, which this Mac's GL doesn't have\n", pname);
+        uint32_t zero = 0;
+        reply(d, token, &zero, 4);
+        return;
+    }
     uint32_t n = 0;
     while (n < 16 && v[n] != sentinel) n++;
     uint8_t out[4 + 16 * 8];
@@ -792,7 +800,12 @@ static void c32SetMouseMode(int relative) {
                 if (debug) {
                     GLenum err;
                     while ((err = glGetError()) != GL_NO_ERROR) {
-                        if (d->errors++ < 200) fprintf(stderr, "[C32GL] GL error 0x%x in %s\n", err, d->lastCall);
+                        if (d->errors++ < 200) {
+                            const uint32_t *a = (const uint32_t *)(d->ring + pos + 8);
+                            fprintf(stderr, "[C32GL] GL error 0x%x in %s (arguments 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x)\n", err, d->lastCall,
+                                    len > 0 ? a[0] : 0, len > 4 ? a[1] : 0, len > 8 ? a[2] : 0, len > 12 ? a[3] : 0, len > 16 ? a[4] : 0,
+                                    len > 20 ? a[5] : 0, len > 24 ? a[6] : 0, len > 28 ? a[7] : 0, len > 32 ? a[8] : 0, len > 36 ? a[9] : 0);
+                        }
                     }
                 }
                 r += 8 + (uint64_t)len;

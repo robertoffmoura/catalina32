@@ -16,6 +16,12 @@ func (m *Machine) registerFrameworkShims() {
 		"_CFRetain":                  func(c *cpu.CPU) { ret(c, c.Arg(0)) },
 		"_sel_registerName":          m.selRegister,
 		"_sel_getUid":                m.selRegister,
+		"_objc_msgSend": func(c *cpu.CPU) { // no Objective-C classes here: messages to nil answer 0
+			sel := c.Arg(1)
+			m.C.ReportOnce("objc:"+c.ReadCString(sel), "[objc] -%s from %s: answered 0", c.ReadCString(sel), m.where(c.Read32(c.Regs[cpu.RegESP])))
+			c.Regs[cpu.RegEDX] = 0
+			ret(c, 0)
+		},
 		// One display, ID 1, driven by renderer mask bit 0.
 		"_CGOpenGLDisplayMaskToDisplayID": func(c *cpu.CPU) {
 			if c.Arg(0)&1 != 0 {
