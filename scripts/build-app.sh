@@ -57,8 +57,9 @@ echo "[build-app] engine (${ARCHS[*]})"
 ENGINES=() WINDOWS=()
 for a in "${ARCHS[@]}"; do
   goarch=$([[ "$a" == x86_64 ]] && echo amd64 || echo arm64)
-  CGO_ENABLED=0 GOOS=darwin GOARCH=$goarch go build ${AOT_TAGS[@]+"${AOT_TAGS[@]}"} -trimpath -o "$WORK/catalina32-$a" ./cmd/catalina32
-  ENGINES+=("$WORK/catalina32-$a")
+  # (Intermediate names must differ by more than case: macOS file systems usually ignore it.)
+  CGO_ENABLED=0 GOOS=darwin GOARCH=$goarch go build ${AOT_TAGS[@]+"${AOT_TAGS[@]}"} -trimpath -o "$WORK/engine-$a" ./cmd/catalina32
+  ENGINES+=("$WORK/engine-$a")
 
   echo "[build-app] window app ($a)"
   flags=(-arch "$a" -mmacosx-version-min=10.15 -O2 -I viewer)
@@ -66,8 +67,8 @@ for a in "${ARCHS[@]}"; do
     clang "${flags[@]}" -fobjc-arc -c "viewer/$f.m" -o "$WORK/$f-$a.o"
   done
   clang "${flags[@]}" -ObjC -fno-objc-arc viewer/C32Window.m "$WORK"/C32Metal-$a.o "$WORK"/C32Launch-$a.o "$WORK"/C32Wizard-$a.o \
-    -o "$WORK/Catalina32-$a" -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework IOKit
-  WINDOWS+=("$WORK/Catalina32-$a")
+    -o "$WORK/window-$a" -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework IOKit
+  WINDOWS+=("$WORK/window-$a")
 done
 lipo -create "${ENGINES[@]}" -output "$APP/Contents/Helpers/catalina32"
 lipo -create "${WINDOWS[@]}" -output "$APP/Contents/MacOS/Catalina32"
