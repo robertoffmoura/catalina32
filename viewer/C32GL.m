@@ -544,6 +544,13 @@ static void applyMouseCapture(void) {
     BOOL want = atomic_load(&g_relative) && [NSApp isActive] && [[g_view window] isKeyWindow];
     if (want == g_captured) return;
     g_captured = want;
+    if (want) { /* the pointer to the view's centre (inside it, where mouse events come from) */
+        NSWindow *w = [g_view window];
+        [w setAcceptsMouseMovedEvents:YES];
+        NSRect r = [w convertRectToScreen:[g_view convertRect:[g_view bounds] toView:nil]];
+        CGFloat top = [[[NSScreen screens] firstObject] frame].size.height; /* Quartz: y from the top */
+        CGWarpMouseCursorPosition(CGPointMake(NSMidX(r), top - NSMidY(r)));
+    }
     CGAssociateMouseAndMouseCursorPosition(want ? false : true);
     if (want) {
         [NSCursor hide];
