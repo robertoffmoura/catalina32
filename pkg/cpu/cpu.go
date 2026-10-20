@@ -109,6 +109,9 @@ type CPU struct {
 	CodeLo, CodeHi   uint32
 	CodeCacheFlushes uint64
 	dcacheUsed       bool // something was decoded; only then do intercept changes need a flush
+	// With several images in the code range, their data lies between their code: textPages marks
+	// the 4 KB pages holding code, and only stores to those flush (nil: the whole range is code).
+	textPages []uint64
 	// The inlined fast paths: loads with addr < readLimit and stores with addr-CodeHi < writeSpan
 	// are in bounds, above guest code (stores) and not watched. SetWatch zeroes both.
 	readLimit uint32
@@ -370,9 +373,25 @@ func (c *CPU) write64Slow(addr uint32, val uint64) {
 
 // noteCodeWrite flushes the decoded-instruction cache when a guest store touches cached code.
 func (c *CPU) noteCodeWrite(addr, size uint32) {
-	if addr < c.CodeHi && addr+size > c.CodeLo && c.dcache != nil {
+	if addr < c.CodeHi && addr+size > c.CodeLo && c.dcache != nil &&
+		(c.textPages == nil || c.isTextPage(addr) || c.isTextPage(addr+size-1)) {
 		c.FlushCodeCache()
 	}
+}
+
+// MarkTextPages records that [lo, hi) holds code (see textPages).
+func (c *CPU) MarkTextPages(lo, hi uint32) {
+	if c.textPages == nil {
+		c.textPages = make([]uint64, ArenaSize>>12/64)
+	}
+	for p := lo >> 12; p < (hi+0xfff)>>12 && p < ArenaSize>>12; p++ {
+		c.textPages[p>>6] |= 1 << (p & 63)
+	}
+}
+
+func (c *CPU) isTextPage(addr uint32) bool {
+	p := addr >> 12
+	return p < ArenaSize>>12 && c.textPages[p>>6]&(1<<(p&63)) != 0
 }
 
 func (c *CPU) WriteF32(addr uint32, val float32) {
