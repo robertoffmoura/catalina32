@@ -71,6 +71,25 @@ scripts/gpuroute.sh EXE GPUCHECK OUTDIR ROUTE MAXSTEPS [VAR=value...]  # GPU pat
   `/tmp/catalina32-mac-preview/msl_errors/`. Their count is reported to the engine log as
   `[GPU] the viewer reported N …`.
 
+- **Source games (OpenGL): glreplay.** `tools/glreplay` plays a headless run's GL stream
+  through the window's own decoding code (`viewer/C32GL.m`, built with `C32GL_REPLAY`) into
+  Mesa's software OpenGL, and saves frames as PNGs. Build it with
+  `tools/glreplay/build.sh <out> [mesa root]` (OSMesa: e.g. `libosmesa6`, `libosmesa6-dev`,
+  `mesa-common-dev`, `libgl-dev`, unpacked with `dpkg -x` when not installed). Then:
+
+  ```
+  glreplay /tmp/gl.shm /tmp/shots every:20 &
+  C32_GL_SHM=/tmp/gl.shm C32_SOURCE_DIR=<Portal> C32_STEPS=11000000000 \
+    C32_ARGS="+sv_cheats 1 +map testchmb_a_00" \
+    C32_CMDS="8000000000:ent_fire portal_red_0 SetActivatedState 1;setang 0 270 0" \
+    go test ./pkg/source -run 'TestBoot$' -v
+  ```
+
+  `C32_CMDS` types console commands in at instruction counts (`steps:cmd;cmd|steps:...`).
+  Mesa is not the Mac's GL: a picture right here and wrong on a Mac points at the Mac's
+  driver or the window, not the stream. `C32_GLTRACE=<file>` (with `C32_GLCHECK=1`) writes
+  every GL command for diffing two runs.
+
 ## Tests
 
 ```sh

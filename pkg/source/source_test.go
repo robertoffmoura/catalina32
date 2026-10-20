@@ -75,6 +75,31 @@ func TestBoot(t *testing.T) {
 	if os.Getenv("C32_TRACECALLS") != "" {
 		m.C.TraceCalls = true
 	}
+	if v := os.Getenv("C32_CMDS"); v != "" { // console commands typed in at instruction counts: "steps:cmd;cmd|steps:..."
+		type timed struct {
+			at   uint64
+			cmds string
+		}
+		var queue []timed
+		for _, part := range strings.Split(v, "|") {
+			at, cmds, _ := strings.Cut(part, ":")
+			n, err := strconv.ParseUint(at, 10, 64)
+			if err != nil {
+				t.Fatalf("C32_CMDS: %q: %v", part, err)
+			}
+			queue = append(queue, timed{n, cmds})
+		}
+		m.OnPoll = func(c *cpu.CPU) {
+			for len(queue) > 0 && c.Steps >= queue[0].at {
+				addText := m.symbolAddr("__Z12Cbuf_AddTextPKc")
+				s := c.Malloc(uint32(len(queue[0].cmds) + 2))
+				c.WriteCString(s, queue[0].cmds+"\n")
+				c.CallGuest(addText, s)
+				t.Logf("at %d (frame %d): %s", c.Steps, m.sdl.frames, queue[0].cmds)
+				queue = queue[1:]
+			}
+		}
+	}
 	err = m.Run(steps)
 	if m.C.TraceCalls {
 		for _, f := range m.C.CallStack {

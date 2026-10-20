@@ -1,10 +1,14 @@
 // OpenGL renderer for a Source game's GL stream (see C32GL.h). Compiled with ARC.
 #define GL_SILENCE_DEPRECATION 1
 #pragma clang diagnostic ignored "-Wdeprecated-declarations" /* NSOpenGL: deprecated with OpenGL, still there */
+#ifdef C32GL_REPLAY /* tools/glreplay: only the stream's decoding, on another platform's GL */
+#include "glreplay_gl.h"
+#else
 #import "C32GL.h"
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #import <OpenGL/glext.h>
+#endif
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -471,6 +475,7 @@ static void c32gl_c32AttribLocation(C32GLDecoder *d, uint32_t token, void *prog,
     reply(d, token, &loc, 4);
 }
 
+#ifndef C32GL_REPLAY /* the window: presenting, input, the renderer thread */
 static NSOpenGLContext *g_context;
 static C32GLView *g_view;
 static _Atomic int g_backingW = 1, g_backingH = 1;
@@ -844,3 +849,4 @@ static void c32SetMouseMode(int relative) {
 }
 
 @end
+#endif
