@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/image/font/sfnt"
+
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/dyld"
 )
@@ -77,6 +79,7 @@ type Machine struct {
 	Live      bool      // wall-clock time (a player is watching), else time from the instruction count
 	start     time.Time
 	input     inputState
+	hostFonts fontRegistry
 	cfStrings map[uint32]string
 	sdl       sdlState
 	gl        nullGL
@@ -105,6 +108,7 @@ func New(dir string, args []string, overlay string, log io.Writer) (*Machine, er
 		mutexes: map[uint32]*gmutex{}, conds: map[uint32]*gcond{}, onces: map[uint32]bool{},
 	}
 	m.start = time.Now()
+	m.hostFonts = fontRegistry{byObj: map[uint32]*hostFont{}, parsed: map[string]*sfnt.Font{}}
 	m.glr = newGLRemote(m)
 	m.openFramebufferShm()
 	m.Live = os.Getenv("C32_LIVE") == "1"

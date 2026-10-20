@@ -2,6 +2,8 @@ package source
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 
 	"catalina32/pkg/cpu"
 )
@@ -21,7 +23,18 @@ func (m *Machine) registerFontShims() {
 	f.next, f.styleSize, f.ctxData = 0x100, map[uint32]float64{}, map[uint32]uint32{}
 	handle := func() uint32 { f.next++; return f.next }
 	for k, v := range map[string]cpu.ThunkFunc{
-		"_FSPathMakeRef":                    ret0,
+		"_FSPathMakeRef": func(c *cpu.CPU) { // a font file the game registers (AddCustomFontFile)
+			// (A path in the game's file system, like resource/halflife2.ttf: look in its folders.)
+			p := c.ReadCString(c.Arg(0))
+			for _, sub := range append(m.modDirs(), "") {
+				if hp := m.hostPath(filepath.Join(sub, p), false); fileExists(hp) {
+					m.hostFonts.custom = append(m.hostFonts.custom, hp)
+					break
+				}
+			}
+			m.hostFonts.scanned = false
+			ret(c, 0)
+		},
 		"_ATSFontActivateFromFileReference": ret0,
 		"_ATSFontFindFromName":              func(c *cpu.CPU) { ret(c, handle()) },
 		"_ATSFontFindFromPostScriptName":    func(c *cpu.CPU) { ret(c, handle()) },
@@ -101,4 +114,21 @@ func (m *Machine) registerFontShims() {
 	} {
 		m.shims[k] = v
 	}
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.Mode().IsRegular()
+}
+
+// modDirs are the game's content folders, as its search paths order them: the mod (-game), then
+// hl2 and platform.
+func (m *Machine) modDirs() []string {
+	var dirs []string
+	for i, a := range m.Args {
+		if a == "-game" && i+1 < len(m.Args) {
+			dirs = append(dirs, m.Args[i+1])
+		}
+	}
+	return append(dirs, "hl2", "platform")
 }

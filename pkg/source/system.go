@@ -207,3 +207,16 @@ func initRuntimeTypeinfo(sym string) func(m *Machine, a uint32) {
 		m.C.Write32(a+4, name)
 	}
 }
+
+// hostFunc gives a host function a guest address (for vtables the host fills).
+func (m *Machine) hostFunc(name string, fn cpu.ThunkFunc) uint32 {
+	a := m.thunkNext
+	m.thunkNext += 4
+	if m.thunkNext > thunkHi {
+		panic("source: out of host function addresses")
+	}
+	m.C.Write8(a, 0xc3)
+	m.C.RegisterIntercept(a, name, fn)
+	m.sysName[a] = name
+	return a
+}
