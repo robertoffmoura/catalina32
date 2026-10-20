@@ -116,3 +116,43 @@ func (m *Machine) dlerror(c *cpu.CPU) {
 	m.dlerr = ""
 	ret(c, a)
 }
+
+// The old dyld API (NSSymbol, NSModule) Miles uses to find its own folder: a symbol is its
+// address, a module its image's handle.
+func (m *Machine) registerNSModuleShims() {
+	for k, v := range map[string]cpu.ThunkFunc{
+		"_NSIsSymbolNameDefined": func(c *cpu.CPU) {
+			_, ok := m.L.Symbol(nil, c.ReadCString(c.Arg(0)))
+			ret(c, b2u(ok))
+		},
+		"_NSLookupAndBindSymbol": func(c *cpu.CPU) {
+			a, _ := m.L.Symbol(nil, c.ReadCString(c.Arg(0)))
+			ret(c, a)
+		},
+		"_NSAddressOfSymbol": func(c *cpu.CPU) { ret(c, c.Arg(0)) },
+		"_NSModuleForSymbol": func(c *cpu.CPU) {
+			if img := m.L.ImageAt(c.Arg(0)); img != nil {
+				ret(c, m.handleOf(img))
+				return
+			}
+			ret(c, 0)
+		},
+		"_NSLibraryNameForModule": func(c *cpu.CPU) {
+			img := m.imageOf(c.Arg(0))
+			if img == nil {
+				ret(c, 0)
+				return
+			}
+			key := "nsmodule:" + img.Path
+			a, ok := m.sys[key]
+			if !ok {
+				a = m.data(uint32(len(img.Path)) + 1)
+				c.WriteCString(a, img.Path)
+				m.sys[key] = a
+			}
+			ret(c, a)
+		},
+	} {
+		m.shims[k] = v
+	}
+}

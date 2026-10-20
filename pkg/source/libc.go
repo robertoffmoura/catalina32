@@ -151,7 +151,6 @@ func (m *Machine) registerShims() {
 		"_gethostname": m.gethostname, "_getpwuid": ret0, "_ctermid": ret0, "_tcgetattr": retN(neg1()), "_tcsetattr": retN(neg1()),
 		"_setjmp": m.setjmp, "__setjmp": m.setjmp, "_longjmp": m.longjmp, "__longjmp": m.longjmp,
 		"_dlopen": m.dlopen, "_dlsym": m.dlsym, "_dlclose": ret0, "_dlerror": m.dlerror, "_dladdr": ret0,
-		"_NSIsSymbolNameDefined": ret0, "_NSLookupAndBindSymbol": ret0, "_NSModuleForSymbol": ret0, "_NSLibraryNameForModule": ret0,
 		"_mach_absolute_time": m.machAbsoluteTime, "_mach_timebase_info": m.machTimebaseInfo,
 		"_mach_task_self": retN(0x103), "_mach_thread_self": m.pthreadSelf, "_mach_port_deallocate": ret0,
 		"_host_page_size": m.hostPageSize, "_vm_page_size": retN(4096),
@@ -228,6 +227,8 @@ func (m *Machine) registerShims() {
 	m.registerFontShims()
 	m.registerSteamShims()
 	m.registerAudioShims()
+	m.registerOpenAL()
+	m.registerNSModuleShims()
 }
 
 func ret0(c *cpu.CPU)    { ret(c, 0) }

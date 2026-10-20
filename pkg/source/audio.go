@@ -7,9 +7,8 @@ import (
 	"catalina32/pkg/cpu"
 )
 
-// Audio and the system services around it: Multiprocessing Services (the semaphores and critical
-// regions Miles uses), a null OpenAL that consumes queued buffers in (virtual) real time, and
-// iconv for the text conversions vgui does.
+// System services around audio: Multiprocessing Services (the semaphores and critical regions
+// Miles uses), and iconv for the text conversions vgui does. OpenAL is in openal.go.
 
 type mpSem struct {
 	value, max uint32
@@ -20,23 +19,11 @@ type mpRegion struct {
 	count int
 }
 
-type alSource struct {
-	queue []alQueued
-}
-
-type alQueued struct {
-	buffer uint32
-	end    uint64 // microsecond the buffer finishes playing
-}
-
 type audioState struct {
-	sems     map[uint32]*mpSem
-	regions  map[uint32]*mpRegion
-	next     uint32
-	sources  map[uint32]*alSource
-	bufBytes map[uint32]uint32 // buffer -> bytes
-	bufRate  map[uint32]uint32 // buffer -> bytes per second
-	iconv    map[uint32][2]string
+	sems    map[uint32]*mpSem
+	regions map[uint32]*mpRegion
+	next    uint32
+	iconv   map[uint32][2]string
 }
 
 const (
@@ -57,8 +44,7 @@ func mpDuration(d uint32) (uint64, bool) {
 
 func (m *Machine) registerAudioShims() {
 	a := &m.audio
-	a.sems, a.regions, a.sources = map[uint32]*mpSem{}, map[uint32]*mpRegion{}, map[uint32]*alSource{}
-	a.bufBytes, a.bufRate, a.iconv = map[uint32]uint32{}, map[uint32]uint32{}, map[uint32][2]string{}
+	a.sems, a.regions, a.iconv = map[uint32]*mpSem{}, map[uint32]*mpRegion{}, map[uint32][2]string{}
 	a.next = 0x5000
 	id := func() uint32 { a.next++; return a.next }
 	for k, v := range map[string]cpu.ThunkFunc{
@@ -88,93 +74,6 @@ func (m *Machine) registerAudioShims() {
 		},
 		"_MPWaitOnSemaphore": m.mpWait,
 		"_MPYield":           m.yieldShim,
-
-		// OpenAL: one device, one context, sources that play queued buffers in time.
-		"_alcOpenDevice":         func(c *cpu.CPU) { ret(c, id()) },
-		"_alcCloseDevice":        retN(1),
-		"_alcCreateContext":      func(c *cpu.CPU) { ret(c, id()) },
-		"_alcMakeContextCurrent": retN(1),
-		"_alcDestroyContext":     retVoid,
-		"_alcGetCurrentContext":  retN(0x5001),
-		"_alcGetContextsDevice":  retN(0x5000),
-		"_alcGetError":           ret0,
-		"_alcGetString":          func(c *cpu.CPU) { ret(c, m.glStr("Null Audio Device")) },
-		"_alcGetIntegerv":        func(c *cpu.CPU) { c.Write32(c.Arg(3), 44100); c.Ret() },
-		"_alcIsExtensionPresent": ret0,
-		"_alIsExtensionPresent":  ret0,
-		"_alGetProcAddress":      ret0,
-		"_alGetError":            ret0,
-		"_alGetString":           func(c *cpu.CPU) { ret(c, m.glStr("1.1")) },
-		"_alGenSources": func(c *cpu.CPU) {
-			for i := uint32(0); i < c.Arg(0); i++ {
-				h := id()
-				a.sources[h] = &alSource{}
-				c.Write32(c.Arg(1)+4*i, h)
-			}
-			c.Ret()
-		},
-		"_alGenBuffers": func(c *cpu.CPU) {
-			for i := uint32(0); i < c.Arg(0); i++ {
-				c.Write32(c.Arg(1)+4*i, id())
-			}
-			c.Ret()
-		},
-		"_alBufferData": func(c *cpu.CPU) { // (buffer, format, data, size, freq)
-			bytesPerFrame := map[uint32]uint32{0x1100: 1, 0x1101: 2, 0x1102: 2, 0x1103: 4}[c.Arg(1)]
-			a.bufBytes[c.Arg(0)], a.bufRate[c.Arg(0)] = c.Arg(3), max(bytesPerFrame, 1)*c.Arg(4)
-			c.Ret()
-		},
-		"_alSourceQueueBuffers": func(c *cpu.CPU) { // (source, n, buffers)
-			s := a.sources[c.Arg(0)]
-			if s == nil {
-				c.Ret()
-				return
-			}
-			end := m.micros()
-			if len(s.queue) > 0 && s.queue[len(s.queue)-1].end > end {
-				end = s.queue[len(s.queue)-1].end
-			}
-			for i := uint32(0); i < c.Arg(1); i++ {
-				b := c.Read32(c.Arg(2) + 4*i)
-				if r := a.bufRate[b]; r > 0 {
-					end += uint64(a.bufBytes[b]) * 1e6 / uint64(r)
-				}
-				s.queue = append(s.queue, alQueued{b, end})
-			}
-			c.Ret()
-		},
-		"_alSourceUnqueueBuffers": func(c *cpu.CPU) {
-			s := a.sources[c.Arg(0)]
-			for i := uint32(0); s != nil && i < c.Arg(1) && len(s.queue) > 0; i++ {
-				c.Write32(c.Arg(2)+4*i, s.queue[0].buffer)
-				s.queue = s.queue[1:]
-			}
-			c.Ret()
-		},
-		"_alGetSourcei": func(c *cpu.CPU) { // (source, param, &value)
-			s := a.sources[c.Arg(0)]
-			v := uint32(0)
-			if s != nil {
-				switch c.Arg(1) {
-				case 0x1016: // AL_BUFFERS_PROCESSED
-					for _, q := range s.queue {
-						if q.end <= m.micros() {
-							v++
-						}
-					}
-				case 0x1015: // AL_BUFFERS_QUEUED
-					v = uint32(len(s.queue))
-				case 0x1010: // AL_SOURCE_STATE
-					v = 0x1012 // AL_PLAYING
-				}
-			}
-			c.Write32(c.Arg(2), v)
-			c.Ret()
-		},
-		"_alSourcePlay": retVoid, "_alSourceStop": retVoid, "_alSourcePause": retVoid, "_alSourceRewind": retVoid,
-		"_alSourcef": retVoid, "_alSourcei": retVoid, "_alSource3f": retVoid, "_alSourcefv": retVoid,
-		"_alListenerf": retVoid, "_alListener3f": retVoid, "_alListenerfv": retVoid, "_alDistanceModel": retVoid,
-		"_alDeleteSources": retVoid, "_alDeleteBuffers": retVoid,
 
 		"_iconv_open":  m.iconvOpen,
 		"_iconv":       m.iconv,
