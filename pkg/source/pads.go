@@ -2,6 +2,7 @@ package source
 
 import (
 	"encoding/binary"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
@@ -35,8 +36,9 @@ type padState struct {
 
 type padInput struct {
 	last    [d3d9.ShmPads]padState
-	pending [][]byte       // SDL events not yet delivered
-	handles map[uint32]int // SDL_GameController / SDL_Joystick handles -> slot
+	pending [][]byte           // SDL events not yet delivered
+	heard   [d3d9.ShmPads]bool // the first input from each slot was logged
+	handles map[uint32]int     // SDL_GameController / SDL_Joystick handles -> slot
 }
 
 // readPad reads slot i's state from the window's shared memory.
@@ -86,6 +88,10 @@ func (m *Machine) pollPads() {
 		}
 		if !now.connected {
 			continue
+		}
+		if !pi.heard[i] && (now.buttons != 0 || slices.ContainsFunc(now.axes[:], func(v int16) bool { return v > 8000 || v < -8000 })) {
+			pi.heard[i] = true // diagnostics: the controller's input gets this far
+			m.logf("[controller] player %d: input reached the game (buttons %#04x, axes %v)", i+1, now.buttons, now.axes)
 		}
 		for b, bit := range padButtons {
 			if bit == 0 || (now.buttons^was.buttons)&bit == 0 {
