@@ -45,7 +45,7 @@ const (
 	eNOSYS    = 78
 )
 
-func (m *Machine) setErrno(v uint32) { m.C.Write32(crt.ErrnoGuestAddr, v) }
+func (m *Machine) setErrno(v uint32) { m.C.Write32(m.errno, v) }
 
 func errnoOf(err error) uint32 {
 	switch {
@@ -133,7 +133,8 @@ func (m *Machine) registerShims() {
 	_ = c
 	m.shims = map[string]cpu.ThunkFunc{
 		// Process.
-		"_exit": m.exit, "__exit": m.exit, "_abort": m.abort, "___assert_rtn": m.assertRtn,
+		"___error": func(c *cpu.CPU) { ret(c, m.errno) },
+		"_exit":    m.exit, "__exit": m.exit, "_abort": m.abort, "___assert_rtn": m.assertRtn,
 		"_atexit": m.atexitShim, "___cxa_atexit": m.cxaAtexit,
 		"_getenv": m.getenv, "_setenv": m.setenv, "_unsetenv": ret0,
 		"_getpid": retN(4242), "_getuid": retN(501), "_geteuid": retN(501), "_getppid": retN(1),

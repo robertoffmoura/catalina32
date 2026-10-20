@@ -16,14 +16,18 @@ import (
 	"catalina32/pkg/dyld"
 )
 
-// Guest memory layout (the CPU's heap starts at cpu.HeapStartAddr, above all of these).
+// Guest memory layout. Code (the images) stays below the heap, so the interpreter's fast store
+// path (above the code range) covers the whole heap.
 const (
-	imageLo = 0x00100000 // dylibs, slid one after another
-	imageHi = 0x03000000 // StackGuard, errno, FS/GS bases follow
-	thunkLo = 0x0e000000 // one address per host function
-	thunkHi = 0x0e800000
-	dataLo  = 0x0e800000 // data the system libraries export (stdio FILEs, ctype tables...)
-	dataHi  = 0x0f000000
+	imageLo  = 0x00100000 // dylibs, slid one after another
+	imageHi  = 0x0d000000
+	thunkLo  = 0x0e000000 // one address per host function
+	thunkHi  = 0x0e800000
+	dataLo   = 0x0e800000 // data the system libraries export (stdio FILEs, ctype tables...)
+	dataHi   = 0x0f000000
+	heapLo   = 0x10000000 // (cpu's sentinel return addresses lie just below)
+	heapHi   = 0xbf000000
+	stackTop = 0xbfff0000 // the main thread's stack, 16 MB below
 )
 
 // Machine is one running Source game.
@@ -66,6 +70,7 @@ type Machine struct {
 	cxx       cxxState
 	stopped   bool
 	skew      uint64 // microseconds the clock jumped while every thread slept
+	errno     uint32 // errno's address
 	cfStrings map[uint32]string
 	sdl       sdlState
 	gl        nullGL
@@ -93,7 +98,10 @@ func New(dir string, args []string, overlay string, log io.Writer) (*Machine, er
 		files: map[uint32]*gfile{}, fds: map[int32]*gfile{}, nextFD: 3, dirs: map[uint32]*gdir{},
 		mutexes: map[uint32]*gmutex{}, conds: map[uint32]*gcond{}, onces: map[uint32]bool{},
 	}
+	m.C.SetHeap(heapLo, heapHi)
 	m.registerShims()
+	m.errno = m.data(4)
+	m.C.FSBase, m.C.GSBase = m.data(4096), m.data(4096)
 	m.C.SetCodeRange(0x1000, imageHi)
 	m.L = &dyld.Linker{
 		Mem: m.C.Mem, Lo: imageLo, Hi: imageHi,
@@ -186,7 +194,7 @@ func (m *Machine) setupProcess() {
 		}
 	}
 	words = append(words, c.Read32(m.apple), 0)
-	sp := (uint32(cpu.StackTopAddr) - 64 - uint32(4*len(words))) &^ 15
+	sp := (uint32(stackTop) - 64 - uint32(4*len(words))) &^ 15
 	for i, w := range words {
 		c.Write32(sp+uint32(4*i), w)
 	}
