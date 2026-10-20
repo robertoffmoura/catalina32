@@ -1,6 +1,8 @@
 # Portal (and Valve's Source games): findings and plan
 
-Status: **planning**. Survey of the user's copy at `/workspace/Portal` (the Steam build, 4.1 GB;
+Status: **experiments done** (2026-10-20, branch `source`): Portal boots headless to its main
+menu and renders frames through the game's own ToGL into a null OpenGL. See [Results](#results-of-the-first-experiments).
+Survey of the user's copy at `/workspace/Portal` (the Steam build of Nov 25 2024, 4.1 GB;
 `steam_appid.txt` 400). Nothing of it is committed or uploaded. Portal 2 has not been surveyed.
 
 ## What the game is
@@ -21,7 +23,7 @@ Status: **planning**. Survey of the user's copy at `/workspace/Portal` (the Stea
 
 | Layer | Who calls it | Size | What we would do |
 |---|---|---|---|
-| **ToGL** (`libtogl`: Direct3D 9 on OpenGL) | shaderapidx9, materialsystem | 95 functions: `IDirect3DDevice9` (58), `IDirect3D9`, textures, buffers, queries, `Direct3DCreate9` | Intercept its exported C++ methods and map them onto our Direct3D 9 implementation → Metal. Shaders arrive as D3D9 bytecode (SM 2.0/2.0b/3.0): extend `pkg/d3dsm` |
+| **ToGL** (`libtogl`: Direct3D 9 on OpenGL) | shaderapidx9, materialsystem | 95 functions: `IDirect3DDevice9` (58), `IDirect3D9`, textures, buffers, queries, `Direct3DCreate9` | **Revised (experiment 5):** keep ToGL in the guest and give it OpenGL: about 150 GL functions, passed to the Mac's OpenGL. ToGL already translates D3D9 shader bytecode to GLSL. (The first idea, intercepting ToGL's methods onto `pkg/d3d9` → Metal, stays the fallback should Apple remove OpenGL) |
 | **SDL2** (`libSDL2`) | launcher, engine, inputsystem... | 70 functions: window, events, GL context, mouse, joystick/game controller, haptics, message boxes | Implement natively (not emulate): our window app already does windows, keyboard, controllers; add the mouse (Portal needs mouse look: relative mode) |
 | **OpenAL** | engine | 28 functions | A small OpenAL (streaming sources/buffers) into our audio ring |
 | **Steam** (`libsteam_api`) | 7 modules | 24 functions (`SteamAPI_InitSafe`, callbacks, `SteamInternal_*` interfaces) | Bridge to the real, running Steam client through the 64-bit slice of the same `libsteam_api.dylib`; no DRM bypass |
@@ -69,7 +71,84 @@ New pieces, in order of dependency:
     too slow to enjoy; plan for the JIT (`docs/JIT.md`), and use developer AOT builds of the hot
     functions to keep testing pleasant meanwhile.
 
-## First experiments (cheap, in this order)
+## Results of the first experiments
+
+Code: `pkg/dyld` (the linker), `pkg/source` (the runner: system libraries from the host), on
+branch `source`. Run: `C32_SOURCE_DIR=/path/to/Portal go test ./pkg/source -run Boot -v`
+(`C32_STEPS`, `C32_LOG`, `C32_ARGS`, `C32_OVERLAY`; `C32_PROBE=<regexp>` logs calls and return
+values of matching guest functions, `C32_WATCH_NULL=1` catches NULL-pointer stores). Runs are
+deterministic.
+
+1. **Link everything: works.** All 37 images (all but `libcef`) link. Two Mach-O generations
+   live side by side: modern images (`LC_DYLD_INFO` opcodes, export tries) and older ones (SDL2,
+   Miles: classic relocations, indirect symbol table, no export trie); the linker handles both.
+   The game itself loads 27 images. The only missing guest symbols are sourcevr's `VR_*`
+   (`libsteam_api` shipped is newer than sourcevr expects); they are bound lazily on a Mac, so
+   harmless. 905 system symbols from 25 system libraries.
+2. **Initialisers: work.** All 1600 static initialisers run with the C++ runtime shims (COW
+   `std::string`, `ios_base::Init`, guards, `__cxa_atexit`).
+3. **To `LauncherMain` and engine init: works.** `hl2_osx` → `LauncherMain` in 124k instructions,
+   then the real order of work: SDL manager → GL display database (CGL renderer queries) →
+   filesystem (VPK signature checks: RSA + SHA-256 over the archives, in the interpreter) →
+   engine, materialsystem, shaderapidx9 → ToGL device → shader precache → client and server →
+   vgui → the menu's background map (`background1`). Gotchas found on the way:
+   - ToGL refuses to create a device until `Gestalt` answers the OS version (we answer Mojave,
+     10.14.6, the last macOS with 32-bit apps).
+   - The Steam flat API's accessors must return the caller's context block (with NULL
+     interfaces), not NULL.
+   - Miles (sound) waits on Multiprocessing Services semaphores; without them it spins and eats
+     the instruction budget.
+4. **Steam: not needed for the menu.** With `SteamAPI_InitSafe` failing, the game continues
+   offline to the main menu. The Steam bridge can wait until achievements and cloud saves.
+5. **First frame: reached, headless.** The game presents frames through its own ToGL into a
+   null OpenGL (answers like a GL 2.1 driver, draws nothing): 440 frames by 8 billion
+   instructions; in the menu, about **5.6 million guest instructions per frame**. On this Linux
+   container the interpreter does about 60–75 M instructions/s, so roughly 11–14 menu frames
+   per second **without** real rendering, AOT or JIT. Nothing was drawn (no GPU here); the next
+   step is a real OpenGL on the Mac.
+
+### Blocker found: this build can't make fonts
+
+The current Mac build (Nov 25 2024, the 20th-anniversary update, made after 32-bit Macs were
+gone) is broken in `vguimatsurface.dylib`: `CFontManager` was compiled against a newer font
+interface (`IVGuiFontImpl`, methods called at vtable offsets up to `0x48`) than the only Mac font
+class, `COSXFont` (12 methods, the old layout, never instantiated). `CreateOrFindWin32Font`
+compiled down to "append a NULL, return NULL", and the next lookup calls a method on that NULL.
+On a real 32-bit Mac this build would most likely crash at startup the same way (not tested on
+hardware). The experiment patches it to fail cleanly (`pkg/source/patches.go`): no fonts, so no
+text, but everything else runs. Ways forward:
+
+- **Fonts from the host** (planned anyway: ATSUI is 32-bit only): implement `IVGuiFontImpl`
+  natively (its method order is recoverable from the call sites in `vguimatsurface`) and
+  rasterise glyphs in Go from the Mac's fonts. Fixes this build, generically, and gives real text.
+- **An older Mac depot** (before Nov 2024) through SteamCMD `download_depot` with an older
+  manifest: may not have the bug, but players would need the same old files.
+
+### Other findings
+
+- **Memory:** in the menu the guest heap peaked at 415 MB, the whole heap of today's 512 MB
+  arena. The bigger guest address space (item 2 below) is required before loading a level.
+- **System surface actually called** up to the menu, beyond the C library: CGL and about 150
+  OpenGL functions (ToGL), SDL2 (window, display modes, GL context, swap), OpenAL and
+  AudioQueue, Multiprocessing Services, iconv, CoreFoundation strings, a few IOKit/CG display
+  queries, `Gestalt`, ATSUI/CoreGraphics (fonts), 12 `objc_msgSend` calls (renderer info).
+  QuickTime video fails gracefully (no menu videos), as planned.
+- **Interpreter cost at startup:** shader precaching alone took about 0.6 billion instructions
+  (11.7 s of virtual time), and the VPK signature checks run in the interpreter too; the JIT
+  (or caching those results) shortens startup.
+
+### Revised plan (replaces the order below where they differ)
+
+1. Bigger guest address space (2–3 GB) and the image region moved out of the low 47 MB.
+2. OpenGL on the Mac: the null GL's entry points become calls to the system's OpenGL (legacy 2.1
+   profile, as ToGL expects), with guest pointers translated; the window and GL context from the
+   app (`SDL2` natively). First real frame of the menu.
+3. Fonts from the host (`IVGuiFontImpl`), input (mouse look: SDL relative mode), audio (OpenAL
+   into our ring).
+4. Game identity for folders (`pkg/gamelib`), the family layer, then the Steam bridge.
+5. Speed: the JIT (`docs/JIT.md`).
+
+## First experiments (as planned, before the results above)
 
 Each answers a question that decides the plan; stop and re-plan if one surprises.
 

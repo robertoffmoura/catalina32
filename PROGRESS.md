@@ -42,9 +42,11 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
 - **Later:** an icon for Catalina32 itself.
 - **Speed:** release builds have no AOT code, so heavy scenes are choppier than with
   `run_on_mac.sh`; the JIT is the answer for players: designed in `docs/JIT.md`, left for later.
-- **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Surveyed; the plan
-  and the first experiments are in `docs/PORTAL.md`. The Feral family layer waits for a second
-  Feral game.
+- **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Surveyed and the
+  first experiments done (branch `source`: `pkg/dyld`, `pkg/source`): Portal boots headless to
+  its main menu and presents frames through its own ToGL into a null OpenGL. Findings, a broken
+  font module in the current Mac build, and the revised plan are in `docs/PORTAL.md`. The Feral
+  family layer waits for a second Feral game.
 
 ## Backlog
 
