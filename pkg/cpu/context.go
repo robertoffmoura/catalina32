@@ -13,6 +13,7 @@ type Context struct {
 	FPUCW     uint16
 	FPUSW     uint16
 	XMM       [8][16]byte
+	MM        [8]uint64
 	MXCSR     uint32
 	CallStack []CallFrame
 }
@@ -23,7 +24,7 @@ func (c *CPU) SaveContext() Context {
 		Regs: c.Regs, EIP: c.EIP, Flags: c.Flags,
 		FSBase: c.FSBase, GSBase: c.GSBase,
 		FPUSt: c.FPUSt, FPUTop: c.FPUTop, FPUCW: c.FPUCW, FPUSW: c.FPUSW,
-		XMM: c.XMM, MXCSR: c.MXCSR,
+		XMM: c.XMM, MM: c.MM, MXCSR: c.MXCSR,
 		CallStack: c.CallStack,
 	}
 }
@@ -40,6 +41,7 @@ func (c *CPU) LoadContext(ctx *Context) {
 	c.FPUCW = ctx.FPUCW
 	c.FPUSW = ctx.FPUSW
 	c.XMM = ctx.XMM
+	c.MM = ctx.MM
 	c.MXCSR = ctx.MXCSR
 	c.CallStack = ctx.CallStack
 }

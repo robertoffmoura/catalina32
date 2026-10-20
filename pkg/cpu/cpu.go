@@ -75,6 +75,7 @@ type CPU struct {
 
 	// SSE XMM0..XMM7 registers (128-bit = 16 bytes each)
 	XMM   [8][16]byte
+	MM    [8]uint64 // MMX registers (mmx.go)
 	MXCSR uint32
 
 	// Heap allocator state

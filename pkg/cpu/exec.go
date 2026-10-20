@@ -993,6 +993,9 @@ func (c *CPU) stepFull() {
 			return
 		}
 
+		if !opSize16 && !repF3 && !repF2 && c.execMMX(op2, segOverride, hasSeg) {
+			return
+		}
 		if c.execSSE(op2, opSize16, repF3, repF2, segOverride, hasSeg) {
 			return
 		}
@@ -1355,6 +1358,9 @@ func (c *CPU) stepFull() {
 				c.Regs[RegEDX] = 0
 			}
 		}
+		return
+
+	case 0x9B: // FWAIT: x87 exceptions are never pending here
 		return
 
 	case 0x9C: // PUSHFD

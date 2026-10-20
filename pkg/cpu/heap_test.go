@@ -76,9 +76,14 @@ func TestSSEFormsAndFPUEnvironment(t *testing.T) {
 	if c := run(0xF2, 0x0F, 0xE6, 0xCA); c.getXMMU32(1, 0) != 2 || int32(c.getXMMU32(1, 1)) != 10 { // cvtpd2dq: 1.75 -> 2
 		t.Errorf("CVTPD2DQ: %d %d", int32(c.getXMMU32(1, 0)), int32(c.getXMMU32(1, 1)))
 	}
-	for _, code := range [][]byte{{0x0F, 0xFE, 0xCA}, {0x0F, 0x7E, 0xC8}, {0x0F, 0xE6, 0xCA}, {0x0F, 0x7C, 0xCA}} { // MMX paddd, movd; unprefixed E6/7C
+	for _, code := range [][]byte{{0x0F, 0xE6, 0xCA}, {0x0F, 0x7C, 0xCA}} { // unprefixed E6/7C: no such instruction
 		if c := run(code...); !c.Halted {
 			t.Errorf("% x: not rejected", code)
+		}
+	}
+	for _, code := range [][]byte{{0x0F, 0xFE, 0xCA}, {0x0F, 0x7E, 0xC8}} { // MMX paddd, movd (mmx.go): not SSE
+		if c := run(code...); c.Halted || c.getXMMF64(1, 0) != 1.5 {
+			t.Errorf("% x: %s; xmm1 %v", code, c.HaltReason, c.getXMMF64(1, 0))
 		}
 	}
 
