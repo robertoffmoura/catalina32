@@ -64,7 +64,12 @@ const stepsPerMicrosecond = 50
 
 var epoch = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
-func (m *Machine) micros() uint64 { return m.C.Steps/stepsPerMicrosecond + m.skew }
+func (m *Machine) micros() uint64 {
+	if m.Live {
+		return uint64(time.Since(m.start).Microseconds()) + m.skew
+	}
+	return m.C.Steps/stepsPerMicrosecond + m.skew
+}
 
 func (m *Machine) now() time.Time {
 	return epoch.Add(time.Duration(m.micros()) * time.Microsecond)
@@ -242,6 +247,10 @@ func (m *Machine) exit(c *cpu.CPU) {
 	code := c.Arg(0)
 	m.logf("[process] exit(%d) from %s", int32(code), m.where(c.Read32(c.Regs[cpu.RegESP])))
 	c.ExitCode = code
+	if m.glr != nil {
+		m.glr.ended()
+	}
+	m.publishGameState(true)
 	c.Halted = true
 	c.HaltReason = "exit(" + strconv.Itoa(int(int32(code))) + ")"
 	m.stopped = true

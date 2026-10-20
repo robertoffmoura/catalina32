@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/dyld"
@@ -69,8 +70,13 @@ type Machine struct {
 	atexit    []uint32
 	cxx       cxxState
 	stopped   bool
-	skew      uint64 // microseconds the clock jumped while every thread slept
-	errno     uint32 // errno's address
+	skew      uint64    // microseconds the clock jumped while every thread slept
+	errno     uint32    // errno's address
+	glr       *glRemote // the OpenGL stream (C32_GL_SHM), nil without one
+	glOn      bool      // the viewer is drawing: GL calls go to the stream
+	Live      bool      // wall-clock time (a player is watching), else time from the instruction count
+	start     time.Time
+	input     inputState
 	cfStrings map[uint32]string
 	sdl       sdlState
 	gl        nullGL
@@ -98,6 +104,10 @@ func New(dir string, args []string, overlay string, log io.Writer) (*Machine, er
 		files: map[uint32]*gfile{}, fds: map[int32]*gfile{}, nextFD: 3, dirs: map[uint32]*gdir{},
 		mutexes: map[uint32]*gmutex{}, conds: map[uint32]*gcond{}, onces: map[uint32]bool{},
 	}
+	m.start = time.Now()
+	m.glr = newGLRemote(m)
+	m.openFramebufferShm()
+	m.Live = os.Getenv("C32_LIVE") == "1"
 	m.C.SetHeap(heapLo, heapHi)
 	m.registerShims()
 	m.errno = m.data(4)

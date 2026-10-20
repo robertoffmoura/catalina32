@@ -45,8 +45,30 @@ func (m *Machine) glStr(s string) uint32 {
 	return a
 }
 
-// glFunc returns the null GL's version of a GL function.
+// glFunc returns a GL function: the stream to the viewer once it is drawing (glremote.go),
+// the null GL otherwise.
 func (m *Machine) glFunc(sym string) cpu.ThunkFunc {
+	null := m.nullGLFunc(sym)
+	if m.glr == nil || !strings.HasPrefix(sym, "_gl") {
+		return null
+	}
+	name := strings.TrimPrefix(sym, "_")
+	remote := m.glr.fn(name)
+	return func(c *cpu.CPU) {
+		switch {
+		case !m.glOn || m.glr.gone:
+			null(c)
+		case remote != nil:
+			remote(c)
+		default:
+			m.glr.logOnce(name, "%s isn't in the stream (glspec.go): ignored", name)
+			null(c)
+		}
+	}
+}
+
+// nullGLFunc returns the null GL's version of a GL function.
+func (m *Machine) nullGLFunc(sym string) cpu.ThunkFunc {
 	g := &m.gl
 	if g.bound == nil {
 		*g = nullGL{next: 1, bound: map[uint32]uint32{}, sizes: map[uint32]uint32{}, mapped: map[uint32]uint32{},

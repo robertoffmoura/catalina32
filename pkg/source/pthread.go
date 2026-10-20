@@ -3,6 +3,7 @@ package source
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"catalina32/pkg/cpu"
 )
@@ -154,7 +155,11 @@ func (m *Machine) schedule(c *cpu.CPU) bool {
 			c.HaltReason = "deadlock: every thread waits: " + strings.Join(where, "; ")
 			return false
 		}
-		m.skew += earliest - m.micros()
+		if wait := earliest - m.micros(); m.Live && wait < 1e6 {
+			time.Sleep(time.Duration(wait) * time.Microsecond) // every thread waits: really wait
+		} else {
+			m.skew += earliest - m.micros()
+		}
 	}
 }
 
