@@ -119,7 +119,19 @@ func (m *Machine) registerSDLShims() {
 			m.sleepFor(uint64(ms) * 1000)
 		},
 		"_SDL_AddEventWatch": retVoid, "_SDL_DelEventWatch": retVoid,
-		"_SDL_NumJoysticks": ret0, "_SDL_ShowCursor": ret0, "_SDL_WarpMouseInWindow": retVoid,
+		"_SDL_NumJoysticks": ret0,
+		"_SDL_ShowCursor": func(c *cpu.CPU) { // (toggle: 1 show, 0 hide, -1 query) -> the previous state
+			was := b2u(!m.input.hidden)
+			if t := int32(c.Arg(0)); t >= 0 {
+				m.input.hidden = t == 0
+				m.updateMouseCapture()
+			}
+			ret(c, was)
+		},
+		"_SDL_WarpMouseInWindow": func(c *cpu.CPU) { // the game's pointer (not the Mac's) moves there
+			m.input.x, m.input.y = int32(c.Arg(1)), int32(c.Arg(2))
+			c.Ret()
+		},
 		"_SDL_GetMouseState": func(c *cpu.CPU) {
 			if c.Arg(0) != 0 {
 				c.Write32(c.Arg(0), uint32(m.input.x))
@@ -129,7 +141,7 @@ func (m *Machine) registerSDLShims() {
 			}
 			ret(c, m.input.buttons)
 		},
-		"_SDL_SetRelativeMouseMode": func(c *cpu.CPU) { m.setRelativeMouse(c.Arg(0) != 0); ret(c, 0) },
+		"_SDL_SetRelativeMouseMode": func(c *cpu.CPU) { m.input.relative = c.Arg(0) != 0; m.updateMouseCapture(); ret(c, 0) },
 		"_SDL_CreateSystemCursor":   func(c *cpu.CPU) { ret(c, c.Malloc(16)) }, "_SDL_SetCursor": retVoid,
 		"_SDL_FreeSurface": retVoid, "_SDL_LoadBMP_RW": ret0, "_SDL_RWFromFile": ret0,
 		"_SDL_ShowSimpleMessageBox": func(c *cpu.CPU) {

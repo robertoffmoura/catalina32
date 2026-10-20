@@ -537,16 +537,24 @@ static void sendEvent(uint32_t type, uint32_t key, uint32_t mods, int32_t x, int
     atomic_store_explicit(wp, w + 1, memory_order_release);
 }
 
+static BOOL g_captured = NO; /* main thread: the mouse is detached and the pointer hidden */
+
+/* Captures the mouse when the game wants it (mouse look) and the window is active. */
+static void applyMouseCapture(void) {
+    BOOL want = atomic_load(&g_relative) && [NSApp isActive] && [[g_view window] isKeyWindow];
+    if (want == g_captured) return;
+    g_captured = want;
+    CGAssociateMouseAndMouseCursorPosition(want ? false : true);
+    if (want) {
+        [NSCursor hide];
+    } else {
+        [NSCursor unhide];
+    }
+}
+
 static void c32SetMouseMode(int relative) {
     if (atomic_exchange(&g_relative, relative) == relative) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CGAssociateMouseAndMouseCursorPosition(relative ? false : true);
-        if (relative) {
-            [NSCursor hide];
-        } else {
-            [NSCursor unhide];
-        }
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ applyMouseCapture(); });
 }
 
 @implementation C32GLView
@@ -635,6 +643,13 @@ static void c32SetMouseMode(int relative) {
     if ([e hasPreciseScrollingDeltas]) dy /= 10.0;
     int steps = (int)(dy > 0 ? dy + 0.5 : dy - 0.5);
     if (steps) sendEvent(evWheel, 0, 0, 0, 0, 0, steps, 0, NULL);
+}
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    for (NSString *n in @[ NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification ]) {
+        [nc addObserverForName:n object:[self window] queue:nil usingBlock:^(NSNotification *note) { applyMouseCapture(); }];
+    }
 }
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];

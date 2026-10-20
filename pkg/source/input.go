@@ -88,7 +88,9 @@ func sdlMods(f uint32) uint32 {
 type inputState struct {
 	x, y     int32
 	buttons  uint32
-	relative bool
+	relative bool   // SDL_SetRelativeMouseMode
+	hidden   bool   // SDL_ShowCursor(0)
+	captured bool   // the window holds the Mac's mouse (relative || hidden)
 	fb       []byte // the viewer's framebuffer shared memory (game state flags), nil without one
 }
 
@@ -166,6 +168,12 @@ func (m *Machine) sdlEvent(c *cpu.CPU, p uint32, e []byte) bool {
 			copy(c.WBytes(p+12, 32), e[32:63])
 		}
 	case evMotion:
+		if in.captured { // raw movement moves the game's pointer
+			x, y = in.x+dx, in.y+dy
+			if in.relative { // SDL keeps a relative-mode pointer inside the window
+				x, y = max(0, min(x, int32(m.sdl.winW)-1)), max(0, min(y, int32(m.sdl.winH)-1))
+			}
+		}
 		in.x, in.y = x, y
 		put(0, sdlMouseMotion)
 		put(16, in.buttons)
@@ -174,6 +182,9 @@ func (m *Machine) sdlEvent(c *cpu.CPU, p uint32, e []byte) bool {
 		put(28, uint32(dx))
 		put(32, uint32(dy))
 	case evButtonDown, evButtonUp:
+		if in.captured {
+			x, y = in.x, in.y
+		}
 		in.x, in.y = x, y
 		t, state := uint32(sdlMouseButtonDown), uint8(1)
 		if typ == evButtonUp {
@@ -201,12 +212,17 @@ func (m *Machine) sdlEvent(c *cpu.CPU, p uint32, e []byte) bool {
 	return true
 }
 
-// setRelativeMouse switches mouse look on or off (SDL_SetRelativeMouseMode).
-func (m *Machine) setRelativeMouse(on bool) {
-	if m.input.relative == on {
+// updateMouseCapture captures the Mac's mouse while the game hides its cursor or asks for
+// relative mode (mouse look): the window hides the pointer and sends raw movement, which moves
+// the game's own pointer. (Source looks around by warping its pointer back to the centre each
+// frame, unless m_rawinput is on.)
+func (m *Machine) updateMouseCapture() {
+	in := &m.input
+	on := in.relative || in.hidden
+	if on == in.captured {
 		return
 	}
-	m.input.relative = on
+	in.captured = on
 	if m.glOn {
 		m.glr.scratch = m.glr.scratch[:0]
 		m.glr.u32(b2u(on))
@@ -242,7 +258,7 @@ func (m *Machine) publishGameState(ended bool) {
 		return
 	}
 	var flags uint32
-	if !m.input.relative {
+	if !m.input.captured {
 		flags |= 1
 	}
 	if ended {
