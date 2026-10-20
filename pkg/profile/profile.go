@@ -20,6 +20,8 @@ import (
 
 type Profile struct {
 	Name string
+	// Title is the game's name as players know it (the wizard and game apps show it).
+	Title string
 	// SHA256 of the Mach-O executable this profile was written for.
 	SHA256 string
 
@@ -37,6 +39,9 @@ type Profile struct {
 	// SaveDir names the game's folder under the user's catalina32 settings directory, which
 	// holds its SaveData (the profile ID when empty).
 	SaveDir string
+	// OriginalSaves is where the original game kept what the runtime maps to SaveData
+	// ("~/" for the home folder); when set, game apps use it by default, so older saves load.
+	OriginalSaves string
 	// ModulePath is what GetModuleFileNameA reports (a Windows path).
 	ModulePath string
 	// UnmappedStubs lists engine->platform boundary functions that should return 1 and be logged

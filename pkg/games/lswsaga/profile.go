@@ -6,6 +6,7 @@ import "catalina32/pkg/profile"
 // Addresses were identified by reverse engineering the stripped executable; see PROGRESS.md.
 var Profile = &profile.Profile{
 	Name:       "LEGO Star Wars: The Complete Saga (Feral, i386)",
+	Title:      "LEGO Star Wars: The Complete Saga",
 	SHA256:     "c6ddb3bbaf09f9fa504403493896cd8c7a1841aa970706be58fa75b057d303ea",
 	EntryPoint: "WinMain",
 	// Static initialisers at or above this address belong to Feral's platform layer and are
