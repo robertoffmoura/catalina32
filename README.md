@@ -12,9 +12,9 @@ You need your own copy of each game; catalina32 never copies or changes it.
 
 ## Supported games
 
-| Game | Version | Status |
-|---|---|---|
-| LEGO Star Wars: The Complete Saga | Feral Interactive Mac port, Steam | Plays: menus, saves, controllers, sound; Episode I tested |
+| Game | Version |
+|---|---|
+| LEGO Star Wars: The Complete Saga | Feral Interactive Mac port, Steam |
 
 Ports by Feral Interactive are the first target: they share one runtime layer, which
 catalina32 replaces, so each new Feral game should need little work.
