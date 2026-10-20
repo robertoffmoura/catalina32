@@ -85,9 +85,11 @@ type Machine struct {
 	gl        nullGL
 	fonts     fontState
 	audio     audioState
+	al        openAL
 }
 
-// New links the game in dir (the folder holding hl2_osx).
+// New links the game in dir (the folder holding hl2_osx). With dir "", it only sets up the
+// system libraries (for tests).
 func New(dir string, args []string, overlay string, log io.Writer) (*Machine, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -126,6 +128,9 @@ func New(dir string, args []string, overlay string, log io.Writer) (*Machine, er
 	}
 	m.initStdio()
 	m.initThreads()
+	if dir == "" { // the system libraries alone (tests)
+		return m, nil
+	}
 	if _, err := m.L.LoadExecutable(filepath.Join(abs, "hl2_osx")); err != nil {
 		return nil, err
 	}

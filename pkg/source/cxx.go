@@ -421,9 +421,9 @@ func (m *Machine) findBase(ti, obj uint32, dst string, depth int) (uint32, bool)
 		return obj, true
 	}
 	switch m.cxx.vtables[c.Read32(ti)] {
-	case "si_class_type_info":
+	case "__si_class_type_info":
 		return m.findBase(c.Read32(ti+8), obj, dst, depth+1)
-	case "vmi_class_type_info":
+	case "__vmi_class_type_info":
 		n := c.Read32(ti + 12)
 		for i := uint32(0); i < n && i < 64; i++ {
 			base, flags := c.Read32(ti+16+8*i), int32(c.Read32(ti+20+8*i))
