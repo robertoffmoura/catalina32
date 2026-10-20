@@ -19,3 +19,18 @@ func TestTextPages(t *testing.T) {
 		t.Fatalf("a code store did not flush the cache")
 	}
 }
+
+// PUSH/POP of segment registers (old MSVC code saves DS and ES) keep the stack balanced.
+func TestSegmentPushPop(t *testing.T) {
+	c := NewCPU()
+	code := []byte{0x1E, 0x06, 0x0E, 0x16, 0x17, 0x58, 0x07, 0x1F} // push ds, es, cs, ss; pop ss; pop eax; pop es; pop ds
+	copy(c.Mem[0x1000:], code)
+	c.EIP = 0x1000
+	esp := c.Regs[RegESP]
+	for range code {
+		c.Step()
+	}
+	if c.Halted || c.Regs[RegESP] != esp || c.Regs[RegEAX] != 0x17 {
+		t.Fatalf("halted %v (%s), esp %#x (want %#x), eax %#x (want the CS selector 0x17)", c.Halted, c.HaltReason, c.Regs[RegESP], esp, c.Regs[RegEAX])
+	}
+}

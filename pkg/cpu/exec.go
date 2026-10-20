@@ -1043,6 +1043,26 @@ func (c *CPU) stepFull() {
 		}
 		return
 
+	case 0x06, 0x0E, 0x16, 0x1E: // PUSH ES/CS/SS/DS: flat segments, the selectors macOS gives 32-bit code
+		sel := uint32(0x1f)
+		if op == 0x0E {
+			sel = 0x17
+		}
+		if opSize16 {
+			c.Push16(uint16(sel))
+		} else {
+			c.Push32(sel)
+		}
+		return
+
+	case 0x07, 0x17, 0x1F: // POP ES/SS/DS: segments are flat, the value is dropped
+		if opSize16 {
+			c.Pop16()
+		} else {
+			c.Pop32()
+		}
+		return
+
 	case 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F: // POP r32(16)
 		reg := int(op & 7)
 		if opSize16 {
