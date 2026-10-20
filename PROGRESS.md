@@ -54,6 +54,13 @@ explain each change); keep this file to what is true now.
   - compressed textures whose sizes aren't multiples of 4 are sent uncompressed;
   - fixed-function vertex fog without a vertex shader (not used by this game);
   - the legacy heuristic renderer (`C32_REAL_SHADERS=0`) still mis-places skies.
+  - `StretchRect` with rectangles (the game never passes any): the viewer's copy discards the
+    rest of the destination (`MTLLoadActionDontCare`) when copying into a sub-rectangle; empty or
+    inverted rectangles aren't rejected (negative Metal viewport); the software path lost its
+    plain whole-surface copy.
+- **Robustness:** the lifted `NuLZHUF_DecodeC` (`pkg/games/lswsaga/lifted.go`), which the game
+  falls back to when the native decoder declines corrupt input, can loop forever inside one
+  step on such input. Real game data never reaches it.
 - **Packaging:** `run_on_mac.sh --build-app` makes a `.app`, but it isn't polished for
   non-developers.
 - **General tool:** only this game has a profile. Game-specific logic still inside
