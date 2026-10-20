@@ -164,6 +164,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | Variable | Effect |
 |---|---|
 | `C32_RENDERER` | `software`: show the software framebuffer instead of Metal (`run_on_mac.sh` then doesn't set `C32_GPU_SHM`) |
+| `C32_HUD` | `1`: a line of stats above the game in the developer window (frame, FPS, draw calls, triangles, instructions, controllers) |
 | `C32_METAL_WINDING` | `ccw`: flip the front-face convention |
 | `C32_METAL_SYNC_SHADERS` | `1`: compile shaders on the render thread, waiting for each (by default they compile in the background and draws needing one are skipped until it is ready) |
 | `C32_PAD_DEBUG` | `1`: print raw controller events |

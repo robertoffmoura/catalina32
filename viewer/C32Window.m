@@ -25,7 +25,6 @@
 #define SHM_SIZE (SHM_PAD_OFFSET + 4 + MAX_PADS * 16)
 
 static uint8_t *g_shm = NULL;
-static int g_tapFrames[256] = {0};
 static uint64_t g_audioReadIdx = 0;
 
 /* ---- Game controllers (IOKit HID) -> XInput-style records in shared memory ---- */
@@ -413,8 +412,7 @@ static int macKeyCodeToDIK(unsigned short kc) {
     C32MetalRenderer *_renderer;
     NSWindow *_window;
     C32View *_fbView;
-    NSTextField *_hudLabel;
-    NSButton *_autoBtn;
+    NSTextField *_hudLabel; /* viewer mode with C32_HUD=1: frame, FPS, draw counts (nil otherwise) */
     NSString *_shmPath;
     AudioQueueRef _audioQueue;
     uint64_t _lastFrame;
@@ -471,39 +469,9 @@ static int macKeyCodeToDIK(unsigned short kc) {
     close(fd);
 }
 
-- (void)tapKey:(NSButton *)sender {
-    int dik = (int)[sender tag];
-    if (dik > 0 && dik < 256 && g_shm) {
-        g_shm[32 + dik] = 0x80;
-        g_tapFrames[dik] = 12;
-    }
-    [_window makeFirstResponder:_fbView];
-}
-
-- (void)cycleAutoKeys:(NSButton *)sender {
-    if (g_shm) {
-        uint8_t cur = g_shm[32];
-        if (cur < 1 || cur > 3) cur = 1;
-        cur = (cur % 3) + 1;
-        g_shm[32] = cur;
-        const char *names[] = {"off", "off", "boot", "loop"};
-        [_autoBtn setTitle:[NSString stringWithFormat:@"AutoKeys: %s", names[cur]]];
-    }
-    [_window makeFirstResponder:_fbView];
-}
-
 - (void)tick:(NSTimer *)timer {
     [self tryMapShm];
     if (!g_shm) return;
-
-    for (int i = 1; i < 256; i++) {
-        if (g_tapFrames[i] > 0) {
-            g_tapFrames[i]--;
-            if (g_tapFrames[i] == 0) {
-                g_shm[32 + i] = 0;
-            }
-        }
-    }
 
     int pads = writePads();
 
@@ -519,13 +487,9 @@ static int macKeyCodeToDIK(unsigned short kc) {
         }
         _fpsBaseFrame = frame;
         _fpsBaseTime = now;
-        const char *ak = "off";
-        if (g_shm[32] == 2) ak = "boot";
-        else if (g_shm[32] == 3) ak = "loop";
         [_hudLabel setStringValue:[NSString stringWithFormat:
             @"Frame: %llu (%.1f FPS)  |  DrawCalls: %llu  |  Triangles: %llu  |  Steps: %.1fM  |  Controllers: %d  |  Keys: WASD / Enter / U H J K",
             frame, _fps, draws, tris, (double)steps / 1e6, pads]];
-        [_autoBtn setTitle:[NSString stringWithFormat:@"AutoKeys: %s", ak]];
     }
 
     if (_renderer && [_renderer active] && [_metalView isHidden]) {
@@ -540,8 +504,10 @@ static int macKeyCodeToDIK(unsigned short kc) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    BOOL player = _game != nil; /* game mode: only the game, no developer HUD or buttons */
-    NSRect winRect = NSMakeRect(0, 0, 1280, player ? 720 : 764);
+    BOOL player = _game != nil; /* game mode: only the game */
+    const char *hudEnv = getenv("C32_HUD");
+    BOOL hud = !player && hudEnv && strcmp(hudEnv, "1") == 0; /* a line of developer stats on top */
+    NSRect winRect = NSMakeRect(0, 0, 1280, hud ? 744 : 720);
     _window = [[NSWindow alloc] initWithContentRect:winRect
                                           styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
                                             backing:NSBackingStoreBuffered
@@ -559,49 +525,19 @@ static int macKeyCodeToDIK(unsigned short kc) {
             int status = [task terminationStatus];
             dispatch_async(dispatch_get_main_queue(), ^{ [me engineStopped:status]; });
         }];
-    } else {
-    _hudLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 736, 700, 22)];
-    [_hudLabel setEditable:NO];
-    [_hudLabel setBezeled:NO];
-    [_hudLabel setDrawsBackground:NO];
-    [_hudLabel setTextColor:[NSColor colorWithCalibratedRed:0.35 green:0.65 blue:1.0 alpha:1.0]];
-    [_hudLabel setFont:[NSFont monospacedSystemFontOfSize:11.5 weight:NSFontWeightMedium]];
-    [_hudLabel setStringValue:@"Connecting to catalina32 shared memory framebuffer..."];
-    [_hudLabel setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
-    [content addSubview:_hudLabel];
-
-    struct { const char *title; int dik; CGFloat w; } btns[] = {
-        {"Enter", 0x1C, 56},
-        {"F2", 0x3C, 40},
-        {"Esc", 0x01, 44},
-        {"U Jump", 0x16, 62},
-        {"H Atk", 0x23, 56},
-        {"J Spec", 0x24, 58},
-        {"K Sw", 0x25, 52},
-    };
-    CGFloat bx = 720;
-    for (size_t i = 0; i < sizeof(btns)/sizeof(btns[0]); i++) {
-        NSButton *b = [[NSButton alloc] initWithFrame:NSMakeRect(bx, 734, btns[i].w, 24)];
-        [b setTitle:[NSString stringWithUTF8String:btns[i].title]];
-        [b setBezelStyle:NSBezelStyleRounded];
-        [b setTag:btns[i].dik];
-        [b setTarget:self];
-        [b setAction:@selector(tapKey:)];
-        [b setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
-        [content addSubview:b];
-        bx += btns[i].w + 4;
+    } else if (hud) {
+        _hudLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 722, 1256, 20)];
+        [_hudLabel setEditable:NO];
+        [_hudLabel setBezeled:NO];
+        [_hudLabel setDrawsBackground:NO];
+        [_hudLabel setTextColor:[NSColor colorWithCalibratedRed:0.35 green:0.65 blue:1.0 alpha:1.0]];
+        [_hudLabel setFont:[NSFont monospacedSystemFontOfSize:11.5 weight:NSFontWeightMedium]];
+        [_hudLabel setStringValue:@"Connecting to catalina32 shared memory framebuffer..."];
+        [_hudLabel setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+        [content addSubview:_hudLabel];
     }
 
-    _autoBtn = [[NSButton alloc] initWithFrame:NSMakeRect(bx, 734, 118, 24)];
-    [_autoBtn setTitle:@"AutoKeys: off"];
-    [_autoBtn setBezelStyle:NSBezelStyleRounded];
-    [_autoBtn setTarget:self];
-    [_autoBtn setAction:@selector(cycleAutoKeys:)];
-    [_autoBtn setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
-    [content addSubview:_autoBtn];
-    } /* viewer mode */
-
-    _fbView = [[C32View alloc] initWithFrame:NSMakeRect(0, 0, 1280, player ? 720 : 728)];
+    _fbView = [[C32View alloc] initWithFrame:NSMakeRect(0, 0, 1280, 720)];
     [_fbView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [content addSubview:_fbView];
 
