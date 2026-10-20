@@ -261,6 +261,11 @@ func (g *glRemote) ask(id int, args func()) []byte {
 	return append([]byte(nil), g.reply[:min(n, glReplySize)]...)
 }
 
+// str asks the window for one of its GL strings (glGetString's name): its real GPU's.
+func (g *glRemote) str(name uint32) string {
+	return string(g.ask(g.ids["c32GetString"], func() { g.u32(name) }))
+}
+
 // --- Encoding the game's calls ---
 
 // stackArgs reads a call's arguments from the guest stack: 4 bytes each, 8 for doubles.

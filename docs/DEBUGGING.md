@@ -87,7 +87,11 @@ scripts/gpuroute.sh EXE GPUCHECK OUTDIR ROUTE MAXSTEPS [VAR=value...]  # GPU pat
 
   `C32_CMDS` types console commands in at instruction counts (`steps:cmd;cmd|steps:...`).
   Mesa is not the Mac's GL: a picture right here and wrong on a Mac points at the Mac's
-  driver or the window, not the stream. `C32_GLTRACE=<file>` (with `C32_GLCHECK=1`) writes
+  driver or the window, not the stream. Some Mac drivers can be imitated:
+  `GLREPLAY_CLIP=position` clips against `gl_Position` whatever the shader writes to
+  `gl_ClipVertex`, as AMD's Mac drivers do, and reports an AMD GPU (portals on AMD Macs drew
+  without walls and floors before the engine told ToGL the GPU's vendor).
+  `GLREPLAY_SCREEN=WxH` is the screen size the game sees (default 1440x900). `C32_GLTRACE=<file>` (with `C32_GLCHECK=1`) writes
   every GL command for diffing two runs.
 
 ## Tests

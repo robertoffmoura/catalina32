@@ -224,6 +224,7 @@ func (m *Machine) registerShims() {
 	m.registerThreadShims()
 	m.registerCxxShims()
 	m.registerFrameworkShims()
+	m.registerIOKitShims()
 	m.registerSDLShims()
 	m.registerPadShims()
 	m.registerFontShims()

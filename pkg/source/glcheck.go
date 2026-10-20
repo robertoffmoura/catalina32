@@ -2,6 +2,7 @@ package source
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -81,7 +82,7 @@ func RunGLCheck(path string, stop <-chan struct{}) (*GLCheck, error) {
 		k.Questions++
 	}
 	locations := uint32(0)
-	var trace *bufio.Writer // C32_GLTRACE: each command: name, hash of its bytes, arguments (for diffing two runs)
+	var trace *bufio.Writer // C32_GLTRACE: each command: name, hash, its bytes (or arguments, when long); for diffing runs
 	if p := os.Getenv("C32_GLTRACE"); p != "" {
 		f, err := os.Create(p)
 		if err != nil {
@@ -123,7 +124,14 @@ func RunGLCheck(path string, stop <-chan struct{}) (*GLCheck, error) {
 			k.PerCall[c.Name]++
 			args, used, err := walkGLArgs(c, p)
 			if trace != nil {
-				fmt.Fprintf(trace, "%s %08x %x\n", c.Name, crc32.ChecksumIEEE(p), args)
+				if c.Name == "glShaderSourceARB" { // the source, between markers
+					n := binary.LittleEndian.Uint32(p[4:]) // H, then the string: length, bytes
+					fmt.Fprintf(trace, "%s %08x <<<\n%s\n>>>\n", c.Name, crc32.ChecksumIEEE(p), bytes.TrimRight(p[8:8+n], "\x00"))
+				} else if len(p) <= 64 { // small: all of it
+					fmt.Fprintf(trace, "%s %08x %x\n", c.Name, crc32.ChecksumIEEE(p), p)
+				} else {
+					fmt.Fprintf(trace, "%s %08x %x\n", c.Name, crc32.ChecksumIEEE(p), args)
+				}
 			}
 			if err != nil {
 				k.fail("%s: %v", c.Name, err)

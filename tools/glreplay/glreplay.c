@@ -15,6 +15,45 @@
 
 static void c32SetMouseMode(int relative) { (void)relative; }
 
+/* GLREPLAY_CLIP=position: user clip planes test gl_Position instead of gl_ClipVertex, as a
+   driver that ignores gl_ClipVertex does (ToGL's renderer table: AMD's Mac drivers). ToGL's
+   vertex shaders set gl_ClipVertex before their y and depth fix-ups; this moves it after
+   them, onto gl_Position. */
+#undef glGetString
+/* ...and then it also says it is AMD's, as the window on such a Mac does. */
+const GLubyte *glreplayGetString(GLenum name) {
+    const char *mode = getenv("GLREPLAY_CLIP");
+    if (mode && strcmp(mode, "position") == 0) {
+        if (name == GL_VENDOR) return (const GLubyte *)"ATI Technologies Inc.";
+        if (name == GL_RENDERER) return (const GLubyte *)"AMD Radeon (simulated on llvmpipe) OpenGL Engine";
+    }
+    return glGetString(name);
+}
+
+#undef glShaderSourceARB
+void glreplayShaderSource(GLhandleARB shader, GLsizei count, const GLcharARB **strings, const GLint *lengths) {
+    static PFNGLSHADERSOURCEARBPROC real;
+    if (!real) real = (PFNGLSHADERSOURCEARBPROC)OSMesaGetProcAddress("glShaderSourceARB");
+    const char *mode = getenv("GLREPLAY_CLIP");
+    const char *set = "gl_ClipVertex = vTempPos;", *pos = "gl_Position = vTempPos;";
+    if (!mode || strcmp(mode, "position") != 0 || count != 1 || !strstr(strings[0], set) || !strstr(strings[0], pos)) {
+        real(shader, count, strings, lengths);
+        return;
+    }
+    const char *src = strings[0];
+    size_t n = strlen(src);
+    char *out = malloc(n + 64), *o = out;
+    const char *a = strstr(src, set);
+    memcpy(o, src, (size_t)(a - src)), o += a - src; /* drop the early gl_ClipVertex */
+    const char *rest = a + strlen(set), *b = strstr(rest, pos) + strlen(pos);
+    memcpy(o, rest, (size_t)(b - rest)), o += b - rest;
+    o += sprintf(o, " gl_ClipVertex = gl_Position;");
+    strcpy(o, b);
+    const GLcharARB *one = out;
+    real(shader, 1, &one, NULL);
+    free(out);
+}
+
 static const char *g_out;
 static uint64_t g_frame;
 static int g_every = 50;
@@ -205,8 +244,10 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[glreplay] %s, %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
     c32gl_c32WindowSize(d, 640, 480);
-    atomic_store((_Atomic uint32_t *)(shm + kOffScreenW), 1440);
-    atomic_store((_Atomic uint32_t *)(shm + kOffScreenH), 900);
+    unsigned sw = 1440, sh = 900; /* the screen the game sees: GLREPLAY_SCREEN=WxH */
+    if (getenv("GLREPLAY_SCREEN")) sscanf(getenv("GLREPLAY_SCREEN"), "%ux%u", &sw, &sh);
+    atomic_store((_Atomic uint32_t *)(shm + kOffScreenW), sw);
+    atomic_store((_Atomic uint32_t *)(shm + kOffScreenH), sh);
     atomic_store_explicit((_Atomic uint32_t *)(shm + kOffReady), 1, memory_order_release);
 
     _Atomic uint64_t *writeIdx = (_Atomic uint64_t *)(shm + kOffWrite);
