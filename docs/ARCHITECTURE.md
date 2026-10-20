@@ -137,6 +137,11 @@ The game's own code writes the save files, so they are compatible with the origi
   builds both and assembles `build/Catalina32.app`. A build for your own use may include the
   AOT code generated from your own copy of a game (`--with-aot`); a build for others must not
   (it is a translation of the game's code), so by default it is left out (`-tags noaot`).
+- **Releases:** `scripts/make_release.sh [--arch universal] [--notes file] [--publish]`, from a
+  clean master: builds the app, refuses an engine that contains AOT-compiled game code, checks
+  the architectures and signature, zips it with `ditto` and writes the release notes in
+  `build/release/`; `--publish` tags `v<version>` and creates a GitHub pre-release (`--final`
+  for a normal one). The version is `cmd/catalina32/cli.go`'s.
 
 ## Distribution and legal
 
