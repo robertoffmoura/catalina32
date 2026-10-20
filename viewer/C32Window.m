@@ -426,6 +426,7 @@ static int macKeyCodeToDIK(unsigned short kc) {
     C32GameLaunch *_game; /* game mode: the engine we started (nil: viewer mode) */
     BOOL _quitting;
     BOOL _pointerHidden; /* we called [NSCursor hide] (balanced by one unhide) */
+    uint32_t _gameFlags; /* the engine's game state, as of the last tick */
 }
 - (instancetype)initWithShmPath:(NSString *)path;
 - (instancetype)initWithGame:(C32GameLaunch *)game;
@@ -482,6 +483,24 @@ static int macKeyCodeToDIK(unsigned short kc) {
     } else {
         [NSCursor unhide];
     }
+    if ([_window styleMask] & NSWindowStyleMaskFullScreen) {
+        [NSApp setPresentationOptions:[self fullScreenOptions]];
+    }
+}
+
+/* In full screen without a pointer, the Dock and the menu bar stay hidden: otherwise the
+   invisible pointer reveals the menu bar (and the title bar) at the top edge and the Dock at
+   the bottom, and the Dock brings the pointer back. Ctrl-Cmd-F, Cmd-Tab and Cmd-Q still work.
+   A game that wants a pointer gets the usual auto-hiding. */
+- (NSApplicationPresentationOptions)fullScreenOptions {
+    if (_gameFlags & SHM_GAME_POINTER) {
+        return NSApplicationPresentationFullScreen | NSApplicationPresentationAutoHideDock | NSApplicationPresentationAutoHideMenuBar;
+    }
+    return NSApplicationPresentationFullScreen | NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
+}
+
+- (NSApplicationPresentationOptions)window:(NSWindow *)window willUseFullScreenPresentationOptions:(NSApplicationPresentationOptions)proposed {
+    return [self fullScreenOptions];
 }
 
 - (void)tick:(NSTimer *)timer {
@@ -510,6 +529,7 @@ static int macKeyCodeToDIK(unsigned short kc) {
     /* In full screen, hide the pointer unless the game wants it (the engine decides from what the
        game asks for: Win32 ShowCursor/SetCursor, a Direct3D device cursor, a windowed device). */
     uint32_t gameFlags = *(volatile uint32_t *)(g_shm + SHM_GAME_OFFSET);
+    _gameFlags = gameFlags;
     if (!_game && (gameFlags & SHM_GAME_ENDED)) {
         /* Viewer mode: the engine is someone else's child; close with the game. (Game mode
            waits for the engine process to end, to report a failure.) */
@@ -627,10 +647,33 @@ static int macKeyCodeToDIK(unsigned short kc) {
 }
 @end
 
+/* The main menu: Hide and Quit (Cmd-H, Cmd-Q), and View > Enter/Exit Full Screen (Ctrl-Cmd-F).
+   Its shortcuts also work in full screen, where the menu bar stays hidden. */
+static void setUpMainMenu(void) {
+    NSString *name = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
+    if (![name length]) name = @"catalina32";
+    NSMenu *bar = [[[NSMenu alloc] init] autorelease];
+    NSMenuItem *appItem = [[[NSMenuItem alloc] init] autorelease];
+    NSMenu *appMenu = [[[NSMenu alloc] initWithTitle:name] autorelease];
+    [appMenu addItemWithTitle:[@"Hide " stringByAppendingString:name] action:@selector(hide:) keyEquivalent:@"h"];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    [appMenu addItemWithTitle:[@"Quit " stringByAppendingString:name] action:@selector(terminate:) keyEquivalent:@"q"];
+    [appItem setSubmenu:appMenu];
+    [bar addItem:appItem];
+    NSMenuItem *viewItem = [[[NSMenuItem alloc] init] autorelease];
+    NSMenu *viewMenu = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
+    NSMenuItem *full = [viewMenu addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+    [full setKeyEquivalentModifierMask:NSEventModifierFlagControl | NSEventModifierFlagCommand];
+    [viewItem setSubmenu:viewMenu];
+    [bar addItem:viewItem];
+    [NSApp setMainMenu:bar];
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        setUpMainMenu();
         id<NSApplicationDelegate> del = nil;
         /* (Old macOS versions pass -psn_... to apps opened from the Finder: not a path.) */
         NSString *manifest = [[NSBundle mainBundle] pathForResource:@"game" ofType:@"json"];
