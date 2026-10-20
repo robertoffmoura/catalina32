@@ -219,6 +219,7 @@ type Subsystem struct {
 	// The mouse pointer, as the game sets it (pointerWanted): the Win32 cursor (ShowCursor
 	// count, SetCursor), the Direct3D device cursor, and whether the device is windowed
 	// (-1: no device yet).
+	gameEnded    bool // the game quit or stopped (the viewer closes)
 	cursorWin32  bool
 	cursorDevice bool
 	windowed     int8
@@ -2169,6 +2170,12 @@ func (s *Subsystem) setPresentParams(c *cpu.CPU, pp uint32) {
 	}
 }
 
+// GameEnded tells the viewer the game is over (it quit, or the engine stopped).
+func (s *Subsystem) GameEnded() {
+	s.gameEnded = true
+	s.publishGameState()
+}
+
 // SetWin32Cursor records whether the game shows the Win32 cursor (ShowCursor count >= 0 and
 // SetCursor not NULL).
 func (s *Subsystem) SetWin32Cursor(visible bool) {
@@ -2192,6 +2199,9 @@ func (s *Subsystem) publishGameState() {
 	var flags uint32
 	if s.pointerWanted() {
 		flags |= 1
+	}
+	if s.gameEnded {
+		flags |= 2
 	}
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&s.shm[ShmGameOffset])), flags)
 }

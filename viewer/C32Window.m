@@ -22,9 +22,10 @@
 #define SHM_PAD_OFFSET (SHM_AUDIO_OFFSET + 8 + SHM_AUDIO_FRAMES * 4)
 #define SHM_PAD_READY 0x50323343u /* "C32P" */
 #define MAX_PADS 4
-/* Game state from the engine: u32 flags, bit 0 = the game wants the system mouse pointer. */
+/* Game state from the engine: u32 flags (below). */
 #define SHM_GAME_OFFSET (SHM_PAD_OFFSET + 4 + MAX_PADS * 16)
 #define SHM_GAME_POINTER 1u
+#define SHM_GAME_ENDED 2u /* the game quit or the engine stopped */
 #define SHM_SIZE (SHM_GAME_OFFSET + 4)
 
 static uint8_t *g_shm = NULL;
@@ -509,6 +510,12 @@ static int macKeyCodeToDIK(unsigned short kc) {
     /* In full screen, hide the pointer unless the game wants it (the engine decides from what the
        game asks for: Win32 ShowCursor/SetCursor, a Direct3D device cursor, a windowed device). */
     uint32_t gameFlags = *(volatile uint32_t *)(g_shm + SHM_GAME_OFFSET);
+    if (!_game && (gameFlags & SHM_GAME_ENDED)) {
+        /* Viewer mode: the engine is someone else's child; close with the game. (Game mode
+           waits for the engine process to end, to report a failure.) */
+        [NSApp terminate:nil];
+        return;
+    }
     BOOL fullScreen = ([_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
     [self setPointerHidden:fullScreen && [NSApp isActive] && !(gameFlags & SHM_GAME_POINTER)];
 

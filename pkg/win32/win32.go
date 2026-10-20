@@ -274,6 +274,7 @@ func (env *Win32Env) RegisterBoundaryThunks(c *cpu.CPU, prof *profile.Profile) {
 	prof.Bind(c, "GetDiskFreeSpaceExA", env.thunkGetDiskFreeSpaceExA)
 	prof.Bind(c, "SHGetFolderPathA", env.thunkSHGetFolderPathA)
 	prof.Bind(c, "ShowCursor", env.thunkShowCursor)
+	prof.Bind(c, "ExitProcess", env.thunkExitProcess)
 	prof.Bind(c, "SetCursor", env.thunkSetCursor)
 
 	// MacdozeFile (stdio wrappers)
@@ -332,6 +333,13 @@ func (env *Win32Env) thunkShowWindow(c *cpu.CPU) {
 func (env *Win32Env) thunkReturnZero(c *cpu.CPU) {
 	c.Regs[cpu.RegEAX] = 0
 	c.Ret()
+}
+
+// ExitProcess(uExitCode): the game ends; it never returns, so the CPU stops here.
+func (env *Win32Env) thunkExitProcess(c *cpu.CPU) {
+	c.Exited, c.ExitCode = true, c.Arg(0)
+	c.Halted = true
+	c.HaltReason = fmt.Sprintf("the game quit (exit code %d)", c.ExitCode)
 }
 
 // ShowCursor(bShow): the display count goes up or down; the cursor shows from 0 up.

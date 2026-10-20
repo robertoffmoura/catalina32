@@ -38,7 +38,7 @@ const (
 	ShmHotplugPads = 2
 	ShmPadSize     = 16
 	// Game state written by the engine for the viewer: u32 flags, bit 0 = the game wants the
-	// system mouse pointer (see pointerWanted).
+	// system mouse pointer (see pointerWanted), bit 1 = the game is over (the viewer closes).
 	ShmGameOffset = ShmPadOffset + 4 + ShmPads*ShmPadSize
 	ShmTotalSize  = ShmGameOffset + 4
 )

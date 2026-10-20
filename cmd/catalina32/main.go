@@ -197,6 +197,11 @@ func engineMain(binPath string) {
 	pprof.StopCPUProfile()
 	d3d.WaitRender() // let the last submitted frame finish drawing/exporting
 	dumpGuestProfile(vm)
+	d3d.GameEnded()
+	if vm.Exited {
+		fmt.Printf("[catalina32] %s after %d instructions\n", vm.HaltReason, vm.Steps)
+		os.Exit(int(vm.ExitCode))
+	}
 	if err != nil {
 		fmt.Printf("[catalina32] WinMain stopped: %v\n  State: %s\n", err, vm.DumpState())
 		fmt.Printf("  CallStack depth=%d:\n", len(vm.CallStack))

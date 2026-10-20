@@ -70,7 +70,7 @@ var Profile = &profile.Profile{
 		"GetFileAttributesA":              0x0060bb30,
 		"GetDiskFreeSpaceExA":             0x0060bd50,
 		"SHGetFolderPathA":                0x0060f610,
-		"ShowCursor":                      0x0060f850,
+		"ExitProcess":                     0x0060f850, // MacDoze's: (exit code, flag); never returns
 		"MacdozeFile::fopen":              0x00612ce0,
 		"MacdozeFile::fread":              0x006137e0,
 		"MacdozeFile::fwrite":             0x00613a90,

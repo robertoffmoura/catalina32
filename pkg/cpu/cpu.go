@@ -96,6 +96,8 @@ type CPU struct {
 	MaxSteps      uint64
 	Halted        bool
 	HaltReason    string
+	Exited        bool   // the game ended the process itself (ExitProcess): Halted, and not an error
+	ExitCode      uint32 // its exit code
 	TraceCalls    bool
 	CallStack     []CallFrame
 	UnmappedCalls map[uint32]uint64
