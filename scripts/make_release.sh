@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# make_release.sh [--arch universal|native|x86_64|arm64] [--notes file] [--final] [--publish]
+# make_release.sh [--arch universal|native|x86_64|arm64] [--notes file]
+# make_release.sh --publish [--final]
 #
-# Makes a Catalina32 release from a clean master checkout (macOS, Go, Xcode command-line tools):
-#   1. builds build/Catalina32.app with scripts/build-app.sh, never with the AOT code;
-#   2. checks the engine holds no AOT-compiled game code (it is a translation of the game's code
-#      and must never be shared) and has the architectures asked for;
-#   3. zips it into build/release/Catalina32-<version>.zip (ditto keeps the signature);
-#   4. writes build/release/NOTES-<version>.md (the text below, plus --notes, plus the changes
-#      since the previous release tag).
-# Nothing leaves this Mac until --publish: check the zip and the notes, then run again with it.
-#   --publish  tag v<version>, push the tag and create a GitHub release with the zip (needs gh,
-#              logged in); a pre-release unless --final
-#   --arch     what to build (default universal: Apple Silicon included, untested so far)
-#   --notes    a Markdown file added to the release notes (what's new, known problems)
-# The version is catalina32's own (cmd/catalina32/cli.go): change it there first.
+# Makes a Catalina32 release from a clean master checkout (macOS, Go, Xcode command-line tools),
+# in two steps:
+#
+# 1. Without --publish: builds build/Catalina32.app with scripts/build-app.sh (never with the
+#    AOT code), refuses an engine that contains AOT-compiled game code (a translation of the
+#    game's code, which must never be shared), checks the architectures and the signature, and
+#    writes into build/release/:
+#      Catalina32-<version>.zip   the app (ditto keeps the signature)
+#      NOTES-<version>.md         the release notes: edit them before publishing if you like
+#      STAMP-<version>            the commit and the zip's checksum
+#    Nothing leaves this Mac. Running it again replaces these files.
+#      --arch   what to build (default universal: Apple Silicon included, untested so far)
+#      --notes  a Markdown file added to the notes (what's new, known problems)
+#
+# 2. --publish: publishes exactly that zip and those notes, without rebuilding, once it has
+#    checked they were made from the current commit and the zip is unchanged: tags v<version>,
+#    pushes the tag and creates a GitHub release (needs gh, logged in), a pre-release unless
+#    --final.
+#
+# The version is catalina32's own (cmd/catalina32/cli.go): bump it there before each release.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
@@ -25,30 +33,55 @@ while [[ $# -gt 0 ]]; do
     --notes) NOTES_EXTRA="$2"; shift 2 ;;
     --publish) PUBLISH=1; shift ;;
     --final) PRERELEASE=0; shift ;;
-    *) sed -n '2,20p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,25p' "$0" >&2; exit 2 ;;
   esac
 done
 fail() { echo "make_release.sh: $*" >&2; exit 1; }
+VERSION_HINT="[release] The version lives in cmd/catalina32/cli.go; bump it there before each later release."
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "needs macOS"
-[[ -z "$NOTES_EXTRA" || -f "$NOTES_EXTRA" ]] || fail "--notes: no such file: $NOTES_EXTRA"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [[ "$BRANCH" == "master" ]] || fail "releases come from master (this is $BRANCH)"
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || fail "commit or set aside your changes first (git status)"
+COMMIT="$(git rev-parse HEAD)"
 VERSION="$(go run ./cmd/catalina32 version)"
 TAG="v$VERSION"
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   fail "tag $TAG exists already: change the version in cmd/catalina32/cli.go"
 fi
+
+OUT="$REPO/build/release"
+ZIP="$OUT/Catalina32-$VERSION.zip"
+NOTES="$OUT/NOTES-$VERSION.md"
+STAMP="$OUT/STAMP-$VERSION"
+zipsum() { shasum -a 256 "$ZIP" | cut -d' ' -f1; }
+
 if [[ "$PUBLISH" == 1 ]]; then
+  # Step 2: publish what step 1 made, as it is.
+  [[ -f "$ZIP" && -f "$NOTES" && -f "$STAMP" ]] || fail "nothing to publish for $VERSION: run scripts/make_release.sh (without --publish) first"
+  STAMP_COMMIT="$(sed -n 's/^commit //p' "$STAMP")"
+  STAMP_SUM="$(sed -n 's/^sha256 //p' "$STAMP")"
+  [[ "$STAMP_COMMIT" == "$COMMIT" ]] || fail "the zip was built from ${STAMP_COMMIT:0:7}, not the current commit ${COMMIT:0:7}: run scripts/make_release.sh again first"
+  [[ "$(zipsum)" == "$STAMP_SUM" ]] || fail "the zip changed since it was built: run scripts/make_release.sh again first"
   command -v gh >/dev/null || fail "--publish needs the GitHub CLI (brew install gh)"
   gh auth status >/dev/null 2>&1 || fail "--publish: log in first (gh auth login)"
   if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
     fail "tag $TAG exists on GitHub already"
   fi
+  echo "[release] Publishing $ZIP ($(du -h "$ZIP" | cut -f1)) as $TAG"
+  git tag -a "$TAG" -m "Catalina32 $VERSION"
+  git push origin "$TAG"
+  FLAGS=()
+  if [[ "$PRERELEASE" == 1 ]]; then FLAGS+=(--prerelease); fi
+  gh release create "$TAG" "$ZIP" --title "Catalina32 $VERSION" --notes-file "$NOTES" ${FLAGS[@]+"${FLAGS[@]}"}
+  echo "[release] Published $TAG"
+  echo "$VERSION_HINT"
+  exit 0
 fi
 
-echo "[release] Catalina32 $VERSION ($ARCH) from $(git rev-parse --short HEAD)"
+# Step 1: build, check, zip, write the notes.
+[[ -z "$NOTES_EXTRA" || -f "$NOTES_EXTRA" ]] || fail "--notes: no such file: $NOTES_EXTRA"
+echo "[release] Catalina32 $VERSION ($ARCH) from ${COMMIT:0:7}"
 scripts/build-app.sh --arch "$ARCH"
 APP="$REPO/build/Catalina32.app"
 ENGINE="$APP/Contents/Helpers/catalina32"
@@ -72,15 +105,12 @@ for a in $WANT; do
 done
 codesign --verify --deep "$APP" || fail "the app's signature doesn't verify"
 
-OUT="$REPO/build/release"
 mkdir -p "$OUT"
-ZIP="$OUT/Catalina32-$VERSION.zip"
-NOTES="$OUT/NOTES-$VERSION.md"
-[[ ! -e "$ZIP" ]] || fail "$ZIP exists already (from an earlier run?): move it away first"
+rm -f "$ZIP" "$NOTES" "$STAMP" # this version's files from an earlier run, if any
 ditto -c -k --keepParent "$APP" "$ZIP"
 
 ARCHS_TEXT="Intel Macs"
-[[ "$WANT" == *arm64* ]] && ARCHS_TEXT="Intel and Apple Silicon Macs (Apple Silicon hasn't been tested yet)"
+if [[ "$WANT" == *arm64* ]]; then ARCHS_TEXT="Intel and Apple Silicon Macs (Apple Silicon hasn't been tested yet)"; fi
 {
   echo "Play 32-bit Mac games on modern macOS. Catalina32 runs the original game's code and makes"
   echo "a clickable app for each supported game you own. Supported games are listed in the"
@@ -110,20 +140,9 @@ ARCHS_TEXT="Intel Macs"
     git log --no-merges --format='- %s' "$PREV..HEAD"
   fi
 } > "$NOTES"
+printf 'commit %s\nsha256 %s\narch %s\n' "$COMMIT" "$(zipsum)" "$ARCH" > "$STAMP"
 
-VERSION_HINT="[release] The version lives in cmd/catalina32/cli.go; bump it there before each later release."
 echo "[release] $ZIP ($(du -h "$ZIP" | cut -f1))"
 echo "[release] $NOTES"
-if [[ "$PUBLISH" != 1 ]]; then
-  echo "[release] Not published. Check both, then run again with --publish (move the zip away first)."
-  echo "$VERSION_HINT"
-  exit 0
-fi
-
-git tag -a "$TAG" -m "Catalina32 $VERSION"
-git push origin "$TAG"
-FLAGS=()
-[[ "$PRERELEASE" == 1 ]] && FLAGS+=(--prerelease)
-gh release create "$TAG" "$ZIP" --title "Catalina32 $VERSION" --notes-file "$NOTES" ${FLAGS[@]+"${FLAGS[@]}"}
-echo "[release] Published $TAG"
+echo "[release] Not published. Check both (edit the notes if you like), then: scripts/make_release.sh --publish"
 echo "$VERSION_HINT"
