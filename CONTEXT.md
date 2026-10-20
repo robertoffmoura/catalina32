@@ -149,5 +149,7 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
 | Status, open bugs, backlog | `PROGRESS.md` |
 | Environment variables, routes, logs, profilers, gpucheck | `docs/DEBUGGING.md` |
 | Game addresses, input layout, how it loads/draws things | `docs/LSWSAGA.md` |
+| The JIT (designed, not started) | `docs/JIT.md` |
+| Portal / Valve Source games: survey and plan | `docs/PORTAL.md` |
 | GPU stream format | top of `pkg/d3d9/gpu.go` |
 | History and reasons for past decisions | `git log` (commit messages explain the why) |

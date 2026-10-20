@@ -41,9 +41,10 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
   one-time Gatekeeper step instead.
 - **Later:** an icon for Catalina32 itself.
 - **Speed:** release builds have no AOT code, so heavy scenes are choppier than with
-  `run_on_mac.sh`; the JIT (backlog) is the answer for players.
-- **Next game: Portal and Portal 2** (Valve's own Mac ports: not Feral, so no MacDoze; needs a
-  feasibility study first). The Feral family layer waits for a second Feral game.
+  `run_on_mac.sh`; the JIT is the answer for players: designed in `docs/JIT.md`, left for later.
+- **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Surveyed; the plan
+  and the first experiments are in `docs/PORTAL.md`. The Feral family layer waits for a second
+  Feral game.
 
 ## Backlog
 
