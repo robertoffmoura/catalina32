@@ -28,25 +28,7 @@ func TestPlayIO(t *testing.T) {
 		t.Skip("C32_SOURCE_DIR not set")
 	}
 	const injectFrom, injectTo, end = 6_500_000_000, 9_000_000_000, 10_000_000_000
-	tmp := t.TempDir()
-	glPath := filepath.Join(tmp, "gl.shm")
-	t.Setenv("C32_GL_SHM", glPath)
-	t.Setenv("C32_SHM_FILE", filepath.Join(tmp, "framebuffer.shm"))
-	stop := make(chan struct{})
-	checked := make(chan struct{})
-	go func() {
-		if _, err := RunGLCheck(glPath, stop); err != nil {
-			t.Errorf("glcheck: %v", err)
-		}
-		close(checked)
-	}()
-	log, _ := os.Create(filepath.Join(tmp, "play.log"))
-	defer log.Close()
-	m, err := New(dir, []string{"-game", "portal", "+map", "testchmb_a_00"}, filepath.Join(tmp, "overlay"), log)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	m, finish := withWindow(t, dir, "+map", "testchmb_a_00")
 	// What the game does with the input.
 	posted := map[uint32]int{} // launcher: CCocoaEvent types posted to the engine
 	calls := map[string]int{}
@@ -93,34 +75,10 @@ func TestPlayIO(t *testing.T) {
 		binary.LittleEndian.PutUint16(r[8:], 0x6000)
 	}
 
-	err = m.Run(end)
-	close(stop)
-	<-checked
-	t.Logf("stopped after %d instructions: %v; %d frames", m.C.Steps, err, m.sdl.frames)
-	if m.C.Steps < end {
-		t.Fatalf("the game stopped early")
-	}
-
-	// Sound: the ring advanced, with non-silent samples.
-	fb := m.input.fb
-	written := atomic.LoadUint64((*uint64)(unsafe.Pointer(&fb[d3d9.ShmAudioOffset])))
-	loud := 0
-	for i := 0; i < d3d9.ShmAudioFrames*2; i++ {
-		if v := int16(binary.LittleEndian.Uint16(fb[d3d9.ShmAudioOffset+8+2*i:])); v > 64 || v < -64 {
-			loud++
-		}
-	}
-	t.Logf("OpenAL: %d buffers, %d non-silent samples; sources %d", m.al.buffers, m.al.loudIn, len(m.al.srcs))
-	for h, s := range m.al.srcs {
-		t.Logf("  source %#x: state %#x gain %.2f queued %d", h, s.state, s.gain, len(s.queue))
-	}
-	t.Logf("sound: %d frames mixed (%.1f s), %d non-silent samples in the ring", written, float64(written)/alRate, loud)
+	finish(end)
 	t.Logf("mouse: %d moves sent; launcher posted %v (3 = mouse move); ApplyMouse saw |dx| %.0f |dy| %.0f; captured %v",
 		moves, posted, mouseX, mouseY, m.input.captured)
 	t.Logf("controller: %v", calls)
-	if written == 0 || loud == 0 {
-		t.Error("no sound reached the window")
-	}
 	if posted[3] == 0 {
 		t.Error("the launcher took no mouse movement")
 	}
@@ -135,5 +93,93 @@ func TestPlayIO(t *testing.T) {
 	}
 	if joy == 0 {
 		t.Error("inputsystem saw no controller")
+	}
+}
+
+// C32_SOURCE_DIR=<Portal> go test ./pkg/source -run MenuSound -v: the main menu with sound on (its
+// music is MP3, decoded by Miles' plugin: old x86 code).
+func TestMenuSound(t *testing.T) {
+	dir := os.Getenv("C32_SOURCE_DIR")
+	if dir == "" {
+		t.Skip("C32_SOURCE_DIR not set")
+	}
+	m, finish := withWindow(t, dir)
+	mp3 := 0
+	pcm := map[uint32][]byte{} // decoder object -> what it decoded
+	m.Around(regexp.MustCompile(`^__ZN9CMilesMP36DecodeEPvj$`), func(_ string, c *cpu.CPU) func(*cpu.CPU) {
+		mp3++
+		this, buf := c.Arg(0), c.Arg(1)
+		return func(c *cpu.CPU) {
+			if n := c.Regs[cpu.RegEAX]; int32(n) > 0 {
+				pcm[this] = append(pcm[this], c.Bytes(buf, n)...)
+			}
+		}
+	})
+	finish(9_000_000_000)
+	if out := os.Getenv("C32_MP3_OUT"); out != "" { // the longest stream (the menu music), raw
+		var best []byte
+		for _, b := range pcm {
+			if len(b) > len(best) {
+				best = b
+			}
+		}
+		os.WriteFile(out, best, 0o644)
+	}
+	t.Logf("MP3 decodes: %d", mp3)
+	if mp3 == 0 {
+		t.Error("no MP3 was decoded")
+	}
+}
+
+// withWindow starts Portal (-game portal, plus args) headless with a stand-in window: the GL
+// stream checked, a real framebuffer shared memory (sound, controllers). finish runs it to
+// end instructions and checks it got there, and that non-silent sound reached the window.
+func withWindow(t *testing.T, dir string, args ...string) (*Machine, func(end uint64)) {
+	tmp := t.TempDir()
+	glPath := filepath.Join(tmp, "gl.shm")
+	t.Setenv("C32_GL_SHM", glPath)
+	t.Setenv("C32_SHM_FILE", filepath.Join(tmp, "framebuffer.shm"))
+	stop := make(chan struct{})
+	checked := make(chan struct{})
+	go func() {
+		if _, err := RunGLCheck(glPath, stop); err != nil {
+			t.Errorf("glcheck: %v", err)
+		}
+		close(checked)
+	}()
+	logPath := filepath.Join(tmp, "game.log")
+	if p := os.Getenv("C32_LOG"); p != "" {
+		logPath = p
+	}
+	log, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.Close() })
+	m, err := New(dir, append([]string{"-game", "portal"}, args...), filepath.Join(tmp, "overlay"), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m, func(end uint64) {
+		err := m.Run(end)
+		close(stop)
+		<-checked
+		t.Logf("stopped after %d instructions: %v; %d frames (log %s)", m.C.Steps, err, m.sdl.frames, logPath)
+		if m.C.Steps < end {
+			t.Fatalf("the game stopped early:\n  %s", strings.Join(m.Backtrace(12), "\n  "))
+		}
+		fb := m.input.fb
+		written := atomic.LoadUint64((*uint64)(unsafe.Pointer(&fb[d3d9.ShmAudioOffset])))
+		loud := 0
+		for i := 0; i < d3d9.ShmAudioFrames*2; i++ {
+			if v := int16(binary.LittleEndian.Uint16(fb[d3d9.ShmAudioOffset+8+2*i:])); v > 64 || v < -64 {
+				loud++
+			}
+		}
+		t.Logf("sound: OpenAL %d buffers (%d non-silent samples); %d frames mixed (%.1f s), %d non-silent samples in the ring",
+			m.al.buffers, m.al.loudIn, written, float64(written)/alRate, loud)
+		if written == 0 || m.al.loudIn == 0 {
+			t.Error("no sound reached the window")
+		}
 	}
 }

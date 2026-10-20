@@ -82,3 +82,33 @@ func (m *Machine) Watch(re *regexp.Regexp, fn func(name string, c *cpu.CPU)) {
 		watch(img)
 	}
 }
+
+// Around calls before at every call of a function whose symbol matches re (in images loaded now
+// and later); the function before returns is called when that call returns (nil: none). For
+// tests and diagnostics: before sees the arguments, after the results.
+func (m *Machine) Around(re *regexp.Regexp, before func(name string, c *cpu.CPU) func(c *cpu.CPU)) {
+	type frame struct {
+		after    func(c *cpu.CPU)
+		ret, esp uint32
+	}
+	var frames []frame
+	retThunk := m.hostFunc("<around return>", func(c *cpu.CPU) {
+		esp := c.Regs[cpu.RegESP]
+		for i := len(frames) - 1; i >= 0; i-- {
+			if f := frames[i]; f.esp < esp {
+				frames = frames[:i]
+				f.after(c)
+				c.EIP = f.ret
+				return
+			}
+		}
+		c.Halted, c.HaltReason = true, "Around: lost a return address"
+	})
+	m.Watch(re, func(name string, c *cpu.CPU) {
+		if after := before(name, c); after != nil {
+			esp := c.Regs[cpu.RegESP]
+			frames = append(frames, frame{after, c.Read32(esp), esp})
+			c.Write32(esp, retThunk)
+		}
+	})
+}
