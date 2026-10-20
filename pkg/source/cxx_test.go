@@ -79,3 +79,27 @@ func TestDynamicCast(t *testing.T) {
 		t.Errorf("Entity -> Panel: %#x, want 0", got)
 	}
 }
+
+func TestSwscanf(t *testing.T) {
+	m, err := New("", nil, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := m.C
+	out := c.Malloc(64)
+	va := c.Malloc(16)
+	for i := uint32(0); i < 3; i++ {
+		c.Write32(va+4*i, out+4*i)
+	}
+	if n := m.scan(c, []rune("219,112,147"), []rune("%i,%i,%i"), va, true); n != 3 {
+		t.Fatalf("stored %d values, want 3", n)
+	}
+	if r, g, b := c.Read32(out), c.Read32(out+4), c.Read32(out+8); r != 219 || g != 112 || b != 147 {
+		t.Fatalf("got %d,%d,%d", r, g, b)
+	}
+	c.Write32(va, out)
+	c.Write32(va+4, out+8)
+	if n := m.scan(c, []rune(" 0x1F  2.5"), []rune("%x %lf"), va, true); n != 2 || c.Read32(out) != 0x1f || c.ReadF64(out+8) != 2.5 {
+		t.Fatalf("hex/double: n=%d %#x %v", n, c.Read32(out), c.ReadF64(out+8))
+	}
+}

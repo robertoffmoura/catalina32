@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"catalina32/pkg/cpu"
 	"catalina32/pkg/crt"
@@ -1058,8 +1059,145 @@ func (m *Machine) vswprintf(c *cpu.CPU) {
 }
 
 func (m *Machine) swscanf(c *cpu.CPU) {
-	m.logf("[libc] swscanf(%q, %q): not implemented", string(m.readW(c.Arg(0))), string(m.readW(c.Arg(1))))
-	ret(c, 0)
+	in, format := m.readW(c.Arg(0)), m.readW(c.Arg(1))
+	ret(c, uint32(m.scan(c, in, format, c.Regs[cpu.RegESP]+12, true)))
+}
+
+// scan is scanf over runes: whitespace, literals and %d %i %u %x %o %f %e %g %s %c %n %% (with
+// widths, '*' and the h/l/ll sizes); values go to the pointers in the guest varargs at va.
+// It returns the number of values stored.
+func (m *Machine) scan(c *cpu.CPU, in, f []rune, va uint32, wide bool) int {
+	pos, n := 0, 0
+	space := func() {
+		for pos < len(in) && unicode.IsSpace(in[pos]) {
+			pos++
+		}
+	}
+	for i := 0; i < len(f); i++ {
+		switch {
+		case unicode.IsSpace(f[i]):
+			space()
+			continue
+		case f[i] != '%':
+			if pos >= len(in) || in[pos] != f[i] {
+				return n
+			}
+			pos++
+			continue
+		}
+		i++
+		if i < len(f) && f[i] == '%' {
+			if pos >= len(in) || in[pos] != '%' {
+				return n
+			}
+			pos++
+			continue
+		}
+		skip := i < len(f) && f[i] == '*'
+		if skip {
+			i++
+		}
+		width := 0
+		for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+			width = width*10 + int(f[i]-'0')
+			i++
+		}
+		size := ""
+		for i < len(f) && strings.ContainsRune("hlLqjzt", f[i]) {
+			size += string(f[i])
+			i++
+		}
+		if i >= len(f) {
+			return n
+		}
+		conv := f[i]
+		if conv != 'c' && conv != 'n' {
+			space()
+		}
+		end := len(in)
+		if width > 0 && pos+width < end {
+			end = pos + width
+		}
+		dst := func() uint32 { a := c.Read32(va); va += 4; return a }
+		switch conv {
+		case 'd', 'i', 'u', 'x', 'X', 'o':
+			base := map[rune]int{'d': 10, 'u': 10, 'i': 0, 'x': 16, 'X': 16, 'o': 8}[conv]
+			v, used := parseIntPrefix(string(in[pos:end]), base)
+			if used == 0 {
+				return n
+			}
+			pos += len([]rune(string(in[pos:end])[:used]))
+			if !skip {
+				a := dst()
+				switch size {
+				case "hh":
+					c.Write8(a, uint8(v))
+				case "h":
+					c.Write16(a, uint16(v))
+				case "ll", "q", "j":
+					c.Write64(a, uint64(v))
+				default:
+					c.Write32(a, uint32(v))
+				}
+				n++
+			}
+		case 'f', 'e', 'g', 'E', 'G', 'a':
+			v, used := parseFloatPrefix(string(in[pos:end]))
+			if used == 0 {
+				return n
+			}
+			pos += len([]rune(string(in[pos:end])[:used]))
+			if !skip {
+				if a := dst(); size == "l" || size == "L" {
+					c.WriteF64(a, v)
+				} else {
+					c.WriteF32(a, float32(v))
+				}
+				n++
+			}
+		case 's', 'S':
+			start := pos
+			for pos < end && !unicode.IsSpace(in[pos]) {
+				pos++
+			}
+			if pos == start {
+				return n
+			}
+			if !skip {
+				a := dst()
+				if (wide && size != "h") || size == "l" || conv == 'S' {
+					m.writeW(a, in[start:pos], 0)
+				} else {
+					c.WriteCString(a, string(in[start:pos]))
+				}
+				n++
+			}
+		case 'c':
+			k := max(width, 1)
+			if pos+k > len(in) {
+				return n
+			}
+			if !skip {
+				a := dst()
+				for j := 0; j < k; j++ {
+					if (wide && size != "h") || size == "l" {
+						c.Write32(a+uint32(4*j), uint32(in[pos+j]))
+					} else {
+						c.Write8(a+uint32(j), uint8(in[pos+j]))
+					}
+				}
+				n++
+			}
+			pos += k
+		case 'n':
+			if !skip {
+				c.Write32(dst(), uint32(pos))
+			}
+		default:
+			return n
+		}
+	}
+	return n
 }
 
 // --- Maths ---
