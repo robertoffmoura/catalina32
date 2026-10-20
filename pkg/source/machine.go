@@ -59,34 +59,36 @@ type Machine struct {
 	cwd                      string
 	dlerr                    string
 
-	files     map[uint32]*gfile // FILE* -> open file
-	fds       map[int32]*gfile  // file descriptor -> open file
-	nextFD    int32
-	dirs      map[uint32]*gdir
-	threads   *sched
-	mutexes   map[uint32]*gmutex
-	conds     map[uint32]*gcond
-	tlsKeys   uint32
-	onces     map[uint32]bool
-	strtokAt  uint32
-	atexit    []uint32
-	cxx       cxxState
-	stopped   bool
-	skew      uint64    // microseconds the clock jumped while every thread slept
-	errno     uint32    // errno's address
-	glr       *glRemote // the OpenGL stream (C32_GL_SHM), nil without one
-	glOn      bool      // the viewer is drawing: GL calls go to the stream
-	Live      bool      // wall-clock time (a player is watching), else time from the instruction count
-	start     time.Time
-	input     inputState
-	pads      padInput
-	hostFonts fontRegistry
-	cfStrings map[uint32]string
-	sdl       sdlState
-	gl        nullGL
-	fonts     fontState
-	audio     audioState
-	al        openAL
+	files              map[uint32]*gfile // FILE* -> open file
+	fds                map[int32]*gfile  // file descriptor -> open file
+	nextFD             int32
+	dirs               map[uint32]*gdir
+	threads            *sched
+	mutexes            map[uint32]*gmutex
+	conds              map[uint32]*gcond
+	tlsKeys            uint32
+	onces              map[uint32]bool
+	strtokAt           uint32
+	atexit             []uint32
+	cxx                cxxState
+	stopped            bool
+	skew               uint64    // microseconds the clock jumped while every thread slept
+	errno              uint32    // errno's address
+	glr                *glRemote // the OpenGL stream (C32_GL_SHM), nil without one
+	glOn               bool      // the viewer is drawing: GL calls go to the stream
+	Live               bool      // wall-clock time (a player is watching), else time from the instruction count
+	start              time.Time
+	input              inputState
+	pads               padInput
+	hostFonts          fontRegistry
+	OnPoll             func(c *cpu.CPU) // tests: called when the game polls for events (to feed it input)
+	cfStrings          map[uint32]string
+	sdl                sdlState
+	gl                 nullGL
+	fonts              fontState
+	audio              audioState
+	al                 openAL
+	alBufferDataStatic uint32 // the extension alGetProcAddress hands out
 }
 
 // New links the game in dir (the folder holding hl2_osx). With dir "", it only sets up the

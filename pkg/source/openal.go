@@ -62,6 +62,8 @@ type openAL struct {
 	written  uint64 // frames mixed
 	start    uint64 // the clock (µs) when mixing started
 	started  bool
+	// Diagnostics: buffers received, and their samples that aren't silence.
+	buffers, loudIn int
 }
 
 func (m *Machine) registerOpenAL() {
@@ -79,6 +81,24 @@ func (m *Machine) registerOpenAL() {
 		}
 	}
 	src := func(c *cpu.CPU) *alSrc { return a.srcs[c.Arg(0)] }
+	// alBufferData and Apple's alBufferDataStatic (buffer, format, data, size, freq): the
+	// samples are copied either way.
+	bufferData := locked(func(c *cpu.CPU) {
+		b := a.bufs[c.Arg(0)]
+		if b == nil {
+			b = &alBuf{}
+			a.bufs[c.Arg(0)] = b
+		}
+		b.pcm, b.rate = toStereo16(c.Bytes(c.Arg(2), c.Arg(3)), c.Arg(1)), float64(max(c.Arg(4), 1))
+		a.buffers++
+		for _, v := range b.pcm {
+			if v > 64 || v < -64 {
+				a.loudIn++
+			}
+		}
+		c.Ret()
+	})
+	m.alBufferDataStatic = m.hostFunc("alBufferDataStatic", bufferData)
 	for k, v := range map[string]cpu.ThunkFunc{
 		// The engine's other sound device (AudioQueue) reports failure, so it uses OpenAL.
 		"_AudioQueueNewOutput":   retN(0xffffffce), // paramErr
@@ -99,9 +119,17 @@ func (m *Machine) registerOpenAL() {
 		},
 		"_alcIsExtensionPresent": ret0,
 		"_alIsExtensionPresent":  ret0,
-		"_alGetProcAddress":      ret0,
-		"_alGetError":            ret0,
-		"_alGetString":           func(c *cpu.CPU) { ret(c, m.glStr("1.1")) },
+		"_alGetProcAddress": func(c *cpu.CPU) { // extensions: Apple's alBufferDataStatic (the engine's buffers)
+			name := c.ReadCString(c.Arg(0))
+			if name == "alBufferDataStatic" {
+				ret(c, m.alBufferDataStatic)
+				return
+			}
+			m.C.ReportOnce("al:"+name, "[openal] extension %s: not available", name)
+			ret(c, 0)
+		},
+		"_alGetError":  ret0,
+		"_alGetString": func(c *cpu.CPU) { ret(c, m.glStr("1.1")) },
 		"_alGenSources": locked(func(c *cpu.CPU) {
 			for i := uint32(0); i < c.Arg(0); i++ {
 				h := id()
@@ -130,15 +158,7 @@ func (m *Machine) registerOpenAL() {
 			}
 			c.Ret()
 		}),
-		"_alBufferData": locked(func(c *cpu.CPU) { // (buffer, format, data, size, freq)
-			b := a.bufs[c.Arg(0)]
-			if b == nil {
-				b = &alBuf{}
-				a.bufs[c.Arg(0)] = b
-			}
-			b.pcm, b.rate = toStereo16(c.Bytes(c.Arg(2), c.Arg(3)), c.Arg(1)), float64(max(c.Arg(4), 1))
-			c.Ret()
-		}),
+		"_alBufferData": bufferData,
 		"_alSourceQueueBuffers": locked(func(c *cpu.CPU) { // (source, n, buffers)
 			if s := src(c); s != nil {
 				if s.static {

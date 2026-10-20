@@ -118,7 +118,19 @@ func (m *Machine) registerSDLShims() {
 			ret(c, 0)
 			m.sleepFor(uint64(ms) * 1000)
 		},
-		"_SDL_AddEventWatch": retVoid, "_SDL_DelEventWatch": retVoid,
+		"_SDL_AddEventWatch": func(c *cpu.CPU) {
+			m.input.watches = append(m.input.watches, [2]uint32{c.Arg(0), c.Arg(1)})
+			c.Ret()
+		},
+		"_SDL_DelEventWatch": func(c *cpu.CPU) {
+			for i, w := range m.input.watches {
+				if w == [2]uint32{c.Arg(0), c.Arg(1)} {
+					m.input.watches = append(m.input.watches[:i], m.input.watches[i+1:]...)
+					break
+				}
+			}
+			c.Ret()
+		},
 		"_SDL_ShowCursor": func(c *cpu.CPU) { // (toggle: 1 show, 0 hide, -1 query) -> the previous state
 			was := b2u(!m.input.hidden)
 			if t := int32(c.Arg(0)); t >= 0 {

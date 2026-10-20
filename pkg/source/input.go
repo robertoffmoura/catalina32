@@ -26,11 +26,14 @@ const (
 	evWheel
 	evText
 	evQuit
+	evFocusIn
+	evFocusOut
 )
 
 // SDL2 event types.
 const (
 	sdlQuit            = 0x100
+	sdlWindowEvent     = 0x200 // data: u8 event at 12 (shown 1, exposed 3, focus gained 12, lost 13)
 	sdlKeyDown         = 0x300
 	sdlKeyUp           = 0x301
 	sdlTextInput       = 0x303
@@ -88,10 +91,12 @@ func sdlMods(f uint32) uint32 {
 type inputState struct {
 	x, y     int32
 	buttons  uint32
-	relative bool   // SDL_SetRelativeMouseMode
-	hidden   bool   // SDL_ShowCursor(0)
-	captured bool   // the window holds the Mac's mouse (relative || hidden)
-	fb       []byte // the viewer's framebuffer shared memory (game state flags), nil without one
+	relative bool        // SDL_SetRelativeMouseMode
+	hidden   bool        // SDL_ShowCursor(0)
+	captured bool        // the window holds the Mac's mouse (relative || hidden)
+	started  bool        // the window's first events (shown, focus) were sent
+	watches  [][2]uint32 // SDL_AddEventWatch: filter, userdata
+	fb       []byte      // the viewer's framebuffer shared memory (game state flags), nil without one
 }
 
 // nextEvent takes the viewer's next event, or nil.
@@ -111,26 +116,61 @@ func (m *Machine) nextEvent() []byte {
 	return e
 }
 
-// pollEvent writes the next event as an SDL_Event at p; false when there is none.
+// pollEvent writes the next event as an SDL_Event at p; false when there is none. The game's
+// event watches (SDL_AddEventWatch: inputsystem reads controllers that way) see each event first.
 func (m *Machine) pollEvent(c *cpu.CPU, p uint32) bool {
+	if m.OnPoll != nil {
+		m.OnPoll(c)
+	}
+	if !m.input.started && m.glOn { // the window is on screen and active (the launcher only reads
+		m.input.started = true // mouse motion once it has been told its window has focus)
+		m.windowEvent(1)
+		m.windowEvent(12)
+	}
 	m.pollPads()
 	if p == 0 { // SDL_PollEvent(NULL): is there one?
 		return len(m.pads.pending) > 0 || m.glr != nil && m.glOn && atomic.LoadUint32(m.glr.word(128)) != atomic.LoadUint32(m.glr.word(132))
 	}
+	got := false
 	if q := m.pads.pending; len(q) > 0 {
 		copy(c.WBytes(p, sdlEventSize), q[0])
 		m.pads.pending = q[1:]
-		return true
+		got = true
 	}
-	for {
+	for !got {
 		e := m.nextEvent()
 		if e == nil {
 			return false
 		}
-		if m.sdlEvent(c, p, e) {
-			return true
-		}
+		got = m.sdlEvent(c, p, e)
 	}
+	m.watchEvent(c, p)
+	return true
+}
+
+// windowEvent queues an SDL_WINDOWEVENT (1 shown, 12 focus gained, 13 focus lost).
+func (m *Machine) windowEvent(kind byte) {
+	e := make([]byte, sdlEventSize)
+	binary.LittleEndian.PutUint32(e, sdlWindowEvent)
+	binary.LittleEndian.PutUint32(e[4:], uint32(m.micros()/1000))
+	binary.LittleEndian.PutUint32(e[8:], 1)
+	e[12] = kind
+	m.pads.pending = append(m.pads.pending, e)
+}
+
+// watchEvent calls the game's event watches (filter(userdata, event)) on the event at p.
+func (m *Machine) watchEvent(c *cpu.CPU, p uint32) {
+	if len(m.input.watches) == 0 {
+		return
+	}
+	tmp := c.Malloc(sdlEventSize) // a copy: the caller's event stays as it was
+	for _, w := range m.input.watches {
+		copy(c.WBytes(tmp, sdlEventSize), c.Bytes(p, sdlEventSize))
+		eax := c.Regs[cpu.RegEAX]
+		c.CallGuest(w[0], w[1], tmp)
+		c.Regs[cpu.RegEAX] = eax
+	}
+	c.Free(tmp)
 }
 
 func (m *Machine) sdlEvent(c *cpu.CPU, p uint32, e []byte) bool {
@@ -212,6 +252,11 @@ func (m *Machine) sdlEvent(c *cpu.CPU, p uint32, e []byte) bool {
 		put(20, uint32(dy))
 	case evQuit:
 		put(0, sdlQuit)
+	case evFocusIn, evFocusOut:
+		put(0, sdlWindowEvent)
+		if p != 0 {
+			c.Write8(p+12, map[uint32]byte{evFocusIn: 12, evFocusOut: 13}[typ])
+		}
 	default:
 		return false
 	}

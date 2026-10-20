@@ -648,7 +648,11 @@ static void c32SetMouseMode(int relative) {
     [super viewDidMoveToWindow];
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     for (NSString *n in @[ NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification ]) {
-        [nc addObserverForName:n object:[self window] queue:nil usingBlock:^(NSNotification *note) { applyMouseCapture(); }];
+        BOOL in = [n isEqualToString:NSWindowDidBecomeKeyNotification];
+        [nc addObserverForName:n object:[self window] queue:nil usingBlock:^(NSNotification *note) {
+            sendEvent(in ? evFocusIn : evFocusOut, 0, 0, 0, 0, 0, 0, 0, NULL); /* the launcher reads mouse motion only with focus */
+            applyMouseCapture();
+        }];
     }
 }
 - (void)updateTrackingAreas {
