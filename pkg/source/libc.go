@@ -1954,36 +1954,48 @@ type gdir struct {
 	ent   uint32
 }
 
-func (m *Machine) opendir(c *cpu.CPU) {
-	p := c.ReadCString(c.Arg(0))
+// listDir lists a guest directory: what the game wrote (the overlay) merged with the game's own
+// files, the overlay's first and winning on names that differ only in case (Mac file systems
+// ignore case). ok is false when neither is a directory.
+func (m *Machine) listDir(p string) (names []string, types []byte, ok bool) {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(m.cwd, p)
+	}
+	p = filepath.Clean(p)
+	game := foldCase(p)
+	if game == "" {
+		game = p
+	}
 	seen := map[string]bool{}
-	d := &gdir{}
-	for _, hp := range []string{filepath.Join(m.Overlay, filepath.Clean(filepath.Join(m.cwd, p))), m.hostPath(p, false)} {
-		ents, err := os.ReadDir(hp)
-		if err != nil {
+	for _, hp := range []string{filepath.Join(m.Overlay, p), game} {
+		if st, err := os.Stat(hp); err != nil || !st.IsDir() {
 			continue
 		}
+		ok = true
+		ents, _ := os.ReadDir(hp)
 		for _, e := range ents {
-			if !seen[e.Name()] {
-				seen[e.Name()] = true
-				d.names = append(d.names, e.Name())
+			if k := strings.ToLower(e.Name()); !seen[k] {
+				seen[k] = true
+				names = append(names, e.Name())
 				t := byte(8) // DT_REG
 				if e.IsDir() {
-					t = 4
+					t = 4 // DT_DIR
 				}
-				d.types = append(d.types, t)
+				types = append(types, t)
 			}
 		}
 	}
-	if len(seen) == 0 {
-		if _, err := os.Stat(m.hostPath(p, false)); err != nil {
-			m.setErrno(eNOENT)
-			ret(c, 0)
-			return
-		}
+	return names, types, ok
+}
+
+func (m *Machine) opendir(c *cpu.CPU) {
+	names, types, ok := m.listDir(c.ReadCString(c.Arg(0)))
+	if !ok {
+		m.setErrno(eNOENT)
+		ret(c, 0)
+		return
 	}
-	d.names = append([]string{".", ".."}, d.names...)
-	d.types = append([]byte{4, 4}, d.types...)
+	d := &gdir{names: append([]string{".", ".."}, names...), types: append([]byte{4, 4}, types...)}
 	h := c.Malloc(16)
 	d.ent = c.Malloc(8 + 256)
 	m.dirs[h] = d
@@ -2036,34 +2048,14 @@ var _ = binary.LittleEndian
 func (m *Machine) scandir(c *cpu.CPU) {
 	dir, out, sel, cmp := c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3)
 	c.Ret()
-	p := c.ReadCString(dir)
-	seen := map[string]byte{}
-	var names []string
-	for _, hp := range []string{filepath.Join(m.Overlay, filepath.Clean(filepath.Join(m.cwd, p))), m.hostPath(p, false)} {
-		ents, err := os.ReadDir(hp)
-		if err != nil {
-			continue
-		}
-		for _, e := range ents {
-			if _, ok := seen[e.Name()]; !ok {
-				t := byte(8)
-				if e.IsDir() {
-					t = 4
-				}
-				seen[e.Name()] = t
-				names = append(names, e.Name())
-			}
-		}
+	found, types, ok := m.listDir(c.ReadCString(dir))
+	if !ok {
+		m.setErrno(eNOENT)
+		c.Regs[cpu.RegEAX] = neg1()
+		return
 	}
-	if len(names) == 0 {
-		if st, err := os.Stat(m.hostPath(p, false)); err != nil || !st.IsDir() {
-			m.setErrno(eNOENT)
-			c.Regs[cpu.RegEAX] = neg1()
-			return
-		}
-	}
-	seen["."], seen[".."] = 4, 4
-	names = append([]string{".", ".."}, names...)
+	names := append([]string{".", ".."}, found...)
+	types = append([]byte{4, 4}, types...)
 	var ents []uint32
 	for i, n := range names {
 		e := c.Malloc(1048)
@@ -2071,7 +2063,7 @@ func (m *Machine) scandir(c *cpu.CPU) {
 		c.Write64(e, uint64(i+1))
 		c.Write16(e+16, 1048)
 		c.Write16(e+18, uint16(len(n)))
-		c.Write8(e+20, seen[n])
+		c.Write8(e+20, types[i])
 		c.WriteCString(e+21, n)
 		if sel != 0 {
 			if keep, _ := c.CallGuest(sel, e); keep == 0 {

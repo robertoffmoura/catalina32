@@ -156,7 +156,11 @@ func withWindow(t *testing.T, dir string, args ...string) (*Machine, func(end ui
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { log.Close() })
-	m, err := New(dir, append([]string{"-game", "portal"}, args...), filepath.Join(tmp, "overlay"), log)
+	overlay := filepath.Join(tmp, "overlay")
+	if p := os.Getenv("C32_OVERLAY"); p != "" { // a settings folder kept between runs
+		overlay = p
+	}
+	m, err := New(dir, append([]string{"-game", "portal"}, args...), overlay, log)
 	if err != nil {
 		t.Fatal(err)
 	}

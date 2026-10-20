@@ -112,3 +112,16 @@ func (m *Machine) Around(re *regexp.Regexp, before func(name string, c *cpu.CPU)
 		}
 	})
 }
+
+// symbolAddr returns the address of a symbol in the loaded images (0: none), for tests.
+func (m *Machine) symbolAddr(sym string) uint32 {
+	var at uint32
+	for _, img := range m.L.Images {
+		img.ForEachSymbol(func(name string, addr uint32) {
+			if at == 0 && name == sym {
+				at = addr
+			}
+		})
+	}
+	return at
+}
