@@ -1,7 +1,9 @@
 # catalina32: context for new sessions
 
-Read this first, then `PROGRESS.md` (status and open work). `docs/DEBUGGING.md` lists every
-switch and tool; `docs/LSWSAGA.md` holds what we know about the game itself.
+Read this first, then `PROGRESS.md` (status and open work). `docs/ARCHITECTURE.md` describes
+the product (Catalina32.app, game apps, the command line, saves) and its layers;
+`docs/DEBUGGING.md` lists every switch and tool; `docs/LSWSAGA.md` holds what we know about
+the game itself. `README.md` is for players.
 
 ## What this is
 

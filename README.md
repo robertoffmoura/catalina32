@@ -1,0 +1,73 @@
+# catalina32
+
+Play 32-bit Mac games on modern macOS.
+
+macOS Catalina (10.15) dropped 32-bit apps, and with them a whole library of Mac games that
+players still own. catalina32 runs those games' original code on today's Macs: it emulates
+the 32-bit x86 code, replaces the old system libraries underneath it, and draws with Metal.
+You need your own copy of each game; catalina32 never copies or changes it.
+
+> **Status: early.** One game is supported and plays well. The app described below is being
+> built; today the way to play is the developer setup at the end of this page.
+
+## Supported games
+
+| Game | Version | Status |
+|---|---|---|
+| LEGO Star Wars: The Complete Saga | Feral Interactive Mac port, Steam | Plays: menus, saves, controllers, sound; Episode I tested |
+
+Ports by Feral Interactive are the first target: they share one runtime layer, which
+catalina32 replaces, so each new Feral game should need little work.
+
+## Playing *(the app is in progress)*
+
+1. Download **Catalina32.app** and open it.
+2. It finds your games (Steam library, Applications folders) and shows which are supported.
+   A game somewhere else: **Choose game…**, or drop it on the window.
+3. **Create app** makes a game app, such as *LEGO Star Wars Saga.app*, with the game's icon.
+4. Open that app to play. Keep it in the Dock like any other.
+
+**Saves** stay where the original game kept them, so saves from before macOS Catalina load as
+they are; catalina32 backs them up before first use.
+
+**Controllers:** USB and Bluetooth controllers work, and can be connected at any time. The one
+that drives the menus is player 1; press a button on another to join as player 2.
+
+**Requirements:** macOS 10.15 or later. Tested on Intel Macs.
+
+## Performance
+
+Most of the game runs at 35–60 FPS on a recent Intel MacBook Pro; the busiest areas drop to
+20–30. The emulator is the limit there, and that's where work continues.
+
+## Troubleshooting
+
+- The game app says the game moved or changed: Steam updated it or the library moved.
+  Create the game app again from Catalina32.
+- Logs: `~/Library/Logs/catalina32/` *(planned)*. Please include them when reporting a problem.
+
+## FAQ
+
+- **Is this legal?** catalina32 is your own copy of the game running on a different
+  implementation of the old system libraries. It contains no game code or data.
+- **Does it change my game?** No. Game apps point to the installed game and never write to it.
+- **Affiliation:** not affiliated with Feral Interactive, LucasArts, Traveller's Tales or any
+  game publisher.
+
+## For developers
+
+- **Building and running:** `go build ./cmd/catalina32` builds the engine and command line;
+  the window app is `viewer/*.m` (clang, macOS frameworks). `run_on_mac.sh` (outside the
+  repository) is the current development loop: it builds both and starts a game.
+- **Tests:** `go test ./...`; with a game executable (`C32_BIN_PATH`), more tests run against
+  the game's own code.
+- **Documentation:**
+  - `docs/ARCHITECTURE.md`: the product and its layers;
+  - `CONTEXT.md`: the engine, conventions, where things are;
+  - `docs/DEBUGGING.md`: every switch, recipe and tool;
+  - `docs/LSWSAGA.md`: what we know about the first game;
+  - `PROGRESS.md`: status and open work.
+- **Adding a game:** a profile in `pkg/games/<id>` (checksum, folders, save location) and,
+  until the Feral family layer lands, its table of runtime-layer addresses. Native
+  replacements of hot functions bind by signature (`cmd/sigmake`), so they reach every game
+  with the same code.
