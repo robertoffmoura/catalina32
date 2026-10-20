@@ -63,11 +63,11 @@ for a in "${ARCHS[@]}"; do
 
   echo "[build-app] window app ($a)"
   flags=(-arch "$a" -mmacosx-version-min=10.15 -O2 -I viewer)
-  for f in C32Metal C32Launch C32Wizard; do
+  for f in C32Metal C32GL C32Launch C32Wizard; do
     clang "${flags[@]}" -fobjc-arc -c "viewer/$f.m" -o "$WORK/$f-$a.o"
   done
-  clang "${flags[@]}" -ObjC -fno-objc-arc viewer/C32Window.m "$WORK"/C32Metal-$a.o "$WORK"/C32Launch-$a.o "$WORK"/C32Wizard-$a.o \
-    -o "$WORK/window-$a" -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework IOKit
+  clang "${flags[@]}" -ObjC -fno-objc-arc viewer/C32Window.m "$WORK"/C32Metal-$a.o "$WORK"/C32GL-$a.o "$WORK"/C32Launch-$a.o "$WORK"/C32Wizard-$a.o \
+    -o "$WORK/window-$a" -framework Cocoa -framework QuartzCore -framework Metal -framework OpenGL -framework AudioToolbox -framework IOKit
   WINDOWS+=("$WORK/window-$a")
 done
 lipo -create "${ENGINES[@]}" -output "$APP/Contents/Helpers/catalina32"

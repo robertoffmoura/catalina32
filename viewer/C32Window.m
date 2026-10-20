@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 #import "C32Metal.h"
 #import "C32App.h"
+#import "C32GL.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <IOKit/hid/IOHIDLib.h>
 #import <IOKit/hid/IOHIDKeys.h>
@@ -414,6 +415,8 @@ static int macKeyCodeToDIK(unsigned short kc) {
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate> {
     C32MetalView *_metalView;
     C32MetalRenderer *_renderer;
+    NSView *_glView;          /* Source games: the OpenGL stream's view (C32_GL_SHM; nil otherwise) */
+    C32GLRenderer *_glRenderer;
     NSWindow *_window;
     C32View *_fbView;
     NSTextField *_hudLabel; /* viewer mode with C32_HUD=1: frame, FPS, draw counts (nil otherwise) */
@@ -560,7 +563,8 @@ static int macKeyCodeToDIK(unsigned short kc) {
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
     [_window center];
-    [_window setTitle:player ? [_game title] : @"catalina32 viewer"];
+    const char *titleEnv = getenv("C32_TITLE");
+    [_window setTitle:player ? [_game title] : titleEnv ? [NSString stringWithUTF8String:titleEnv] : @"catalina32 viewer"];
     [_window setBackgroundColor:[NSColor colorWithCalibratedRed:0.06 green:0.08 blue:0.11 alpha:1.0]];
     [_window setDelegate:self];
 
@@ -590,8 +594,17 @@ static int macKeyCodeToDIK(unsigned short kc) {
 
     /* GPU renderer: the emulator writes Metal command frames to gpu.shm next to the framebuffer
        (C32_GPU_SHM); C32_RENDERER=software keeps the software path. */
+    /* OpenGL renderer (Valve Source games, C32_GL_SHM). Looked up by name: builds without
+       C32GL.m (LEGO Star Wars only) still link. */
     const char *rend = getenv("C32_RENDERER");
-    if (!(rend && strcmp(rend, "software") == 0) && MTLCreateSystemDefaultDevice()) {
+    const char *glPath = getenv("C32_GL_SHM");
+    Class glViewClass = NSClassFromString(@"C32GLView"), glRendererClass = NSClassFromString(@"C32GLRenderer");
+    if (glPath && glViewClass && glRendererClass) {
+        _glView = [[glViewClass alloc] initWithFrame:[_fbView frame]];
+        [_glView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [content addSubview:_glView positioned:NSWindowAbove relativeTo:_fbView];
+        _glRenderer = [[glRendererClass alloc] initWithPath:[NSString stringWithUTF8String:glPath] view:(C32GLView *)_glView];
+    } else if (!(rend && strcmp(rend, "software") == 0) && MTLCreateSystemDefaultDevice()) {
         _metalView = [[C32MetalView alloc] initWithFrame:[_fbView frame]];
         [_metalView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [_metalView setHidden:YES];
@@ -605,7 +618,8 @@ static int macKeyCodeToDIK(unsigned short kc) {
     }
 
     [_window makeKeyAndOrderFront:nil];
-    [_window makeFirstResponder:_fbView];
+    [_window makeFirstResponder:_glView ? _glView : _fbView];
+    [_glRenderer start];
     [NSApp activateIgnoringOtherApps:YES];
 
     AudioStreamBasicDescription fmt = {0};
@@ -643,6 +657,7 @@ static int macKeyCodeToDIK(unsigned short kc) {
 - (void)applicationWillTerminate:(NSNotification *)notification {
     _quitting = YES;
     [_renderer stop]; /* tells the emulator to stop sending GPU frames */
+    [_glRenderer stop];
     if ([[_game engine] isRunning]) [[_game engine] terminate];
 }
 @end
