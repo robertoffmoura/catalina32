@@ -32,18 +32,18 @@ explain each change); keep this file to what is true now.
    functions and takes about 37% of the host time. The AOT compiler can't fix this for users
    (see Speed in the backlog); the generic answer is a JIT.
 
-## The app (branch `app`, untested on a Mac)
+## The app
 
-Catalina32.app and game apps, as designed in `docs/ARCHITECTURE.md`:
-- `pkg/gamelib` (identify, scan, wrap, manifest, saves, backups) and the `catalina32 list`,
-  `info`, `wrap`, `run` commands: tested here, including on the user's copy of the game.
-- The window app's game mode and the wizard (`viewer/C32Launch.m`, `C32Wizard.m`): checked
-  with clang against stub headers only.
-- `scripts/build-app.sh`: needs a Mac; the engine cross-compiles here.
-- Not done:
-  - an app icon for Catalina32 itself;
-  - the Feral family layer (MacDoze entry points by signature): needs a second 32-bit Feral
-    game to check the signatures against.
+Catalina32.app and game apps (`docs/ARCHITECTURE.md`) work on the user's Mac: the wizard, game
+apps, saves in the original game's folder, quitting, the pointer in full screen. **Release 0.1.0
+is published** (`scripts/make_release.sh`; GitHub pre-release, universal, without AOT code).
+- **Decided:** no Apple Developer ID or notarisation; the README and release notes explain the
+  one-time Gatekeeper step instead.
+- **Later:** an icon for Catalina32 itself.
+- **Speed:** release builds have no AOT code, so heavy scenes are choppier than with
+  `run_on_mac.sh`; the JIT (backlog) is the answer for players.
+- **Next game: Portal and Portal 2** (Valve's own Mac ports: not Feral, so no MacDoze; needs a
+  feasibility study first). The Feral family layer waits for a second Feral game.
 
 ## Backlog
 
