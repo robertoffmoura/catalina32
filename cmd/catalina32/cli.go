@@ -25,6 +25,8 @@ func usage() {
   catalina32 run <Game.app>                      play a game without making a game app
   catalina32 run --manifest <game.json> --no-window
                                                  the engine for a game app's window
+  catalina32 source [--window app] <folder> [game options]
+                                                 a Valve Source game (Portal...; experimental)
   catalina32 -game <executable>                  the engine alone (development; C32_* variables)
 `)
 }
@@ -40,6 +42,8 @@ func runCommand(name string, args []string) int {
 		return cmdWrap(args)
 	case "run":
 		return cmdRun(args)
+	case "source":
+		return cmdSource(args)
 	case "version":
 		fmt.Println(version)
 		return 0
