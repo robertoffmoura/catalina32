@@ -524,13 +524,11 @@ func (c *CPU) Step() {
 	// Check if current EIP is intercepted by a host thunk or lifted function
 	if fn := c.interceptAt(c.EIP); fn != nil {
 		c.Steps++
+		c.HostCalls++
 		fn(c)
 		return
 	}
 
-	if c.SlowOps != nil && c.EIP < ArenaSize-4 {
-		c.SlowOps[uint32(c.Mem[c.EIP])<<16|uint32(c.Mem[c.EIP+1])<<8|uint32(c.Mem[c.EIP+2])]++
-	}
 	if c.EIP >= c.CodeLo && c.EIP < c.CodeHi {
 		d := &c.dcache[c.EIP&dcacheMask]
 		if d.tag != c.EIP {
@@ -572,6 +570,10 @@ func (c *CPU) StepRaw() {
 
 func (c *CPU) stepFull() {
 	startEIP := c.EIP
+	c.FullDecodes++
+	if c.SlowOps != nil && c.EIP < ArenaSize-4 {
+		c.SlowOps[uint32(c.Mem[c.EIP])<<16|uint32(c.Mem[c.EIP+1])<<8|uint32(c.Mem[c.EIP+2])]++
+	}
 	if startEIP > ArenaSize-maxInstLen {
 		c.Halted = true
 		c.HaltReason = fmt.Sprintf("instruction fetch outside guest memory at EIP=0x%08x", startEIP)

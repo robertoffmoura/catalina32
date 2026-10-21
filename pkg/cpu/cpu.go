@@ -99,6 +99,8 @@ type CPU struct {
 	// Execution telemetry & debugging
 	Steps         uint64
 	MaxSteps      uint64
+	HostCalls     uint64 // calls of host functions (intercepts): diagnostics
+	FullDecodes   uint64 // instructions run by the full decoder (stepFull: forms not cached, so not translated): diagnostics
 	Halted        bool
 	HaltReason    string
 	Exited        bool   // the game ended the process itself (ExitProcess): Halted, and not an error
@@ -149,7 +151,7 @@ type CPU struct {
 	jit    jitState
 	jitc   *jitCode
 	jitGen uint32 // bumped when translations are discarded (dBlock.jitGen must match)
-	// Diagnostics: when non-nil, counts instructions Step decodes in full, by their first three
+	// Diagnostics: when non-nil, counts instructions stepFull decodes, by their first three
 	// bytes (forms worth adding to the decoded-instruction cache).
 	SlowOps map[uint32]uint64
 	// Tests: more pages whose stores translated code hands to the interpreter.

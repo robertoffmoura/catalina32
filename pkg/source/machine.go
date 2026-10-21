@@ -83,6 +83,7 @@ type Machine struct {
 	pads               padInput
 	hostFonts          fontRegistry
 	OnPoll             func(c *cpu.CPU) // tests: called when the game polls for events (to feed it input)
+	OnFrame            func(c *cpu.CPU) // diagnostics: called when the game presents a frame
 	cfStrings          map[uint32]string
 	cfData             map[uint32][]byte            // CFData objects -> their bytes
 	folded             map[string]string            // fold's cache (libc.go)

@@ -88,6 +88,7 @@ type glRemote struct {
 	unpack   [8]int32        // GL_UNPACK_ row length, skip rows, skip pixels, alignment, image height, skip images
 	token    uint32
 	frames   uint64
+	sent     uint64            // commands sent (diagnostics)
 	strings  map[uint32]uint32 // glGetString results, in guest memory
 	logged   map[string]bool
 	gone     bool
@@ -195,6 +196,7 @@ func (g *glRemote) null() { g.u32(0xFFFFFFFF) }
 
 // send writes the command in scratch with id into the ring and publishes it.
 func (g *glRemote) send(id int) {
+	g.sent++
 	if g.gone {
 		return
 	}

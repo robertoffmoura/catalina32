@@ -215,6 +215,8 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_FONT_PNG`, `C32_MP3_OUT` | write a font sample (`HostFontSample`); the menu music's decoded PCM (`TestMenuSound`) |
 | `C32_LIVE` | `1`: wall clock (set by `catalina32 source`) |
 | `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters, per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
+| `C32_FRAMESTATS` | `TestBoot`: a CSV line per frame: instructions, those the full decoder ran, host milliseconds, host calls, GL commands and KB, JIT slow and end exits |
+| `C32_CPUPROF`, `C32_CPUPROF_AFTER` | `TestBoot`: the host's CPU profile, from that instruction count on (e.g. after loading) |
 | `GLREPLAY_CLIP`, `GLREPLAY_SCREEN` | `tools/glreplay`: `position` imitates AMD's clipping (and reports an AMD GPU); the screen size the game sees |
 
 **Tests**

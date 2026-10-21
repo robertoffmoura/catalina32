@@ -92,6 +92,9 @@ func (m *Machine) registerSDLShims() {
 			if m.sdl.frames <= 5 || m.sdl.frames%100 == 0 {
 				m.logf("[sdl] frame %d presented at instruction %d", m.sdl.frames, c.Steps)
 			}
+			if m.OnFrame != nil {
+				m.OnFrame(c)
+			}
 			c.Ret()
 		},
 		"_SDL_GL_GetProcAddress": func(c *cpu.CPU) {

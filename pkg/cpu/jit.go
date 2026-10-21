@@ -407,6 +407,7 @@ func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
 		}
 		if fn := c.interceptAt(eip); fn != nil {
 			c.Steps++
+			c.HostCalls++
 			fn(c)
 			*limit = c.nextEventStep() // what RunUntil would use next
 			continue

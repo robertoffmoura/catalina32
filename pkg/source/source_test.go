@@ -5,10 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"catalina32/pkg/cpu"
 )
@@ -94,8 +96,58 @@ func TestBoot(t *testing.T) {
 				top = append(top, kv{op, n})
 			}
 			sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
-			for i := 0; i < len(top) && i < 40; i++ {
+			for i := 0; i < len(top) && i < 100; i++ {
 				t.Logf("  slow op %06x: %d", top[i].op, top[i].n)
+			}
+		}()
+	}
+	if p := os.Getenv("C32_FRAMESTATS"); p != "" { // a CSV line per frame: what it took
+		f, err := os.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,host_calls,gl_commands,gl_kb,jit_slow,jit_end")
+		var last struct {
+			steps, full, calls, cmds, bytes, slow, end uint64
+			at                                         time.Time
+		}
+		last.at = time.Now()
+		frame := 0
+		m.OnFrame = func(c *cpu.CPU) {
+			frame++
+			now, st := time.Now(), c.JITStats()
+			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%d,%d,%.1f,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
+				float64(now.Sub(last.at).Microseconds())/1000, c.HostCalls-last.calls, m.glr.sent-last.cmds,
+				float64(m.glr.w-last.bytes)/1024, st.SlowExits-last.slow, st.EndExits-last.end)
+			last.steps, last.full, last.calls, last.cmds, last.bytes, last.slow, last.end, last.at = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, st.SlowExits, st.EndExits, now
+		}
+	}
+	if p := os.Getenv("C32_CPUPROF"); p != "" { // the host's CPU profile from instruction C32_CPUPROF_AFTER on
+		after, _ := strconv.ParseUint(os.Getenv("C32_CPUPROF_AFTER"), 10, 64)
+		f, err := os.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		started := false
+		start := func() {
+			if !started && m.C.Steps >= after {
+				started = true
+				if err := pprof.StartCPUProfile(f); err != nil {
+					t.Fatal(err)
+				}
+				t.Logf("CPU profile from instruction %d", m.C.Steps)
+			}
+		}
+		if prev := m.OnFrame; prev != nil {
+			m.OnFrame = func(c *cpu.CPU) { prev(c); start() }
+		} else {
+			m.OnFrame = func(c *cpu.CPU) { start() }
+		}
+		defer func() {
+			if started {
+				pprof.StopCPUProfile()
 			}
 		}()
 	}
