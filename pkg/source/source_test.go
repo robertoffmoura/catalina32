@@ -273,6 +273,9 @@ func TestBoot(t *testing.T) {
 	t.Logf("backtrace:\n  %s", strings.Join(m.Backtrace(16), "\n  "))
 	t.Logf("%d images, %d initialisers run, %d threads, %d frames presented, heap %d MB in use (peak %d MB), log in %s",
 		len(m.L.Images), m.initsRun, len(m.threads.threads), m.sdl.frames, m.C.HeapInUse()>>20, m.C.HeapPeak()>>20, logPath)
+	if m.sndDSP != nil {
+		t.Logf("sound effects in Go: %s", m.sndDSP.report())
+	}
 	if os.Getenv("C32_GLSTATS") != "" {
 		type kv struct {
 			k string

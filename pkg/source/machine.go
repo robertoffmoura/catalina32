@@ -94,7 +94,8 @@ type Machine struct {
 	fonts              fontState
 	audio              audioState
 	al                 openAL
-	alBufferDataStatic uint32 // the extension alGetProcAddress hands out
+	alBufferDataStatic uint32  // the extension alGetProcAddress hands out
+	sndDSP             *sndDSP // the sound effects in Go (snddsp.go), nil when not bound
 }
 
 // New links the game in dir (the folder holding hl2_osx). With dir "", it only sets up the
@@ -169,6 +170,7 @@ func (m *Machine) mapped(img *dyld.Image) {
 	lo, hi := img.Span()
 	m.logf("[dyld] %s at %#08x-%#08x", img.Name(), lo+img.Slide, hi+img.Slide)
 	m.applyPatches(img)
+	m.bindSndDSP(img)
 }
 
 // setupProcess builds the initial stack (argc, argv, envp, apple) and the ProgramVars.
