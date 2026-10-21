@@ -112,6 +112,8 @@ LZHUF_TEST_DIR=<C32_DUMP_LZHUF dir> C32_BIN_PATH=... go test ./pkg/crt -run LZHU
     and the compiled code.
   - `TestLiftedMatchGuest`: lifted functions against the game's own code.
   - `TestWideMatchesScalar`: the batched pixel-shader evaluator against the scalar one.
+  - `TestJITMatchesInterpreter` (`pkg/cpu`): random programs, interpreter against JIT; the
+    arm64 backend runs it under QEMU (`docs/JIT.md`, Testing).
 
 ## Profiling
 
@@ -167,6 +169,8 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_PORT` | HTTP preview port (browser viewer); `0` picks a free one |
 | `C32_NO_AOT` | `1`: don't install the AOT-compiled functions |
 | `C32_NO_DCACHE` | `1`: disable the decoded-instruction cache |
+| `C32_NO_JIT` | `1`: no JIT (interpreter and block cache only) |
+| `C32_JIT` | `1`: the JIT where it is opt-in (Apple Silicon, until verified there) |
 | `C32_NO_NATIVE_LZHUF` | `1`: decompress level data with the game's own (emulated) decoder |
 
 **Diagnostics**
@@ -178,7 +182,8 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_DUMP_LZHUF` | save every compressed block the game decompresses (`NNNNN_<size>.lh5`) |
 | `C32_CPUPROF`, `C32_CPUPROF_AFTER`, `C32_CPUPROF_FRAMES` | host CPU profile |
 | `C32_GUEST_PROF`, `C32_PROF_TOP` | guest call-stack sampling |
-| `C32_TRACE_CALLS` | track guest calls (slow) |
+| `C32_TRACE_CALLS` | track guest calls (slow; switches the JIT off) |
+| `C32_JITPROF` | `1`: count runs of translated blocks (what their code costs: see `docs/JIT.md`) |
 | `C32_WATCH` | `lo-hi`: log the first access to a guest address range from each instruction |
 | `C32_VERIFY_MDCT` | run the native MDCT and the game's side by side and compare |
 
@@ -209,6 +214,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_PROBE`, `C32_WATCH_NULL`, `C32_TRACECALLS` | log calls and returns of matching guest functions; catch NULL-pointer stores; keep a call stack for backtraces |
 | `C32_FONT_PNG`, `C32_MP3_OUT` | write a font sample (`HostFontSample`); the menu music's decoded PCM (`TestMenuSound`) |
 | `C32_LIVE` | `1`: wall clock (set by `catalina32 source`) |
+| `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters, per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
 | `GLREPLAY_CLIP`, `GLREPLAY_SCREEN` | `tools/glreplay`: `position` imitates AMD's clipping (and reports an AMD GPU); the screen size the game sees |
 
 **Tests**
@@ -217,4 +223,5 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 |---|---|
 | `HLSL_TEST_DIR` | a `C32_DUMP_SHADERS` directory for the HLSL tests |
 | `LZHUF_TEST_DIR` | a `C32_DUMP_LZHUF` directory for `TestLZHUFMatchesGuest` |
+| `C32_JITN`, `C32_JITSEED` | `TestJITMatchesInterpreter`: how many random programs; `TestJITBisect`: the seed whose first difference to find |
 | `C32_BIN_PATH` | enables tests that read shaders or code from the game executable |

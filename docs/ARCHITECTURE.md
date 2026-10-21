@@ -27,7 +27,7 @@ Host         window · Metal renderer · OpenGL renderer · keyboard, mouse,    
              controllers · audio
                          │  shared memory: framebuffer, GPU command stream or OpenGL stream,
                          │  input, PCM audio
-Engine       x86 CPU (interpreter + block cache; JIT planned) · Mach-O loader and   (Go)
+Engine       x86 CPU (interpreter, block cache, JIT) · Mach-O loader and            (Go)
              dynamic linker · Feral games: MacDoze (Win32) and IndirectX (D3D9,
              DirectInput, DirectSound) shims, shader translation · Valve's Source
              games: the system libraries (C library, pthreads, C++ runtime, SDL2,

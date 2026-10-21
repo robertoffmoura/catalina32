@@ -1,146 +1,235 @@
-# JIT: design for a future session
+# The JIT
 
-Status: **not started**. This is the design agreed with the user, written so a future session
-can implement it. Read `CONTEXT.md` (the CPU tiers) and `docs/ARCHITECTURE.md` (what "generic"
-means here) first.
+Status (October 2026, branch `jit`): **phases 1–4 done.**
+
+- **x86-64 backend:** Intel Macs and Linux. On by default.
+- **arm64 backend:** tested under QEMU user-mode on Linux only. On Apple Silicon it is
+  **off unless `C32_JIT=1`** until someone verifies it on Apple hardware (the platform glue
+  there, `MAP_JIT` and write protection, can't be tested here).
+
+Read `CONTEXT.md` (the CPU tiers) and `docs/ARCHITECTURE.md` (what "generic" means here) first.
 
 ## Why
 
-Players run Catalina32.app, which never contains the AOT code (it is a translation of the
-game's code, compiled on the developer's machine, and can't be distributed). So in the product
-every game instruction runs on the interpreter and its decoded-block cache. Measured on LEGO Star
-Wars: in heavy scenes the interpreter takes most of the host time even though AOT functions run
-83% of the instructions; without AOT it is the whole cost. The user notices it as choppiness in
-release builds. Interpreter tweaks have run out (the dispatch loop is near what plain Go
-allows; precomputed addresses and batched step counts measured as noise).
+Players run Catalina32.app, which never contains AOT code. AOT code is a translation of the
+game's code, compiled on the developer's machine, and can't be distributed. So in the product
+every game instruction ran on the interpreter and its decoded-block cache: choppy heavy scenes
+in LEGO Star Wars, a few frames per second in Portal.
 
 A JIT translates hot guest code into host machine code at run time, on the player's machine,
 from their own copy. It is fully generic: it works on x86 instructions, needs no profiles,
 signatures or per-game data, and distributes nothing derived from any game.
 
-## Where it fits (read these first)
+## Results
 
-- `pkg/cpu/exec.go`: `RunUntil` (the run loop), `nextEventStep` (when step limit, preemption or
-  the profiler need a check), `runCached` (runs cached blocks until then), `Step` (one
-  instruction, including intercepts), `stepFull` (the full decoder).
-- `pkg/cpu/dcache.go`: the decoded-instruction cache (`dInst`, about 60 `d*` kinds including
-  fused compare+branch), blocks (`dBlock`, up to `blockMax` instructions, ending at control
-  transfers), `buildBlock`, `execBlock`, `FlushCodeCache`, `noteCodeWrite` (writes into the code
-  range flush the cache: self-modifying code and patches).
-- `pkg/cpu/cpu.go`: guest memory (`Mem`, `ArenaSize`), the inlined access fast paths
-  (`readLimit`, `writeSpan`: in bounds, above code for stores, not watched), flags
-  (`UpdateFlags*`, `EvalCond`), x87 helpers (`FPUPush` ...).
-- Intercepts: `RegisterIntercept`, the `icept` bitmap; a block never contains an intercepted
-  address. Thunks (Go functions) run at block boundaries only.
-- `cmd/c32aot` and `pkg/games/*/aot_gen.go`: the AOT translator. Its handling of instruction
-  forms, flags and fallbacks (`StepRaw` for untranslated instructions) is the closest existing
-  model for a translator, and its tests (random snippets, interpreter vs compiled) are the
-  model for the JIT's.
-- Determinism: headless runs are exactly reproducible; the clock is derived from `Steps`
-  (instruction count) and green-thread preemption happens at step counts (`Preempt`,
-  `nextPreempt`). The JIT must count exactly as the interpreter does.
+Measured on the Linux dev container, x86-64 backend, against the interpreter with
+`C32_NO_JIT=1`.
 
-## Design
+| Run | Interpreter | JIT | Same result |
+|---|---|---|---|
+| LEGO, `gpuroute.sh` `episode1`, 1.1 billion instructions, GPU path, no AOT | 17.0 s | 6.5–7.8 s | identical `Steps=` lines and final state |
+| Portal `TestBoot`, 12 billion instructions | 182 s | ~50 s | byte-identical OpenGL stream (`C32_GLTRACE`) |
+| Portal gameplay | ~75M instructions/s | ~280M instructions/s | |
 
-### Translation unit and lifecycle
+**What is left in Portal:** Go round trips for calls to host functions, about 14 million a
+second in gameplay (the C library, SDL, OpenAL ... are Go). Each one leaves translated code and
+enters it again.
 
-1. **Hot blocks.** Count executions per block in `runCached` (or per block start address); at a
-   threshold (start around 50–200) translate the block. Cold code stays interpreted.
-2. **Block = the same block `buildBlock` makes** (same boundaries: control transfers,
-   intercepts, uncached forms, `blockMax`). Same step count (`b.steps`), so determinism holds
-   trivially. Later: superblocks / traces across unconditional jumps.
-3. **Entry check.** `runCached` already refuses a block that would cross the next event
-   (`b.steps > limit-c.Steps`); keep that: a translated block runs whole or not at all.
-4. **Exit.** Translated code returns to the dispatcher with the next EIP in the CPU struct and
-   an exit reason (normal, needs-slow-memory-path, unsupported-instruction-at, halted).
-5. **Chaining (phase 2).** A block exit to a known, translated, non-intercepted target jumps
-   straight to it (patched jump), with the step budget checked at block entry (a counter in a
-   register, compared against `limit`).
-6. **Invalidation.** `FlushCodeCache` (and `noteCodeWrite`) must drop translated blocks too
-   (unlink chains, free or recycle the code buffer). Intercepts installed later
-   (`RegisterIntercept`) also flush, as they do for the dcache.
-7. **Fallback.** An instruction the translator doesn't handle ends the block before it; the
-   interpreter executes it, exactly as `runCached` stops at `dSlow` today.
+**arm64:** QEMU emulates the host, so speed there says little about real hardware. The
+arm64 backend's numbers are in "Testing".
 
-### Generated code conventions (x86-64 host)
+## How it works
 
-- **Guest registers in host registers** for the duration of a block: 8 guest GPRs map to 8 host
-  registers (e.g. r8–r15); loaded at entry, stored at exit (phase 2: keep them across chained
-  blocks). One host register holds the guest memory base (`&Mem[0]`), one the CPU struct.
-- **Memory access** = `base + guest address` with the same guarantees as the interpreter's fast
-  paths: loads need `addr < readLimit`, stores `addr-CodeHi < writeSpan` (above code, in
-  bounds, not watched); anything else exits to the slow path (the interpreter re-executes that
-  instruction: so translate per instruction with an exit point before each memory access that
-  can fail, or make the slow path a helper exit that resumes after it). Generated code must
-  never fault.
-- **Flags.** On an x86-64 host, x86-32 arithmetic sets the host flags identically: compute them
-  natively and store EFLAGS at exit only when a later block can read them; within a block, skip
-  flag materialisation for flags that are overwritten before being read (liveness over the
-  block). Watch the quirks the interpreter already encodes: INC/DEC preserve CF, shifts by 0
-  leave flags alone, partial-register writes (AH etc.).
-- **No host stack use** in generated code (no calls, no pushes beyond a fixed scratch area in
-  the CPU struct). Anything needing Go (x87, rare SSE, helpers) is an exit, not a call.
-- **x87/SSE.** Start with fallback; then translate the scalar SSE forms the dcache already
-  caches (`movss`, `addss`, `mulss`, `ucomiss`...) natively. x87 stays in the interpreter (its
-  semantics there are float64-based; the JIT must match the interpreter, not real x87).
+Generic part: `pkg/cpu/jit.go` and `jit_flags.go`. The two backends: `jit_amd64.go` (encoder
+`x64asm.go`) and `jit_arm64.go` (encoder `a64asm.go`).
 
-### Running generated code from Go
+### Lifecycle
 
-- **Executable memory:** `mmap` a code buffer.
-  - Intel Macs and Linux: read-write-execute memory is allowed for an app without the hardened
-    runtime (Catalina32 is signed ad hoc, not notarised, so it has none).
-  - Apple Silicon: memory is never writable and executable at once. Use `MAP_JIT` and toggle
-    with `pthread_jit_write_protect_np` per thread, then `sys_icache_invalidate`. Works without
-    entitlements while the app isn't notarised (with the hardened runtime it needs
-    `com.apple.security.cs.allow-jit`).
-- **Calling it:** a small Go assembly trampoline (`.s` file) that loads the pinned registers
-  and jumps in; generated code returns to it. Because generated code uses no stack and never
-  calls back, it can run on the goroutine's stack. Async preemption signals (SIGURG) landing in
-  generated code are harmless (Go sees a non-Go PC and skips preemption), as is SIGPROF.
-- **Alternative** (the backlog's long-standing idea): the CPU core in Rust or C behind the same
-  interface, via cgo. Makes stack/signal questions simpler, cross-compilation harder (the app
-  is built per architecture on a Mac with clang anyway). Prefer pure Go + assembly first.
-- **Switch:** `C32_NO_JIT=1` disables it (A/B tests, and a way out for players).
+- **What is translated.** `runCached` counts runs of each decoded block (`dBlock.hits`). At
+  `jitThreshold` (32) it translates the block, the same block `buildBlock` made: same
+  boundaries, same step count. A block whose first instruction can't be translated is
+  remembered (`failed`) and stays interpreted.
+- **Running.** `jitRun` enters translated code through `jitCall`, an assembly trampoline that
+  calls the backend's prologue. The prologue loads the guest registers into host registers and
+  jumps to the block.
+- **The step limit.** Each block charges its steps at its head against `jitState.budget`. If
+  the block wouldn't fit before the limit, it exits without running. The limit is the next
+  event: preemption, the step limit, or at most `jitSlice` (4M) steps. So Steps advance
+  exactly as in the interpreter, and green-thread switches happen at the same instruction.
+- **Chaining.**
+  - A direct jump or call to a translated block jumps straight to it.
+  - A direct jump to a block not translated yet goes through a patchable jump. It is patched
+    when the target is translated (`pending`).
+  - Indirect jumps, calls and returns look the target up in a hashed table (2^18 entries;
+    translated code computes the same Fibonacci hash).
+- **Exits.**
+  - `End`: the target isn't translated. `jitNext` runs host functions (intercepts) in place
+    and enters translated code again if it can.
+  - `Slow`: an instruction needs the interpreter. Go runs that one instruction with
+    `execBlock`, then translated code resumes at the next one. If that instruction flushed
+    the code cache, the interpreter finishes the block, as `execBlock` would with its stale
+    copy.
+  - `Limit`: the next block wouldn't fit before the limit.
+- **Invalidation.**
+  - `FlushCodeCache` (self-modifying code, patches, intercepts registered later) discards all
+    translated code (`jitReset`).
+  - A full code buffer (64 MB) does the same.
+  - `SetCodeRange` and `MarkTextPages` mark the store table stale.
+- **Off** with `C32_NO_JIT=1` (or `CPU.NoJIT`). It is also off while the interpreter's
+  per-instruction hooks are wanted: call tracing, watchpoints, the guest profiler.
 
-### Backends
+### Exactness
 
-1. **x86-64 first.** It covers Intel Macs (the user's), and the Linux dev container can run
-   and test it (unlike Metal). Guest x86-32 → host x86-64 is close to 1:1.
-2. **arm64 later.** Same front end; flags must be emulated (lazy flags: record op and operands,
-   materialise on read), W^X toggling, memory ordering is not a concern (single guest core).
+Translated code must be indistinguishable from the interpreter.
 
-## Testing and measuring
+- **Memory.** Only the interpreter's fast paths are inlined:
+  - loads need `addr < ArenaSize-8` (16-byte loads: `addr+16 <= ArenaSize-8`);
+  - stores look up a per-page store table. It marks pages holding code, the page before each
+    (a store may straddle into it), and pages past guest memory.
+  
+  Anything else is a slow exit *before* the instruction changes anything. Generated code never
+  faults.
+- **Flags.** `c.Flags` gets exactly what the interpreter computes, including bits the
+  hardware leaves undefined:
+  - logic ops zero AF;
+  - INC and DEC keep CF;
+  - IMUL sets only CF and OF;
+  - shifts set OF only for a count of 1;
+  - ROR, RCL and RCR set only CF;
+  - SSE `UCOMISS` clears OF, SF and AF.
+  
+  **Flag liveness** (`jitCaptures`, shared by both backends): a flag result is kept only if
+  something may observe it before an instruction overwrites all of it. Observers are an
+  instruction reading flags other than straight from the host's, a slow exit, and the block's
+  end.
+- **Floating point.** Translated SSE matches the interpreter's Go code on the same host, NaN
+  payloads included:
+  - ADD and MUL with two NaN operands return the first one, quieted (`sseAdd`, `sseMul`);
+  - truncating conversions out of range give 0x80000000 (`ToInt32`);
+  - MINSS and MAXSS return the second operand unless strictly less (greater).
+- **Forms.** Every `dInst` kind the decoded-instruction cache has is translated, including the
+  fused compare+branch kinds, 8- and 16-bit ALU forms, and scalar and packed SSE. x87 isn't
+  cached, so it stays in the interpreter. Untranslated forms are slow exits.
 
-- **Differential tests:** random instruction sequences run by the interpreter and by the JIT
-  from the same state, comparing registers, flags, memory and EIP (reuse `cmd/c32aot`'s
-  generator and harness). Include faulting/edge cases (slow-path addresses, writes into code).
-- **Whole-game determinism:** headless routes (`scripts/runroute.sh`, `scripts/gpuroute.sh`)
-  must give identical `Steps=` lines and identical gpucheck output with and without the JIT.
-- **Speed:** paired side-by-side headless runs to the same instruction count (the method in
-  `docs/DEBUGGING.md`), interpreter vs JIT, GPU path, **without** `aot_gen.go`. Keep runs
-  short (the user asked for quick iterations: under a few minutes).
-- **On the Mac:** the user plays with a `build-app.sh` build (no AOT) and compares.
+### x86-64 backend
 
-## Phases
+- **Registers.**
+  - Guest registers EAX..EDI live in rax, rcx, rdx, rbx, r12, rbp, rsi, rdi, so most
+    instructions keep their encoding, including AH..BH.
+  - r15 holds the CPU, r14 guest memory, r13 the store table.
+  - r8 holds effective addresses; r9–r11 are scratch.
+- **Flags** come from the host instruction itself:
+  - When they must be kept: `PUSHFQ` into `jitState.raw`, with which bits in `pmask`.
+  - They stay **pending** across blocks. They are merged into `c.Flags` only when something
+    reads them or sets just some of them, and by Go on every exit.
+  - A JCC, CMOV or SETCC right after the instruction that set the flags reads the host's
+    flags directly.
+- **Code placement.** Block bodies go in a hot region; exit stubs go in a cold one.
 
-1. **Infrastructure:** code buffer, trampoline, dispatcher hook in `runCached`, invalidation,
-   `C32_NO_JIT`. Translate a handful of forms (mov, alu reg/imm, lea, jcc/jmp, call/ret, push/
-   pop). Differential tests green. Measure.
-2. **Coverage:** every `dInst` kind the dcache caches, fused compare+branch, scalar SSE.
-3. **Speed:** chaining, registers kept across blocks, flag liveness, hot-path inline memory
-   access.
-4. **arm64 backend.**
+### arm64 backend
 
-Acceptance at each phase: differential tests and determinism checks pass; measurable speedup
-over the interpreter in the A/B; no change in what the game does.
+- **Registers.**
+  - Guest registers live in w19–w26.
+  - x27 holds the CPU, w8 the guest flags, x7 the step budget.
+  - x9 holds guest memory, x10 the store table, x3 the lookup table, x5 `&XMM[0]`, and x11
+    and x12 the flag tables.
+  - x0 holds effective addresses; x1, x2 and x13–x17 are scratch.
+  - Translated code never touches x18 (the platform register), x28 (Go's `g`, which signal
+    handlers rely on), x29, x30 or the stack.
+- **Flags are computed.** An instruction runs as the host instruction that sets NZCV the same
+  way: ADDS, SUBS, ADCS, SBCS, ANDS, or TST after ORR/EOR. 8- and 16-bit operations work on
+  operands shifted to the top of the register. When the flags must be kept they go into w8 at
+  once:
+  - CF, ZF, SF and OF come from NZCV through a table (`a64FlagTabs`), per mode: subtraction
+    inverts C; INC and DEC have no CF; FCMP has its own table.
+  - PF comes from a parity table.
+  - AF is `(a^b^result) & 0x10`.
+  - A reader right after the instruction that set the flags tests NZCV directly when a host
+    condition matches its x86 condition in that mode (`a64Conds`); otherwise it tests w8.
+  - Resuming after a slow exit, such a reader is entered through a copy of it that tests w8.
+- **Left to the interpreter:** ADC and SBB on 8 and 16 bits, and RCL and RCR by CL. They are
+  rare.
+- **Executable memory.**
+  - Linux: read-write-execute memory, then the caches are synchronised after writing
+    (`jitFlushICache`: DC CVAU, IC IVAU, DSB, ISB).
+  - macOS: `MAP_JIT`, with `pthread_jit_write_protect_np` toggled around writes on a locked
+    thread, then `sys_icache_invalidate`. These are called through libSystem trampolines, as
+    `golang.org/x/sys/unix` does, because the app is built without cgo.
+  - Off by default there (`jitOptIn`) until verified.
 
-## Pitfalls already known
+## Testing
+
+- **`TestJITMatchesInterpreter`** (`pkg/cpu/jit_test.go`) runs 3000 random programs through
+  the interpreter and through the JIT, from the same state, and compares registers, flags,
+  XMM, memory, EIP, steps and halts. Set `C32_JITN` for more programs.
+  - The programs cover every form, with forward Jccs, calls to a guest subroutine, to a host
+    function, through memory, and to `ret 4`, in a 6-iteration loop.
+  - On odd seeds, stores to the data area are forced through the interpreter.
+  - XMM registers start with quiet and signaling NaNs, single and double.
+  - **`TestJITBisect`** (`C32_JITSEED=n`) finds the first step where seed n differs.
+- **`TestA64Encodings`** checks the arm64 encoder against `golang.org/x/arch`'s disassembler.
+- **arm64 on an x86 machine**, with QEMU user-mode (`qemu-user` from the distribution):
+  ```sh
+  GOARCH=arm64 go test -c -o /tmp/cpu_arm64.test ./pkg/cpu
+  qemu-aarch64 /tmp/cpu_arm64.test -test.run 'JITMatches|A64' -test.v
+  ```
+  A wrapper script (`exec qemu-aarch64 <arm64 catalina32> "$@"`) runs whole games the same
+  way, for example through `scripts/gpuroute.sh`.
+- **Mutation checks** (done by hand, October 2026): deliberately broken arm64 code was caught
+  by the full test:
+  - CF not inverted after subtraction;
+  - AF missing;
+  - a wrong host condition for JLE;
+  - the NaN rule for ADD and MUL (scalar and packed);
+  - the NaN case of CVTTSS2SI.
+- **Whole games:**
+  - LEGO: `scripts/gpuroute.sh` with and without `C32_NO_JIT=1` must give identical `Steps=`
+    lines.
+  - Portal: `TestBoot` with `C32_GLCHECK` and `C32_GLTRACE` must give identical GL streams.
+- **Speed:** the same runs side by side, without `aot_gen.go`.
+
+**arm64 under QEMU** (October 2026):
+
+- **LEGO**, `gpuroute.sh` `episode1`, 1.1 billion instructions, with both runs at once on the
+  container:
+  - Interpreter and JIT give the same 27 `Steps=` lines, final state and gpucheck summary as
+    the x86-64 interpreter.
+  - Times: 4 min 25 s interpreted, 1 min 40 s with the JIT. QEMU's own costs dominate both,
+    so this says little about Apple hardware.
+- **Portal**: `TestBoot` with `+map testchmb_a_00`, 4 billion instructions. The arm64 JIT
+  gives a GL stream byte-identical to the x86-64 interpreter's (9.6 MB of commands).
+
+## Diagnostics
+
+| Variable | Effect |
+|---|---|
+| `C32_NO_JIT=1` | no JIT (A/B comparisons; a way out for players) |
+| `C32_JIT=1` | the JIT where it is opt-in (Apple Silicon) |
+| `C32_JITPROF=1` | per-block run counts and code costs; `TestBoot` prints the totals (flag saves, loads, stores, bytes per block run) and the costliest blocks |
+| `C32_JITSTATS=1` | `TestBoot`: translations, entries, exits by kind, and where translated code most often returns to Go |
+| `C32_JITDUMP=eip,...` | `TestBoot`: write those blocks' host and guest code to the temporary folder (disassemble with `objdump -D -b binary -mi386:x86-64`) |
+| `C32_SLOWOPS=1` | `TestBoot`: the most frequent instructions the interpreter's full decoder runs (forms not cached, so not translated) |
+| `C32_JITN`, `C32_JITSEED` | `TestJITMatchesInterpreter`: number of programs; `TestJITBisect`: the seed to bisect |
+
+## Ideas not done
+
+- **Host calls without leaving translated code** (the main cost left in Portal). It would
+  need calling Go from generated code, or translating the hottest host functions.
+- **Superblocks or traces** across unconditional jumps and calls.
+- **arm64:** keep flags pending across blocks, as x86-64 does. Today every kept result is
+  computed at once, and a compare at a block's end is always kept.
+- **Apple Silicon:** verify, then set `jitOptIn` to false in `jitmem_darwin_arm64.go`.
+
+## Pitfalls
 
 - Green threads switch on step counts (`Preempt`): a block must not run past `nextPreempt`.
 - Code may be patched at run time (`pkg/games/lswsaga` patches `NuTexRead`; games may
   self-modify): invalidation must be exact.
 - Intercepts can be registered after code was translated (lazy `Bind`): flush.
-- `TraceCalls` / the guest profiler rely on per-call hooks in `execBlock` (`dCall`): disable the
-  JIT while they are on, or emit the hook.
-- AOT and JIT together (developer builds): AOT functions are intercepts, so blocks stop at them;
-  nothing special needed, but measure the JIT without AOT.
+- `TraceCalls` and the guest profiler rely on per-call hooks in `execBlock` (`dCall`): the JIT
+  is off while they are on.
+- AOT and JIT together (developer builds): AOT functions are intercepts, so blocks stop at
+  them; measure the JIT without AOT.
+- Two `Watch`/`Around` hooks on the same symbol: the second is silently skipped.
+- Go may evaluate `a+b` as `b+a`. Where the operand order shows (NaN payloads), the
+  interpreter must say which it means (`sseAdd`), and the backends must do the same.

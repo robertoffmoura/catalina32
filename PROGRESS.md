@@ -30,7 +30,8 @@ explain each change); keep this file to what is true now.
 2. **Heavy areas run at 20–30 FPS** (the emulator at full speed). Compiled code already runs
    83% of the instructions there; the other 17% is spread over hundreds of interpreted
    functions and takes about 37% of the host time. The AOT compiler can't fix this for users
-   (see Speed in the backlog); the generic answer is a JIT.
+   (see Speed in the backlog); the generic answer is the JIT (branch `jit`, `docs/JIT.md`):
+   without AOT, a headless route runs 2.2–2.5× faster. Not yet tried on the Mac.
 
 ## The app
 
@@ -41,11 +42,13 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
   one-time Gatekeeper step instead.
 - **Later:** an icon for Catalina32 itself.
 - **Speed:** release builds have no AOT code, so heavy scenes are choppier than with
-  `run_on_mac.sh`; the JIT is the answer for players: designed in `docs/JIT.md`, left for later.
+  `run_on_mac.sh`. The JIT is the answer for players: built (branch `jit`, `docs/JIT.md`), to be
+  tried on the Mac.
 - **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Branch `source`.
   On the user's Mac it plays from the menu through the first chambers with no known bugs:
   New Game and Load Game, mouse look, keyboard, a controller, sound and music, text, portals.
-  It runs at a few frames per second: speed now needs the JIT. It runs from
+  Interpreted it runs at a few frames per second; the JIT runs its gameplay 3.7× faster
+  headless (to be tried on the Mac). It runs from
   `scripts/run_source.sh` only (no game app yet). Details, tests and next steps:
   `docs/PORTAL.md`. The Feral family layer waits for a second Feral game.
 
@@ -54,10 +57,11 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
 - **Play further:** other chapters and episodes, vehicle levels, Free Play, bonus areas. Expect
   unimplemented calls to show up as crashes or drawing errors (logged once by name).
 - **Speed.** Everything here must work for users with no developer tools and no per-game work.
-  - **A JIT** (hot guest code compiled to machine code at run time, on the user's own copy):
-    the real answer for the heavy areas. Large; likely `pkg/cpu` in Rust behind the same
-    interface. The interpreter's dispatch loop is near what plain Go allows (precomputed
-    addresses and batched step counts measured as noise).
+  - **The JIT** (hot guest code translated to machine code at run time, on the user's own
+    copy; `docs/JIT.md`): x86-64 and arm64 backends, in Go and assembly. Next: try it on the
+    Mac; host calls without leaving translated code; Apple Silicon (off there unless
+    `C32_JIT=1` until verified). The interpreter's dispatch loop is near what plain Go allows
+    (precomputed addresses and batched step counts measured as noise).
   - **The AOT compiler (`cmd/c32aot`) is a developer tool.** It translates the game's code to
     Go, which needs Go on the user's machine and can't be distributed (it is game code), so a
     shipped app can't count on it; hand-picking or auto-choosing its function list doesn't

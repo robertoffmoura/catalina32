@@ -5,8 +5,9 @@ Pro 560X) Portal plays from the menu through the first chambers: New Game and Lo
 mouse look, keyboard, a controller (connected at launch or later), sound and music, menus and
 HUD text, and portals drawn correctly. No known bugs except speed: about 10 million guest
 instructions per frame in a chamber against an interpreter doing ~75 million a second, so a
-few frames per second. The answer is the JIT (`docs/JIT.md`); the decoded-instruction cache
-already covers all but ~4% of Source's instructions.
+few frames per second interpreted. The JIT (`docs/JIT.md`, branch `jit`) runs gameplay at
+about 280 million instructions a second headless (3.7×), with a byte-identical GL stream;
+it hasn't been tried on the Mac yet.
 
 ## Running it
 
@@ -132,7 +133,8 @@ Each of these cost a bug; most are generic to Source on Mac.
 
 ## Next
 
-1. **Speed:** the JIT (`docs/JIT.md`).
+1. **Speed:** play with the JIT on the Mac. What is left is mostly calls to host functions
+   (about 14 million a second in gameplay), each a return to Go (`docs/JIT.md`, Ideas).
 2. **A game app for Portal:** teach `pkg/gamelib` (scan, identify, wrap) that a game can be a
    folder, identified by `steam_appid.txt`, `gameinfo.txt` and its engine's checksum
    (`hl2_osx` is the same launcher in every Source game).

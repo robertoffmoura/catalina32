@@ -27,8 +27,9 @@ own runner, `pkg/source`, described in `docs/PORTAL.md`.
 **State (October 2026):** it boots, plays with sound, controllers and saves, and draws
 through Metal at about 35–57 FPS on the user's Intel MacBook Pro. The whole of Episode I
 Chapter 1 (Negotiations) has been played through without crashes. Portal plays on the Mac
-with no known bugs but runs at a few frames per second (the JIT is next). See `PROGRESS.md`
-for open work.
+with no known bugs but, interpreted, at a few frames per second. A JIT now translates hot guest
+code to x86-64 or arm64 (branch `jit`, `docs/JIT.md`): about 3.7× faster in Portal's gameplay
+headless, not yet tried on the Mac. See `PROGRESS.md` for open work.
 
 ## People, machines, paths
 
@@ -168,7 +169,7 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
 | Status, open bugs, backlog | `PROGRESS.md` |
 | Environment variables, routes, logs, profilers, gpucheck | `docs/DEBUGGING.md` |
 | Game addresses, input layout, how it loads/draws things | `docs/LSWSAGA.md` |
-| The JIT (designed, not started) | `docs/JIT.md` |
+| The JIT: how it works, its tests, results | `docs/JIT.md` |
 | Portal / Valve Source games: how it runs, tests, lessons, next | `docs/PORTAL.md` |
 | The OpenGL stream format | top of `pkg/source/glremote.go`, `pkg/source/glspec.go` |
 | GPU stream format | top of `pkg/d3d9/gpu.go` |
