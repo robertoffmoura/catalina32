@@ -114,6 +114,9 @@ type JITCost struct {
 	Insts, Bytes                    uint64
 	FlagSaves, FlagLoads, Merges    uint64 // PUSHFQ, POPFQ (flags into the host), merges into c.Flags
 	DynMerges, Loads, Stores, Exits uint64 // merges of another block's flags; checked accesses; possible slow exits
+	// Bytes of the body that are bookkeeping (x86-64): the step-limit check at the head, the
+	// checks of memory accesses, and saving, loading and merging flags.
+	HeadBytes, CheckBytes, FlagBytes uint64
 }
 
 // jitProf turns on per-block run counts (C32_JITPROF=1).
@@ -146,6 +149,9 @@ func (c *CPU) JITProfile() (total JITCost, runs uint64, top []string) {
 		total.Loads += n * k.Loads
 		total.Stores += n * k.Stores
 		total.Exits += n * k.Exits
+		total.HeadBytes += n * k.HeadBytes
+		total.CheckBytes += n * k.CheckBytes
+		total.FlagBytes += n * k.FlagBytes
 		all = append(all, bc{jb, n * k.Bytes})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].w > all[j].w })
@@ -154,6 +160,18 @@ func (c *CPU) JITProfile() (total JITCost, runs uint64, top []string) {
 		top = append(top, fmt.Sprintf("%#x: %d runs x %d insts, %+v", jb.eip, *jb.runs, len(jb.insts), jb.cost))
 	}
 	return
+}
+
+// ResetJITProfile zeroes the run counts of C32_JITPROF (to profile from a point on).
+func (c *CPU) ResetJITProfile() {
+	if c.jitc == nil {
+		return
+	}
+	for _, jb := range c.jitc.blocks {
+		if jb.runs != nil {
+			*jb.runs = 0
+		}
+	}
 }
 
 // jitCode is one CPU's translated code.
@@ -445,6 +463,43 @@ func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
 		}
 		return b.jit
 	}
+}
+
+// JITBlockInfo describes a translated block (diagnostics: attributing profile samples).
+type JITBlockInfo struct {
+	Head  uintptr // its code (the body; exits are elsewhere on x86-64)
+	Bytes int
+	EIP   uint32
+	Insts int
+	Runs  uint64 // entries at its head (C32_JITPROF), since ResetJITProfile
+}
+
+// JITBlocks lists the translated blocks.
+func (c *CPU) JITBlocks() []JITBlockInfo {
+	if c.jitc == nil {
+		return nil
+	}
+	var out []JITBlockInfo
+	for _, jb := range c.jitc.blocks {
+		bi := JITBlockInfo{Head: jb.head, Bytes: int(jb.cost.Bytes), EIP: jb.eip, Insts: len(jb.insts)}
+		if jb.runs != nil {
+			bi.Runs = *jb.runs
+		}
+		out = append(out, bi)
+	}
+	return out
+}
+
+// JITCodeAt returns the code buffer's bytes at host address addr (diagnostics), or nil.
+func (c *CPU) JITCodeAt(addr uintptr, n int) []byte {
+	if c.jitc == nil || c.jitc.buf == nil {
+		return nil
+	}
+	base := uintptr(unsafe.Pointer(&c.jitc.buf[0]))
+	if addr < base || addr+uintptr(n) > base+uintptr(len(c.jitc.buf)) {
+		return nil
+	}
+	return c.jitc.buf[addr-base : addr-base+uintptr(n)]
 }
 
 // JITTargetKind says what runs at eip (diagnostics for JITStats.EndAt): "host" (an intercept),

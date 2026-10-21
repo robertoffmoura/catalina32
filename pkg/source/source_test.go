@@ -1,6 +1,7 @@
 package source
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -122,11 +123,11 @@ func TestBoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,cpu_ms,host_calls,gl_commands,gl_kb,jit_slow,jit_end,jit_resets")
+		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,cpu_ms,host_calls,gl_commands,gl_kb,gl_questions,jit_slow,jit_end,jit_resets")
 		var last struct {
-			steps, full, calls, cmds, bytes, slow, end uint64
-			at                                         time.Time
-			cpu                                        time.Duration
+			steps, full, calls, cmds, bytes, asked, slow, end uint64
+			at                                                time.Time
+			cpu                                               time.Duration
 		}
 		last.at, last.cpu = time.Now(), processCPU()
 		frame := 0
@@ -134,10 +135,10 @@ func TestBoot(t *testing.T) {
 			frame++
 			now, st := time.Now(), c.JITStats()
 			cpuNow := processCPU()
-			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.1f,%d,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
+			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.1f,%d,%d,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
 				float64(now.Sub(last.at).Microseconds())/1000, float64((cpuNow-last.cpu).Microseconds())/1000, c.HostCalls-last.calls, m.glr.sent-last.cmds,
-				float64(m.glr.w-last.bytes)/1024, st.SlowExits-last.slow, st.EndExits-last.end, st.Resets)
-			last.steps, last.full, last.calls, last.cmds, last.bytes, last.slow, last.end, last.at, last.cpu = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, st.SlowExits, st.EndExits, now, cpuNow
+				float64(m.glr.w-last.bytes)/1024, m.glr.askedN-last.asked, st.SlowExits-last.slow, st.EndExits-last.end, st.Resets)
+			last.steps, last.full, last.calls, last.cmds, last.bytes, last.asked, last.slow, last.end, last.at, last.cpu = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, m.glr.askedN, st.SlowExits, st.EndExits, now, cpuNow
 		}
 	}
 	if p := os.Getenv("C32_CPUPROF"); p != "" { // the host's CPU profile from instruction C32_CPUPROF_AFTER on
@@ -151,6 +152,7 @@ func TestBoot(t *testing.T) {
 		start := func() {
 			if !started && m.C.Steps >= after {
 				started = true
+				m.C.ResetJITProfile() // C32_JITPROF counts from here too
 				if err := pprof.StartCPUProfile(f); err != nil {
 					t.Fatal(err)
 				}
@@ -169,6 +171,25 @@ func TestBoot(t *testing.T) {
 		}()
 	}
 	err = m.Run(steps)
+	if p := os.Getenv("C32_JITMAP"); p != "" { // translated blocks: head, bytes, guest address, instructions, symbol; and their code
+		if f, err := os.Create(p); err == nil {
+			code, _ := os.Create(p + ".bin") // per block: head (8 bytes), length (4), code
+			for _, b := range m.C.JITBlocks() {
+				fmt.Fprintf(f, "%x %d %x %d %s\n", b.Head, b.Bytes, b.EIP, b.Insts, m.where(b.EIP))
+				if bs := m.C.JITCodeAt(b.Head, b.Bytes); bs != nil && code != nil {
+					var hdr [12]byte
+					binary.LittleEndian.PutUint64(hdr[:], uint64(b.Head))
+					binary.LittleEndian.PutUint32(hdr[8:], uint32(len(bs)))
+					code.Write(hdr[:])
+					code.Write(bs)
+				}
+			}
+			f.Close()
+			if code != nil {
+				code.Close()
+			}
+		}
+	}
 	if v := os.Getenv("C32_JITDUMP"); v != "" { // eip,eip...: write those blocks' host and guest code to the temporary folder
 		for _, a := range strings.Split(v, ",") {
 			eip, _ := strconv.ParseUint(a, 0, 32)
@@ -184,6 +205,29 @@ func TestBoot(t *testing.T) {
 			runs, float64(total.Insts)/float64(runs), float64(total.Bytes)/float64(runs), float64(total.FlagSaves)/float64(runs),
 			float64(total.FlagLoads)/float64(runs), float64(total.Merges)/float64(runs), float64(total.DynMerges)/float64(runs),
 			float64(total.Loads)/float64(runs), float64(total.Stores)/float64(runs))
+		b := float64(total.Bytes)
+		t.Logf("jit profile: of the code run, %.0f%% step-limit checks, %.0f%% memory checks, %.0f%% flags",
+			100*float64(total.HeadBytes)/b, 100*float64(total.CheckBytes)/b, 100*float64(total.FlagBytes)/b)
+		byFn := map[string]float64{} // code run, by guest function
+		for _, jb := range m.C.JITBlocks() {
+			name := m.where(jb.EIP)
+			if i := strings.LastIndexByte(name, '+'); i > 0 {
+				name = name[:i]
+			}
+			byFn[name] += float64(jb.Runs) * float64(jb.Bytes)
+		}
+		type fw struct {
+			name string
+			w    float64
+		}
+		var fns []fw
+		for k, w := range byFn {
+			fns = append(fns, fw{k, w})
+		}
+		sort.Slice(fns, func(i, j int) bool { return fns[i].w > fns[j].w })
+		for i := 0; i < len(fns) && i < 40; i++ {
+			t.Logf("  %5.1f%% of the code run: %s", 100*fns[i].w/b, fns[i].name)
+		}
 		for _, l := range top {
 			t.Logf("  %s", l)
 		}
@@ -241,6 +285,9 @@ func TestBoot(t *testing.T) {
 		sort.Slice(l, func(i, j int) bool { return l[i].v > l[j].v })
 		for _, e := range l {
 			t.Logf("gl %10d %s", e.v, e.k)
+		}
+		for k, v := range m.glr.asked {
+			t.Logf("gl question %10d %s", v, k)
 		}
 	}
 	for _, line := range m.Report() {

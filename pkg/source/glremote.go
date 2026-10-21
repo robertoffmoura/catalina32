@@ -89,6 +89,8 @@ type glRemote struct {
 	token    uint32
 	frames   uint64
 	sent     uint64            // commands sent (diagnostics)
+	asked    map[string]uint64 // questions (calls waiting for the window's answer) by name (diagnostics)
+	askedN   uint64
 	strings  map[uint32]uint32 // glGetString results, in guest memory
 	logged   map[string]bool
 	gone     bool
@@ -247,6 +249,11 @@ func (g *glRemote) resumed() { glPauseStart = time.Time{} }
 
 // ask sends a question (its first argument is the reply token) and waits for the answer.
 func (g *glRemote) ask(id int, args func()) []byte {
+	if g.asked == nil {
+		g.asked = map[string]uint64{}
+	}
+	g.asked[g.calls[id].Name]++
+	g.askedN++
 	g.token++
 	g.scratch = g.scratch[:0]
 	g.u32(g.token)
