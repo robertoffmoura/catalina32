@@ -1,5 +1,7 @@
 package cpu
 
+import "math"
+
 // Decoded-instruction cache.
 //
 // Step() normally re-decodes every instruction (prefixes, opcode switch, ModRM/SIB/displacement)
@@ -130,6 +132,14 @@ const (
 	dMovdFromX  // 66 0F 7E: r/m32 = xmm
 	dCmpxchg8b  // [F0] 0F C7 /1 m64
 	dBswap      // 0F C8+r
+
+	// x87 (the interpreter's: float64 registers FPUSt, top FPUTop).
+	dFld    // push: aux = source (fld*), rm = i for ST(i)
+	dFst    // store ST0: aux = destination (fst*), rm = i for ST(i); imm = 1: pop (fstp)
+	dFxch   // ST0 <-> ST(rm)
+	dFsign  // aux 0: fchs, 1: fabs
+	dFArith // ST(reg) = x op y: op = aux&3 (fpuAdd...), the memory operand's type = aux>>2 (fpuM32, fpuM64),
+	//         x = imm&15, y = imm>>4&15 (an ST index, or fpuMem); imm>>8&1: pop
 )
 
 type dInst struct {
@@ -179,6 +189,14 @@ type dBlock struct {
 	jitGen uint32
 
 	code []byte // a block outside [CodeLo, CodeHi): its instruction bytes (see codeSame)
+}
+
+// fpuOperand is dFArith operand k: ST(k), or m for fpuMem.
+func (c *CPU) fpuOperand(k uint32, m float64) float64 {
+	if k == fpuMem {
+		return m
+	}
+	return c.FPUGet(int(k))
 }
 
 // codeSame says whether self-checking block b's instructions are still those in memory.
@@ -517,6 +535,8 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 		set(dMovStore8, p+decodeModRM(m, p, d))
 	case op == 0x8A:
 		set(dMovLoad8, p+decodeModRM(m, p, d))
+	case op >= 0xD8 && op <= 0xDF:
+		decodeFPU(d, m, op, p, set)
 	case op == 0x90:
 		set(dNop, p)
 	case op == 0xA8:
@@ -674,6 +694,125 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			d.reg = op2 & 7
 			set(dBswap, p)
 		}
+	}
+}
+
+// Sources of dFld, destinations of dFst.
+const (
+	fldST = iota
+	fldM32
+	fldM64
+	fldI32
+	fldOne
+	fldZero
+)
+
+const (
+	fstST = iota
+	fstM32
+	fstM64
+)
+
+// dFArith operations and operands.
+const (
+	fpuAdd = iota
+	fpuMul
+	fpuSub
+	fpuDiv
+
+	fpuM32 = 1
+	fpuM64 = 2
+	fpuMem = 8 // the memory operand, as x or y
+)
+
+// decodeFPU decodes the x87 forms the cache runs (op D8..DF at m[p-1]): loads, stores, fxch,
+// fchs, fabs, and arithmetic between registers or with a float operand. The arithmetic's operands
+// are in the order of the interpreter's expressions (execFPU).
+func decodeFPU(d *dInst, m []byte, op uint8, p uint32, set func(uint8, uint32)) {
+	n := decodeModRM(m, p, d)
+	end := p + n
+	reg, i := d.reg, d.rm
+	// arith sets dFArith ST(dst) = op(a, b) for /0 add and /1 mul; for subtraction and division,
+	// /4 and /6 are a-b and a/b, /5 and /7 b-a and b/a, the other way round with swap (DE).
+	arith := func(dst, a, b, ext, mem uint8, pop, swap bool) {
+		var o uint8
+		switch ext {
+		case 0:
+			o = fpuAdd
+		case 1:
+			o = fpuMul
+		case 4, 5:
+			o = fpuSub
+		case 6, 7:
+			o = fpuDiv
+		default:
+			return // compares: the full decoder
+		}
+		x, y := a, b
+		if ext >= 4 && (ext == 5 || ext == 7) != swap {
+			x, y = b, a
+		}
+		d.reg = dst
+		d.aux = o | mem<<2
+		d.imm = uint32(x) | uint32(y)<<4
+		if pop {
+			d.imm |= 1 << 8
+		}
+		set(dFArith, end)
+	}
+	if d.isMem {
+		switch {
+		case op == 0xD8:
+			arith(0, 0, fpuMem, reg, fpuM32, false, false)
+		case op == 0xDC:
+			arith(0, 0, fpuMem, reg, fpuM64, false, false)
+		case op == 0xD9 && reg == 0:
+			d.aux = fldM32
+			set(dFld, end)
+		case op == 0xDD && reg == 0:
+			d.aux = fldM64
+			set(dFld, end)
+		case op == 0xDB && reg == 0:
+			d.aux = fldI32
+			set(dFld, end)
+		case (op == 0xD9 || op == 0xDD) && (reg == 2 || reg == 3):
+			d.aux = fstM32
+			if op == 0xDD {
+				d.aux = fstM64
+			}
+			d.imm = uint32(reg - 2)
+			set(dFst, end)
+		}
+		return
+	}
+	switch {
+	case op == 0xD8:
+		arith(0, 0, i, reg, 0, false, false)
+	case op == 0xDC:
+		arith(i, i, 0, reg, 0, false, false)
+	case op == 0xDE:
+		arith(i, i, 0, reg, 0, true, true)
+	case op == 0xD9 && reg == 0:
+		d.aux = fldST
+		set(dFld, end)
+	case (op == 0xD9 || op == 0xDD) && reg == 1:
+		set(dFxch, end)
+	case op == 0xD9 && reg == 3, op == 0xDD && (reg == 2 || reg == 3):
+		d.aux = fstST
+		d.imm = 0
+		if reg == 3 {
+			d.imm = 1
+		}
+		set(dFst, end)
+	case op == 0xD9 && reg == 4 && i <= 1:
+		d.aux = i
+		set(dFsign, end)
+	case op == 0xD9 && reg == 5 && (i == 0 || i == 6):
+		d.aux = fldOne
+		if i == 6 {
+			d.aux = fldZero
+		}
+		set(dFld, end)
 	}
 }
 
@@ -1128,6 +1267,82 @@ func (c *CPU) execBlock(insts []dInst) {
 			c.EIP = c.rm32(d)
 		case dPushRM32:
 			c.Push32(c.rm32(d))
+		case dFld:
+			var v float64
+			switch d.aux {
+			case fldST:
+				v = c.FPUGet(int(d.rm))
+			case fldM32:
+				v = float64(c.ReadF32(c.ea(d)))
+			case fldM64:
+				v = c.ReadF64(c.ea(d))
+			case fldI32:
+				v = float64(int32(c.Read32(c.ea(d))))
+			case fldOne:
+				v = 1
+			}
+			c.FPUPush(v)
+		case dFst:
+			pop := d.imm != 0
+			switch d.aux {
+			case fstST:
+				if pop {
+					if v := c.FPUPop(); d.rm > 0 {
+						c.FPUSet(int(d.rm)-1, v)
+					}
+				} else {
+					c.FPUSet(int(d.rm), c.FPUGet(0))
+				}
+			case fstM32:
+				addr := c.ea(d)
+				if pop {
+					c.WriteF32(addr, float32(c.FPUPop()))
+				} else {
+					c.WriteF32(addr, float32(c.FPUGet(0)))
+				}
+			case fstM64:
+				addr := c.ea(d)
+				if pop {
+					c.WriteF64(addr, c.FPUPop())
+				} else {
+					c.WriteF64(addr, c.FPUGet(0))
+				}
+			}
+		case dFxch:
+			v0, vi := c.FPUGet(0), c.FPUGet(int(d.rm))
+			c.FPUSet(0, vi)
+			c.FPUSet(int(d.rm), v0)
+		case dFsign:
+			if d.aux == 0 {
+				c.FPUSet(0, -c.FPUGet(0))
+			} else {
+				c.FPUSet(0, math.Abs(c.FPUGet(0)))
+			}
+		case dFArith:
+			var m float64
+			if d.isMem {
+				if addr := c.ea(d); d.aux>>2 == fpuM32 {
+					m = float64(c.ReadF32(addr))
+				} else {
+					m = c.ReadF64(addr)
+				}
+			}
+			x, y := c.fpuOperand(d.imm&15, m), c.fpuOperand(d.imm>>4&15, m)
+			var r float64
+			switch d.aux & 3 {
+			case fpuAdd:
+				r = sseAdd(x, y)
+			case fpuMul:
+				r = sseMul(x, y)
+			case fpuSub:
+				r = x - y
+			default:
+				r = x / y
+			}
+			c.FPUSet(int(d.reg), r)
+			if d.imm>>8&1 != 0 {
+				c.FPUPop()
+			}
 		case dXorps:
 			var src [16]byte
 			if d.isMem {

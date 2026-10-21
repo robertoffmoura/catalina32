@@ -171,9 +171,9 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 			b := c.FPUGet(rm)
 			switch reg {
 			case 0:
-				c.FPUSet(0, a+b)
+				c.FPUSet(0, sseAdd(a, b))
 			case 1:
-				c.FPUSet(0, a*b)
+				c.FPUSet(0, sseMul(a, b))
 			case 2:
 				c.fpuCompare(a, b)
 			case 3:
@@ -349,9 +349,9 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 			b := c.FPUGet(0)
 			switch reg {
 			case 0:
-				c.FPUSet(rm, a+b)
+				c.FPUSet(rm, sseAdd(a, b))
 			case 1:
-				c.FPUSet(rm, a*b)
+				c.FPUSet(rm, sseMul(a, b))
 			case 2:
 				c.fpuCompare(b, a)
 			case 3:
@@ -392,10 +392,10 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 			b := c.FPUGet(0)
 			switch reg {
 			case 0: // FADDP
-				c.FPUSet(rm, a+b)
+				c.FPUSet(rm, sseAdd(a, b))
 				c.FPUPop()
 			case 1: // FMULP
-				c.FPUSet(rm, a*b)
+				c.FPUSet(rm, sseMul(a, b))
 				c.FPUPop()
 			case 2: // FCOMP
 				c.fpuCompare(b, a)
@@ -443,9 +443,9 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		a := c.FPUGet(0)
 		switch reg {
 		case 0:
-			c.FPUSet(0, a+m)
+			c.FPUSet(0, sseAdd(a, m))
 		case 1:
-			c.FPUSet(0, a*m)
+			c.FPUSet(0, sseMul(a, m))
 		case 2:
 			c.fpuCompare(a, m)
 		case 3:
@@ -482,9 +482,9 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		a := c.FPUGet(0)
 		switch reg {
 		case 0:
-			c.FPUSet(0, a+m)
+			c.FPUSet(0, sseAdd(a, m))
 		case 1:
-			c.FPUSet(0, a*m)
+			c.FPUSet(0, sseMul(a, m))
 		case 2:
 			c.fpuCompare(a, m)
 		case 3:
@@ -523,9 +523,9 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		a := c.FPUGet(0)
 		switch reg {
 		case 0:
-			c.FPUSet(0, a+m)
+			c.FPUSet(0, sseAdd(a, m))
 		case 1:
-			c.FPUSet(0, a*m)
+			c.FPUSet(0, sseMul(a, m))
 		case 2:
 			c.fpuCompare(a, m)
 		case 3:
@@ -574,9 +574,9 @@ func (c *CPU) execFPU(op uint8, segOverride uint32, hasSeg bool) {
 		a := c.FPUGet(0)
 		switch reg {
 		case 0:
-			c.FPUSet(0, a+m)
+			c.FPUSet(0, sseAdd(a, m))
 		case 1:
-			c.FPUSet(0, a*m)
+			c.FPUSet(0, sseMul(a, m))
 		case 2:
 			c.fpuCompare(a, m)
 		case 3:

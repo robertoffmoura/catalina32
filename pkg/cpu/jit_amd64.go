@@ -2,6 +2,7 @@ package cpu
 
 import (
 	"encoding/binary"
+	"math"
 	"unsafe"
 )
 
@@ -1247,6 +1248,8 @@ func (g *jitGen) inst2(d *dInst) bool {
 		} else {
 			a.emit(0x0F, 0xC8+byte(hr))
 		}
+	case dFld, dFst, dFxch, dFsign, dFArith:
+		g.x87(d)
 	case dMovdFromX:
 		a.load32(hR9, xmmOp(d.reg))
 		if d.isMem {
@@ -1260,6 +1263,110 @@ func (g *jitGen) inst2(d *dInst) bool {
 		return false
 	}
 	return true
+}
+
+// x87: the interpreter's registers are float64s (FPUSt), indexed from FPUTop, which the code
+// loads into r9d; r10 and r11 index other registers. The arithmetic is SSE2's on doubles, as Go
+// compiles the interpreter's (x86 returns the first operand when both are NaN, as sseAdd does).
+
+// st returns guest register ST(i)'s memory, its index computed into idx (r9d holds FPUTop).
+func (g *jitGen) st(i uint32, idx int) xop {
+	if i == 0 {
+		return xmi(hR15, hR9, 3, offFPUSt)
+	}
+	g.a.lea32(idx, xm(hR9, int32(i)))
+	g.a.alu32I(4, xr(idx), 7)
+	return xmi(hR15, idx, 3, offFPUSt)
+}
+
+// fpuTopMove adds delta (+1 pop, -1 push) to FPUTop, in r9d and memory.
+func (g *jitGen) fpuTopMove(delta int32) {
+	g.a.lea32(hR9, xm(hR9, delta))
+	g.a.alu32I(4, xr(hR9), 7)
+	g.a.store32(xm(hR15, offFPUTop), hR9)
+}
+
+func (g *jitGen) x87(d *dInst) {
+	a := &g.a
+	if d.isMem { // the access is checked before anything changes
+		g.ea(d)
+		size := 8
+		if d.kind == dFld && (d.aux == fldM32 || d.aux == fldI32) || d.kind == dFst && d.aux == fstM32 || d.kind == dFArith && d.aux>>2 == fpuM32 {
+			size = 4
+		}
+		if d.kind == dFst {
+			g.chkStore(hR8)
+		} else {
+			g.chkLoad(size)
+		}
+	}
+	a.load32(hR9, xm(hR15, offFPUTop))
+	switch d.kind {
+	case dFld:
+		switch d.aux {
+		case fldST:
+			a.sse(0xF2, 0x10, 0, g.st(uint32(d.rm), hR10)) // movsd xmm0, ST(i)
+		case fldM32:
+			a.sse(0xF3, 0x5A, 0, memAt) // cvtss2sd
+		case fldM64:
+			a.sse(0xF2, 0x10, 0, memAt)
+		case fldI32:
+			a.sse(0xF2, 0x2A, 0, memAt) // cvtsi2sd xmm0, dword
+		default:
+			v := uint64(0)
+			if d.aux == fldOne {
+				v = math.Float64bits(1)
+			}
+			a.emit(0x49, 0xBB) // mov r11, imm64
+			a.emit64(v)
+			a.inst(0x66, xW, []byte{0x0F, 0x6E}, 0, xr(hR11)) // movq xmm0, r11
+		}
+		g.fpuTopMove(-1)
+		a.sse(0xF2, 0x11, 0, g.st(0, 0))
+	case dFst:
+		a.sse(0xF2, 0x10, 0, g.st(0, 0))
+		switch d.aux {
+		case fstST:
+			if d.rm != 0 || d.imm == 0 {
+				a.sse(0xF2, 0x11, 0, g.st(uint32(d.rm), hR10))
+			}
+		case fstM32:
+			a.sse(0xF2, 0x5A, 0, xr(0)) // cvtsd2ss xmm0, xmm0
+			a.sse(0xF3, 0x11, 0, memAt)
+		case fstM64:
+			a.sse(0xF2, 0x11, 0, memAt)
+		}
+		if d.imm != 0 {
+			g.fpuTopMove(1)
+		}
+	case dFxch:
+		other := g.st(uint32(d.rm), hR10)
+		a.sse(0xF2, 0x10, 0, g.st(0, 0))
+		a.sse(0xF2, 0x10, 1, other)
+		a.sse(0xF2, 0x11, 1, g.st(0, 0))
+		a.sse(0xF2, 0x11, 0, other)
+	case dFsign:
+		a.load64(hR11, g.st(0, 0))
+		a.inst(0, xW, []byte{0x0F, 0xBA}, 7-int(d.aux), xr(hR11)) // btc (fchs) / btr (fabs) r11, 63
+		a.emit(63)
+		a.store64(g.st(0, 0), hR11)
+	case dFArith:
+		for k, sh := range []uint32{0, 4} {
+			switch src := d.imm >> sh & 15; {
+			case src != fpuMem:
+				a.sse(0xF2, 0x10, k, g.st(src, hR10))
+			case d.aux>>2 == fpuM32:
+				a.sse(0xF3, 0x5A, k, memAt)
+			default:
+				a.sse(0xF2, 0x10, k, memAt)
+			}
+		}
+		a.sse(0xF2, [4]byte{0x58, 0x59, 0x5C, 0x5E}[d.aux&3], 0, xr(1))
+		a.sse(0xF2, 0x11, 0, g.st(uint32(d.reg), hR10))
+		if d.imm>>8&1 != 0 {
+			g.fpuTopMove(1)
+		}
+	}
 }
 
 // src128 loads d's 128-bit source operand into host XMM register x.

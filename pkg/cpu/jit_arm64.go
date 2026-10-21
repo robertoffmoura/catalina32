@@ -2,6 +2,7 @@ package cpu
 
 import (
 	"encoding/binary"
+	"math"
 	"unsafe"
 )
 
@@ -1584,6 +1585,8 @@ func (g *jitGen) sse(d *dInst) bool {
 		g.xmm(size, a64Ld, true, 0, d.reg, 0)
 		a.fcmp(double, 0, 1)
 		g.produce(fmFcmp, flagsArith, func() { g.nzcv(fmFcmp) })
+	case dFld, dFst, dFxch, dFsign, dFArith:
+		g.x87(d)
 	case dPshufd:
 		g.src(d, 4, 1)
 		for i := 0; i < 4; i++ {
@@ -1594,6 +1597,136 @@ func (g *jitGen) sse(d *dInst) bool {
 		return false
 	}
 	return true
+}
+
+// x87: the interpreter's registers are float64s (FPUSt), indexed from FPUTop: x17 = &FPUSt[0],
+// w15 = FPUTop, w16 another index. The arithmetic is the double-precision instructions Go
+// compiles the interpreter's to, with sseAdd's rule for two NaNs (see the SSE forms).
+
+// stIdx returns the register holding ST(i)'s index.
+func (g *jitGen) stIdx(i uint32) int {
+	if i == 0 {
+		return rT3
+	}
+	g.a.addI(false, a64Add, rT4, rT3, i)
+	g.a.logI(a64AndI, rT4, rT4, 7)
+	return rT4
+}
+
+// fpuTopMove adds delta (1 pop, -1 push) to FPUTop, in w15 and memory.
+func (g *jitGen) fpuTopMove(delta int) {
+	if delta > 0 {
+		g.a.addI(false, a64Add, rT3, rT3, 1)
+	} else {
+		g.a.addI(false, a64Sub, rT3, rT3, 1)
+	}
+	g.a.logI(a64AndI, rT3, rT3, 7)
+	g.cpuLS(2, a64St, rT3, offFPUTop)
+}
+
+func (g *jitGen) x87(d *dInst) {
+	a := &g.a
+	m32 := d.kind == dFld && (d.aux == fldM32 || d.aux == fldI32) || d.kind == dFst && d.aux == fstM32 || d.kind == dFArith && d.aux>>2 == fpuM32
+	if d.isMem { // the access is checked before anything changes
+		g.ea(d, rEA)
+		if d.kind == dFst {
+			g.chkStore(rEA)
+		} else if m32 {
+			g.chkLoad(4)
+		} else {
+			g.chkLoad(8)
+		}
+	}
+	g.cpuLS(2, a64Ld, rT3, offFPUTop)
+	a.addI(true, a64Add, rAddr, rCPU, uint32(offFPUSt))
+	ld := func(v int, i uint32) { a.ldstX(3, a64Ld, true, v, rAddr, g.stIdx(i)) }
+	st := func(v int, i uint32) { a.ldstX(3, a64St, true, v, rAddr, g.stIdx(i)) }
+	mem := func(v int) { // the memory operand as a double in d<v>
+		if m32 {
+			g.guest(2, a64Ld, true, v)
+			a.fcvtS2D(v, v)
+		} else {
+			g.guest(3, a64Ld, true, v)
+		}
+	}
+	switch d.kind {
+	case dFld:
+		switch d.aux {
+		case fldST:
+			ld(0, uint32(d.rm))
+		case fldM32, fldM64:
+			mem(0)
+		case fldI32:
+			g.guest(2, a64Ld, false, rT1)
+			a.scvtf(true, 0, rT1)
+		default:
+			v := uint64(0)
+			if d.aux == fldOne {
+				v = math.Float64bits(1)
+			}
+			a.movI64(rF1, v)
+			g.fpuTopMove(-1)
+			a.ldstX(3, a64St, false, rF1, rAddr, rT3)
+			return
+		}
+		g.fpuTopMove(-1)
+		st(0, 0)
+	case dFst:
+		ld(0, 0)
+		switch d.aux {
+		case fstST:
+			if d.rm != 0 || d.imm == 0 {
+				st(0, uint32(d.rm))
+			}
+		case fstM32:
+			a.fcvtD2S(0, 0)
+			g.guest(2, a64St, true, 0)
+		case fstM64:
+			g.guest(3, a64St, true, 0)
+		}
+		if d.imm != 0 {
+			g.fpuTopMove(1)
+		}
+	case dFxch:
+		ld(0, 0)
+		ld(1, uint32(d.rm))
+		st(1, 0)
+		st(0, uint32(d.rm))
+	case dFsign:
+		ld(0, 0)
+		if d.aux == 0 {
+			a.fneg(0, 0)
+		} else {
+			a.fabs(0, 0)
+		}
+		st(0, 0)
+	case dFArith:
+		for k, sh := range []uint32{0, 4} {
+			if src := d.imm >> sh & 15; src == fpuMem {
+				mem(k)
+			} else {
+				ld(k, src)
+			}
+		}
+		switch d.aux & 3 {
+		case fpuAdd, fpuMul: // a NaN first operand is the result (quieted), as on x86
+			a.fcmp(true, 0, 0)
+			a.fcsel(true, 1, 0, 1, a64VS)
+			op := uint32(a64Fadd)
+			if d.aux&3 == fpuMul {
+				op = a64Fmul
+			}
+			a.fop(op, true, 0, 0, 1)
+		case fpuSub:
+			a.fop(a64Fsub, true, 0, 0, 1)
+		default:
+			a.fop(a64Fdiv, true, 0, 0, 1)
+		}
+		st(0, uint32(d.reg))
+		if d.imm>>8&1 != 0 {
+			g.fpuTopMove(1)
+		}
+	}
 }
 
 // src loads d's XMM source operand (size: 2 single, 3 double, 4 all 16 bytes) into SIMD

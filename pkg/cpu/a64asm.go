@@ -370,6 +370,11 @@ func (a *a64) ldstR(size int, opc int, simd bool, rt, rn, rm int) {
 	a.emit(a64ldstOp(0x38200800, size, opc, simd) | uint32(rm)<<16 | 2<<13 | uint32(rn)<<5 | uint32(rt))
 }
 
+// ldstX is a load or store at [rn + rm<<size] (rm an X register holding an index).
+func (a *a64) ldstX(size int, opc int, simd bool, rt, rn, rm int) {
+	a.emit(a64ldstOp(0x38200800, size, opc, simd) | uint32(rm)<<16 | 3<<13 | 1<<12 | uint32(rn)<<5 | uint32(rt))
+}
+
 // a64ldstOp adds the size, opc and SIMD bits to a load/store opcode (a Q register is size 0 with
 // opc 1x).
 func a64ldstOp(w uint32, size int, opc int, simd bool) uint32 {
@@ -429,6 +434,9 @@ func (a *a64) fcmp(double bool, rn, rm int) {
 func (a *a64) fcsel(double bool, rd, rn, rm int, cond uint8) {
 	a.emit(0x1E200C00 | a64ftype(double) | uint32(rm)<<16 | uint32(cond)<<12 | uint32(rn)<<5 | uint32(rd))
 }
+func (a *a64) fneg(rd, rn int) { a.emit(0x1E614000 | uint32(rn)<<5 | uint32(rd)) } // double
+func (a *a64) fabs(rd, rn int) { a.emit(0x1E60C000 | uint32(rn)<<5 | uint32(rd)) } // double
+
 func (a *a64) fcvtS2D(rd, rn int) { a.emit(0x1E22C000 | uint32(rn)<<5 | uint32(rd)) }
 func (a *a64) fcvtD2S(rd, rn int) { a.emit(0x1E624000 | uint32(rn)<<5 | uint32(rd)) }
 

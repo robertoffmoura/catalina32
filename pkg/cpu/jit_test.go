@@ -79,7 +79,7 @@ func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func (g *jtGen) inst() []byte {
 	r := g.r
 	op := uint8(r.Intn(8))
-	switch r.Intn(54) {
+	switch r.Intn(61) {
 	case 0: // op r/m32, r32
 		return cat([]byte{op<<3 | 1}, g.modrm(g.any(), g.dst(), true, op != 7))
 	case 1: // op r32, r/m32
@@ -251,9 +251,48 @@ func (g *jtGen) inst() []byte {
 			return cat([]byte{0x66, 0x0F, 0x6E}, g.modrm(uint8(r.Intn(8)), g.any(), true, false))
 		}
 		return cat([]byte{0x66, 0x0F, 0x7E}, g.modrm(uint8(r.Intn(8)), g.dst(), true, true))
+	case 54: // fld: st(i), m32, m64, m32int, 1, 0
+		switch r.Intn(5) {
+		case 0:
+			return []byte{0xD9, 0xC0 | byte(r.Intn(8))}
+		case 1:
+			return []byte{0xD9, []byte{0xE8, 0xEE}[r.Intn(2)]}
+		default:
+			return cat([]byte{[]byte{0xD9, 0xDD, 0xDB}[r.Intn(3)]}, g.fpuMem(0, false))
+		}
+	case 55: // fst / fstp: st(i), m32, m64
+		switch r.Intn(3) {
+		case 0:
+			return []byte{[]byte{0xD9, 0xDD}[r.Intn(2)], 0xD8 | byte(r.Intn(8))}
+		case 1:
+			return []byte{0xDD, 0xD0 | byte(r.Intn(8))}
+		default:
+			return cat([]byte{[]byte{0xD9, 0xDD}[r.Intn(2)]}, g.fpuMem(uint8(2+r.Intn(2)), true))
+		}
+	case 56: // fxch, fchs, fabs
+		if r.Intn(2) == 0 {
+			return []byte{0xD9, 0xC8 | byte(r.Intn(8))}
+		}
+		return []byte{0xD9, 0xE0 | byte(r.Intn(2))}
+	case 57, 58, 59: // arithmetic: D8 / DC / DE register forms, D8 / DC memory forms
+		ext := []uint8{0, 1, 4, 5, 6, 7}[r.Intn(6)]
+		op := []byte{0xD8, 0xDC, 0xDE}[r.Intn(3)]
+		if op != 0xDE && r.Intn(2) == 0 {
+			return cat([]byte{op}, g.fpuMem(ext, false))
+		}
+		return []byte{op, 0xC0 | ext<<3 | byte(r.Intn(8))}
 	default: // compare or test, often followed by a Jcc (fused)
 		return g.compare()
 	}
+}
+
+// fpuMem is a memory ModRM (with reg field reg) for an x87 operand.
+func (g *jtGen) fpuMem(reg uint8, store bool) []byte {
+	m := g.modrm(reg, 0, true, store)
+	if m[0]>>6 == 3 {
+		m = []byte{0x45 | reg<<3, byte(g.r.Intn(0x58))}
+	}
+	return m
 }
 
 func (g *jtGen) compare() []byte {
@@ -337,6 +376,8 @@ func (g *jtGen) program(n int) []byte {
 type jtState struct {
 	regs   [8]uint32
 	flags  uint32
+	fpu    [8]uint64 // x87 registers' bits
+	fpuTop int
 	xmm    [8][16]byte
 	data   []byte
 	stack  []byte
@@ -420,6 +461,21 @@ func jtRun(t *testing.T, prog []byte, seed int64, mode jtMode, maxSteps uint64) 
 			binary.LittleEndian.PutUint64(c.XMM[i][8*r.Intn(2):], v)
 		}
 	}
+	for i := range c.FPUSt { // x87 registers: ordinary values, NaNs (quiet, signaling), infinities, zeros
+		v := r.NormFloat64() * 1000
+		switch r.Intn(8) {
+		case 0:
+			v = math.Float64frombits(0x7FF8000000000000 | r.Uint64()&0x8007FFFFFFFFFFFF)
+		case 1:
+			v = math.Float64frombits(0x7FF0000000000001 | r.Uint64()&0x8007FFFFFFFFFFFF)
+		case 2:
+			v = math.Inf(1 - 2*r.Intn(2))
+		case 3:
+			v = math.Copysign(0, float64(1-2*r.Intn(2)))
+		}
+		c.FPUSt[i] = v
+	}
+	c.FPUTop = r.Intn(8)
 	for i := uint32(0); i < 0x2000; i++ {
 		c.Mem[jtData+i] = byte(r.Intn(256))
 	}
@@ -429,9 +485,12 @@ func jtRun(t *testing.T, prog []byte, seed int64, mode jtMode, maxSteps uint64) 
 	c.EIP = jtCode
 	c.MaxSteps = maxSteps
 	c.RunUntil(SentinelReturnEIP)
-	st := jtState{regs: c.Regs, flags: c.Flags, xmm: c.XMM, eip: c.EIP, steps: c.Steps,
+	st := jtState{regs: c.Regs, flags: c.Flags, xmm: c.XMM, eip: c.EIP, steps: c.Steps, fpuTop: c.FPUTop,
 		data: append([]byte(nil), c.Mem[jtData:jtData+0x2000]...), stack: append([]byte(nil), c.Mem[jtStack-0x400:jtStack]...),
 		code: append([]byte(nil), c.Mem[jtCode:jtCode+uint32(len(prog))]...)}
+	for i, v := range c.FPUSt {
+		st.fpu[i] = math.Float64bits(v)
+	}
 	if c.Halted {
 		st.halted = c.HaltReason
 	}
@@ -444,6 +503,9 @@ func (s jtState) diff(o jtState) string {
 	var d []string
 	if s.regs != o.regs {
 		d = append(d, fmt.Sprintf("regs %08x vs %08x", s.regs, o.regs))
+	}
+	if s.fpu != o.fpu || s.fpuTop != o.fpuTop {
+		d = append(d, fmt.Sprintf("x87 %016x top %d vs %016x top %d", s.fpu, s.fpuTop, o.fpu, o.fpuTop))
 	}
 	if s.flags != o.flags {
 		d = append(d, fmt.Sprintf("flags %#x vs %#x", s.flags, o.flags))
@@ -495,11 +557,15 @@ func TestJITMatchesInterpreter(t *testing.T) {
 		if d := a.diff(b); d != "" {
 			t.Fatalf("seed %d, program % x:\ninterpreter vs JIT: %s", seed, prog, d)
 		}
-		if jtChecked(seed) {
+		if jtChecked(seed) || os.Getenv("C32_JITPLAIN") == "1" { // C32_JITPLAIN=1: every program
 			// (The full decoder's halt messages give a different EIP within the instruction.)
 			p, q := jtRun(t, prog, seed, jtPlain, 20000), a
 			p.halted, q.halted = jtHaltAt.ReplaceAllString(p.halted, ""), jtHaltAt.ReplaceAllString(q.halted, "")
 			if d := p.diff(q); d != "" {
+				if !jtChecked(seed) { // C32_JITPLAIN: report them all
+					t.Errorf("seed %d, program % x:\nfull decoder vs interpreter: %s", seed, prog, d)
+					continue
+				}
 				t.Fatalf("seed %d, program % x (outside the code range):\nfull decoder vs interpreter: %s", seed, prog, d)
 			}
 		}
@@ -531,6 +597,9 @@ func TestJITBisect(t *testing.T) {
 	for n := uint64(1); n < 20000; n++ {
 		a := jtRun(t, prog, seed, jtInterp, n)
 		b := jtRun(t, prog, seed, jtJIT, n)
+		if os.Getenv("C32_JITPLAIN") == "1" { // the full decoder against the cache
+			a, b = jtRun(t, prog, seed, jtPlain, n), a
+		}
 		if d := a.diff(b); d != "" && !strings.HasPrefix(d, "eip") {
 			c := jtRun(t, prog, seed, jtInterp, n-1)
 			t.Fatalf("first difference after %d steps (before it: eip %#x, regs %08x flags %#x):\n%s", n, c.eip, c.regs, c.flags, d)

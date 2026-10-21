@@ -69,6 +69,8 @@ var (
 	offFlags  = int32(unsafe.Offsetof(CPU{}.Flags))
 	offSteps  = int32(unsafe.Offsetof(CPU{}.Steps))
 	offXMM    = int32(unsafe.Offsetof(CPU{}.XMM))
+	offFPUSt  = int32(unsafe.Offsetof(CPU{}.FPUSt))
+	offFPUTop = int32(unsafe.Offsetof(CPU{}.FPUTop))
 	offJit    = int32(unsafe.Offsetof(CPU{}.jit))
 	offMem    = offJit + int32(unsafe.Offsetof(jitState{}.mem))
 	offStore  = offJit + int32(unsafe.Offsetof(jitState{}.stores))
