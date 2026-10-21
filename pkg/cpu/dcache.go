@@ -91,6 +91,38 @@ const (
 	dNot32     // F7 /2
 	dNeg32     // F7 /3
 	dSetcc     // 0F 9x: r/m8 = condition (aux)
+
+	// Forms below run through the full decoder when interpreted (execBlock rewinds and calls
+	// stepFull, so they behave exactly as uncached): they are cached so blocks don't end at
+	// them and the JIT can translate them.
+	dAlu8RMR    // 00,08,..,38: r/m8 op= r8
+	dAlu8RRM    // 02,0A,..,3A: r8 op= r/m8
+	dAluALImm   // 04,0C,..,3C: AL op= imm8
+	dMovR8Imm   // B0+r
+	dNot8       // F6 /2
+	dNeg8       // F6 /3
+	dRetImm     // C2 iw (imm = bytes released)
+	dMov16Store // 66 89
+	dMov16Load  // 66 8B
+	dMov16Imm   // 66 C7 /0
+	dAlu16RMR   // 66 01..39
+	dAlu16RRM   // 66 03..3B
+	dGrp1RM16   // 66 81 / 66 83 (imm sign-extended to 16 bits)
+	dTest16     // 66 85
+	dArithSS2   // F3 0F 51/5D/5F: sqrtss, minss, maxss (aux = op2)
+	dArithSD    // F2 0F 51/58/59/5C/5D/5E/5F (aux = op2)
+	dArithPS    // 0F 51/58/59/5C/5D/5E/5F (aux = op2)
+	dLogicPS    // 0F 54/55/56: andps, andnps, orps (aux = op2)
+	dCvtSS2SD   // F3 0F 5A
+	dCvtSD2SS   // F2 0F 5A
+	dCvttSS2SI  // F3 0F 2C
+	dCvttSD2SI  // F2 0F 2C
+	dCvtSI2SS   // F3 0F 2A
+	dCvtSI2SD   // F2 0F 2A
+	dUcomisd    // 66 0F 2E / 2F
+	dPshufd     // 66 0F 70 (imm = order)
+	dMovdToX    // 66 0F 6E: xmm = r/m32
+	dMovdFromX  // 66 0F 7E: r/m32 = xmm
 )
 
 type dInst struct {
@@ -125,7 +157,7 @@ func newDCache() []dInst {
 // control transfer (or before an uncached instruction, an intercepted address, or blockMax).
 // Blocks hold copies of their instructions so collisions in the instruction cache cannot alter them.
 const (
-	blockBits = 16
+	blockBits = 18
 	blockMask = 1<<blockBits - 1
 	blockMax  = 64
 )
@@ -155,7 +187,7 @@ func (c *CPU) FlushCodeCache() {
 
 func endsBlock(kind uint8) bool {
 	switch kind {
-	case dJcc, dJmp, dCall, dRet, dCallInd, dJmpInd:
+	case dJcc, dJmp, dCall, dRet, dCallInd, dJmpInd, dRetImm:
 		return true
 	}
 	return false
@@ -341,18 +373,47 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 				k = dMovsdStore
 			}
 			set(k, p+n)
-		case 0x58, 0x59, 0x5C, 0x5E:
-			if pfx == 0xF3 {
-				n := decodeModRM(m, p, d)
-				d.aux = op2
+		case 0x58, 0x59, 0x5C, 0x5E, 0x51, 0x5D, 0x5F:
+			n := decodeModRM(m, p, d)
+			d.aux = op2
+			switch {
+			case pfx == 0xF2:
+				set(dArithSD, p+n)
+			case op2 == 0x51 || op2 == 0x5D || op2 == 0x5F:
+				set(dArithSS2, p+n)
+			default:
 				set(dArithSS, p+n)
 			}
+		case 0x5A, 0x2C, 0x2A:
+			n := decodeModRM(m, p, d)
+			k := map[uint8][2]uint8{0x5A: {dCvtSS2SD, dCvtSD2SS}, 0x2C: {dCvttSS2SI, dCvttSD2SI}, 0x2A: {dCvtSI2SS, dCvtSI2SD}}[op2]
+			if pfx == 0xF3 {
+				set(k[0], p+n)
+			} else {
+				set(k[1], p+n)
+			}
 		}
+		return
+	}
+	if op == 0x66 {
+		c.decode66(d, eip, p, set)
 		return
 	}
 
 	if op < 0x40 && op&7 < 6 {
 		switch op & 7 {
+		case 0:
+			n := decodeModRM(m, p, d)
+			d.aux = (op >> 3) & 7
+			set(dAlu8RMR, p+n)
+		case 2:
+			n := decodeModRM(m, p, d)
+			d.aux = (op >> 3) & 7
+			set(dAlu8RRM, p+n)
+		case 4:
+			d.aux = (op >> 3) & 7
+			d.imm = uint32(m[p])
+			set(dAluALImm, p+1)
 		case 1:
 			n := decodeModRM(m, p, d)
 			d.aux = (op >> 3) & 7
@@ -415,6 +476,13 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	case op == 0xA8:
 		d.imm = uint32(m[p])
 		set(dTestALImm, p+1)
+	case op >= 0xB0 && op <= 0xB7:
+		d.reg = op & 7
+		d.imm = uint32(m[p])
+		set(dMovR8Imm, p+1)
+	case op == 0xC2:
+		d.imm = uint32(m[p]) | uint32(m[p+1])<<8
+		set(dRetImm, p+2)
 	case op >= 0xB8 && op <= 0xBF:
 		d.reg = op & 7
 		d.imm = le32(m, p)
@@ -501,6 +569,10 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 		if n := decodeModRM(m, p, d); d.reg == 0 || d.reg == 1 {
 			d.imm = uint32(m[p+n])
 			set(dTestRMI8, p+n+1)
+		} else if d.reg == 2 {
+			set(dNot8, p+n)
+		} else if d.reg == 3 {
+			set(dNeg8, p+n)
 		}
 	case op == 0x0F:
 		op2 := m[p]
@@ -540,6 +612,69 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 		case op2 == 0x57:
 			n := decodeModRM(m, p, d)
 			set(dXorps, p+n)
+		case op2 == 0x51 || op2 == 0x58 || op2 == 0x59 || op2 == 0x5C || op2 == 0x5D || op2 == 0x5E || op2 == 0x5F:
+			n := decodeModRM(m, p, d)
+			d.aux = op2
+			set(dArithPS, p+n)
+		case op2 >= 0x54 && op2 <= 0x56:
+			n := decodeModRM(m, p, d)
+			d.aux = op2
+			set(dLogicPS, p+n)
+		}
+	}
+}
+
+// decode66 decodes the 16-bit and 66-prefixed SSE forms (op at m[p]).
+func (c *CPU) decode66(d *dInst, eip, p uint32, set func(uint8, uint32)) {
+	m := c.Mem
+	op := m[p]
+	p++
+	switch {
+	case op < 0x40 && op&7 == 1:
+		n := decodeModRM(m, p, d)
+		d.aux = (op >> 3) & 7
+		set(dAlu16RMR, p+n)
+	case op < 0x40 && op&7 == 3:
+		n := decodeModRM(m, p, d)
+		d.aux = (op >> 3) & 7
+		set(dAlu16RRM, p+n)
+	case op == 0x81:
+		n := decodeModRM(m, p, d)
+		d.aux = d.reg
+		d.imm = uint32(m[p+n]) | uint32(m[p+n+1])<<8
+		set(dGrp1RM16, p+n+2)
+	case op == 0x83:
+		n := decodeModRM(m, p, d)
+		d.aux = d.reg
+		d.imm = uint32(uint16(int16(int8(m[p+n]))))
+		set(dGrp1RM16, p+n+1)
+	case op == 0x85:
+		set(dTest16, p+decodeModRM(m, p, d))
+	case op == 0x89:
+		set(dMov16Store, p+decodeModRM(m, p, d))
+	case op == 0x8B:
+		set(dMov16Load, p+decodeModRM(m, p, d))
+	case op == 0xC7:
+		if n := decodeModRM(m, p, d); d.reg == 0 {
+			d.imm = uint32(m[p+n]) | uint32(m[p+n+1])<<8
+			set(dMov16Imm, p+n+2)
+		}
+	case op == 0x90:
+		set(dNop, p)
+	case op == 0x0F:
+		op2 := m[p]
+		p++
+		switch op2 {
+		case 0x2E, 0x2F:
+			set(dUcomisd, p+decodeModRM(m, p, d))
+		case 0x70:
+			n := decodeModRM(m, p, d)
+			d.imm = uint32(m[p+n])
+			set(dPshufd, p+n+1)
+		case 0x6E:
+			set(dMovdToX, p+decodeModRM(m, p, d))
+		case 0x7E:
+			set(dMovdFromX, p+decodeModRM(m, p, d))
 		}
 	}
 }
@@ -747,9 +882,9 @@ func (c *CPU) execBlock(insts []dInst) {
 			var r float32
 			switch d.aux {
 			case 0x58:
-				r = a + b
+				r = sseAdd(a, b)
 			case 0x59:
-				r = a * b
+				r = sseMul(a, b)
 			case 0x5C:
 				r = a - b
 			case 0x5E:
@@ -949,6 +1084,13 @@ func (c *CPU) execBlock(insts []dInst) {
 			}
 			for i := range src {
 				c.XMM[d.reg][i] ^= src[i]
+			}
+		default: // forms the full decoder runs (exactly as when uncached)
+			c.EIP = start
+			c.Steps--
+			c.stepFull()
+			if c.EIP != start+uint32(d.len) && !endsBlock(d.kind) {
+				return // the code changed under the block (or the instruction did something else)
 			}
 		}
 		if c.Halted {

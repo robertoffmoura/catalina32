@@ -23,3 +23,16 @@ func newBitmap(n uint64) []uint64 {
 	b := newArena(n * 8)
 	return unsafe.Slice((*uint64)(unsafe.Pointer(&b[0])), n)
 }
+
+// freeArena returns memory from newArena or newBitmap.
+func freeArena(b []byte) {
+	if len(b) > 0 {
+		syscall.Munmap(b)
+	}
+}
+
+func freeBitmap(b []uint64) {
+	if len(b) > 0 {
+		freeArena(unsafe.Slice((*byte)(unsafe.Pointer(&b[0])), len(b)*8))
+	}
+}

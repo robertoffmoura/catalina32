@@ -4,3 +4,5 @@ package cpu
 
 func newArena(size uint64) []byte { return make([]byte, size) }
 func newBitmap(n uint64) []uint64 { return make([]uint64, n) }
+func freeArena(b []byte)          {}
+func freeBitmap(b []uint64)       {}

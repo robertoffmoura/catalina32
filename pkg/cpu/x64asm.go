@@ -54,6 +54,8 @@ func (a *x64) emit(bs ...byte) { a.b = append(a.b, bs...) }
 
 func (a *x64) emit32(v uint32) { a.b = binary.LittleEndian.AppendUint32(a.b, v) }
 
+func (a *x64) emit16(v uint16) { a.b = binary.LittleEndian.AppendUint16(a.b, v) }
+
 func (a *x64) emit64(v uint64) { a.b = binary.LittleEndian.AppendUint64(a.b, v) }
 
 func (a *x64) newLabel() int {

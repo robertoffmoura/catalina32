@@ -1004,9 +1004,9 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 			case 0x53:
 				r = 1.0 / b
 			case 0x58:
-				r = a + b
+				r = sseAdd(a, b)
 			case 0x59:
-				r = a * b
+				r = sseMul(a, b)
 			case 0x5C:
 				r = a - b
 			case 0x5D:
@@ -1033,9 +1033,9 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 			case 0x51:
 				r = math.Sqrt(b)
 			case 0x58:
-				r = a + b
+				r = sseAdd(a, b)
 			case 0x59:
-				r = a * b
+				r = sseMul(a, b)
 			case 0x5C:
 				r = a - b
 			case 0x5D:
@@ -1064,9 +1064,9 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 				case 0x51:
 					r = math.Sqrt(b)
 				case 0x58:
-					r = a + b
+					r = sseAdd(a, b)
 				case 0x59:
-					r = a * b
+					r = sseMul(a, b)
 				case 0x5C:
 					r = a - b
 				case 0x5D:
@@ -1100,9 +1100,9 @@ func (c *CPU) execSSE(op2 uint8, opSize16 bool, repF3 bool, repF2 bool, segOverr
 				case 0x53:
 					r = 1.0 / b
 				case 0x58:
-					r = a + b
+					r = sseAdd(a, b)
 				case 0x59:
-					r = a * b
+					r = sseMul(a, b)
 				case 0x5C:
 					r = a - b
 				case 0x5D:
@@ -1767,4 +1767,31 @@ func (c *CPU) DumpState() string {
 		"EIP=0x%08x EAX=0x%08x ECX=0x%08x EDX=0x%08x EBX=0x%08x ESP=0x%08x EBP=0x%08x ESI=0x%08x EDI=0x%08x FLAGS=0x%08x Steps=%d",
 		c.EIP, c.Regs[0], c.Regs[1], c.Regs[2], c.Regs[3], c.Regs[4], c.Regs[5], c.Regs[6], c.Regs[7], c.Flags, c.Steps,
 	)
+}
+
+// sseAdd and sseMul are SSE's addition and multiplication. When both operands are NaN, x86
+// returns the first one (quieted); Go may evaluate a+b as b+a, so that case is explicit.
+func sseAdd[T float32 | float64](a, b T) T {
+	if a != a && b != b {
+		return quietNaN(a)
+	}
+	return a + b
+}
+
+func sseMul[T float32 | float64](a, b T) T {
+	if a != a && b != b {
+		return quietNaN(a)
+	}
+	return a * b
+}
+
+// quietNaN sets NaN a's quiet bit, as an x86 arithmetic instruction does.
+func quietNaN[T float32 | float64](a T) T {
+	switch v := any(a).(type) {
+	case float32:
+		return T(math.Float32frombits(math.Float32bits(v) | 1<<22))
+	case float64:
+		return T(math.Float64frombits(math.Float64bits(v) | 1<<51))
+	}
+	return a
 }

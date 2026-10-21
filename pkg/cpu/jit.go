@@ -37,7 +37,7 @@ const (
 // Exit reasons, set by translated code in jitState.exit.
 const (
 	jitExitEnd   = iota // a block (or chain of blocks) ended: EIP and Steps are set
-	jitExitSlow         // instruction exitIdx of block exitBlk needs the interpreter: EIP is its start
+	jitExitSlow         // instruction exitIdx of block exitBlk needs the interpreter (Go sets EIP and Steps)
 	jitExitLimit        // the next block would cross the step limit: EIP is its start
 )
 
@@ -49,11 +49,13 @@ type jitState struct {
 	mem     uintptr // &Mem[0]
 	stores  uintptr // &jitCode.stores[0]
 	table   uintptr // &jitCode.table[0]
-	limit   uint64  // chained blocks may only start while Steps + their steps <= limit
+	limit   uint64  // Steps may not pass it (set by Go before entering translated code)
+	budget  uint64  // limit minus the steps charged: each block charges its steps at its head
 	exit    uint32
 	exitIdx uint32
 	exitBlk uint32
 	_       uint32
+	raw     uint64    // host flags saved by translated code, not yet merged into c.Flags
 	save    [8]uint64 // host registers kept across translated code (the backend's prologue)
 }
 
@@ -70,6 +72,7 @@ type jitBlock struct {
 	eip    uint32
 	insts  []dInst   // the decoded instructions it was translated from (the interpreter's view)
 	prefix []uint64  // steps before instruction i (a fused compare and branch counts two)
+	starts []uint32  // guest address of instruction i
 	resume []uintptr // where translated code for instruction i starts (0: never resumed there)
 	head   uintptr   // entry with the step-limit check (chaining)
 	steps  uint64    // all its steps
@@ -95,11 +98,14 @@ type jitCode struct {
 
 // JITStats counts what the JIT did (diagnostics, tests).
 type JITStats struct {
-	Translated uint64 // blocks translated
-	Bytes      uint64 // host code written
-	Entries    uint64 // entries into translated code from Go
-	SlowExits  uint64 // instructions handed to the interpreter
-	Resets     uint64 // times all translations were discarded
+	Translated uint64            // blocks translated
+	Bytes      uint64            // host code written
+	Entries    uint64            // entries into translated code from Go
+	SlowExits  uint64            // instructions handed to the interpreter
+	EndExits   uint64            // returns to Go at a block end (target not translated, or a lookup miss)
+	LimitExits uint64            // returns to Go at the step limit
+	Resets     uint64            // times all translations were discarded
+	EndAt      map[uint32]uint64 // where EndExits went (when non-nil: diagnostics)
 }
 
 // JITStats returns the JIT's counters (zero if it never ran).
@@ -174,6 +180,11 @@ func (c *CPU) jitStores() {
 	if c.CodeHi <= c.CodeLo {
 		return
 	}
+	for _, r := range c.jitSlowPages {
+		for p := r[0] >> 12; p < r[1]>>12; p++ {
+			j.stores[p] = 1
+		}
+	}
 	for p := c.CodeLo >> 12; p <= (c.CodeHi-1)>>12 && p < uint32(len(j.stores)); p++ {
 		if c.textPages == nil || c.textPages[p>>6]&(1<<(p&63)) != 0 {
 			j.stores[p] = 1
@@ -201,12 +212,15 @@ func (c *CPU) jitCompile(b *dBlock) *jitBlock {
 	}
 	jb := &jitBlock{id: uint32(len(j.blocks)), eip: b.tag, insts: append([]dInst(nil), b.insts...), steps: uint64(b.steps)}
 	jb.prefix = make([]uint64, len(jb.insts)+1)
+	jb.starts = make([]uint32, len(jb.insts)+1)
+	jb.starts[0] = jb.eip
 	for i, d := range jb.insts {
-		n := uint64(1)
+		n, l := uint64(1), uint32(d.len)
 		if isFused(d.kind) {
-			n = 2
+			n, l = 2, l+uint32(d.len2)
 		}
 		jb.prefix[i+1] = jb.prefix[i] + n
+		jb.starts[i+1] = jb.starts[i] + l
 	}
 	if !jitTranslate(c, j, jb) {
 		j.failed[b.tag] = true
@@ -234,29 +248,56 @@ func isFused(k uint8) bool {
 
 // jitRun runs translated block jb (whose steps fit before limit) and whatever it chains to, until
 // translated code exits; slow instructions run in the interpreter, after which translated code
-// resumes.
-func (c *CPU) jitRun(jb *jitBlock, limit uint64) {
+// resumes. Calls to host functions (intercepts) are made here too, and translated code entered
+// again after them, as long as RunUntil wouldn't have done anything else in between (limit,
+// stopEIP, a halt).
+func (c *CPU) jitRun(jb *jitBlock, stopEIP uint32, limit uint64) {
 	j := c.jitc
-	if j.stale {
-		c.jitStores()
-	}
-	c.jit.limit = min(limit, c.Steps+jitSlice)
 	entry, idx := jb.head, 0
 	for {
-		c.Steps -= jb.prefix[idx] // translated code adds the steps before its exit point
+		if j.stale {
+			c.jitStores()
+		}
+		c.jit.limit = min(limit, c.Steps+jitSlice)
+		// Translated code charges each block's steps at its head; entering part way, the rest of
+		// this block is charged here.
+		c.jit.budget = c.jit.limit - c.Steps
+		if idx > 0 {
+			c.jit.budget -= jb.steps - jb.prefix[idx]
+		}
 		jitCall(j.prologue, c, entry)
 		j.Stats.Entries++
+		c.Steps = c.jit.limit - c.jit.budget
 		switch c.jit.exit {
-		case jitExitEnd, jitExitLimit:
+		case jitExitEnd:
+			j.Stats.EndExits++
+			if j.Stats.EndAt != nil {
+				j.Stats.EndAt[c.EIP]++
+			}
+			if jb = c.jitNext(stopEIP, &limit); jb == nil {
+				return
+			}
+			entry, idx = jb.head, 0
+		case jitExitLimit:
+			j.Stats.LimitExits++
 			return
 		case jitExitSlow:
 			j.Stats.SlowExits++
 			jb = j.blocks[c.jit.exitBlk]
 			i := int(c.jit.exitIdx)
+			c.EIP = jb.starts[i]
+			c.Steps -= jb.steps - jb.prefix[i] // charged, not run
 			flushes := c.CodeCacheFlushes
 			c.execBlock(jb.insts[i : i+1])
-			if c.Halted || i+1 == len(jb.insts) {
+			if c.Halted {
 				return
+			}
+			if i+1 == len(jb.insts) {
+				if jb = c.jitNext(stopEIP, &limit); jb == nil {
+					return
+				}
+				entry, idx = jb.head, 0
+				continue
 			}
 			if c.CodeCacheFlushes != flushes { // the instruction changed code: finish as execBlock would
 				c.execBlock(jb.insts[i+1:])
@@ -264,10 +305,35 @@ func (c *CPU) jitRun(jb *jitBlock, limit uint64) {
 			}
 			idx = i + 1
 			entry = jb.resume[idx]
-			if entry == 0 {
-				c.execBlock(jb.insts[idx:])
-				return
-			}
 		}
+	}
+}
+
+// jitNext runs host functions at EIP (as RunUntil's Step would) until EIP is a translated block
+// that fits before the limit, which it returns; nil when RunUntil or runCached must take over.
+func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
+	for {
+		eip := c.EIP
+		if c.Halted || eip == stopEIP || c.Steps >= *limit {
+			return nil
+		}
+		if fn := c.interceptAt(eip); fn != nil {
+			c.Steps++
+			fn(c)
+			*limit = c.nextEventStep() // what RunUntil would use next
+			continue
+		}
+		b := &c.blocks[eip&blockMask]
+		if b.tag != eip || b.jit == nil || b.jitGen != c.jitGen || uint64(b.steps) > *limit-c.Steps {
+			return nil
+		}
+		return b.jit
+	}
+}
+
+// Run0JITStats starts counting where translated code returns to Go (diagnostics).
+func (c *CPU) Run0JITStats() {
+	if c.jitInit() {
+		c.jitc.Stats.EndAt = map[uint32]uint64{}
 	}
 }

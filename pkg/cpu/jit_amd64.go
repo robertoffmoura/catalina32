@@ -12,9 +12,12 @@ import (
 //
 // so most instructions keep their encoding (and CL, AH..BH work as in the guest). r14 holds
 // &Mem[0], r15 the CPU, r13 the store table; r8 holds effective addresses, r9-r11 are scratch.
-// Guest flags stay in c.Flags: an instruction that sets flags runs natively and its flags are
-// merged into c.Flags right after (with the interpreter's rules for flags the hardware leaves
-// undefined); an instruction that reads flags loads them into the host's first.
+// Guest flags live in c.Flags. An instruction that sets flags runs natively; when its flags can
+// be observed (by an instruction reading them, at the block's end, or at a slow exit before
+// something overwrites them all) they are saved (PUSHFQ to jitState.raw) and merged into
+// c.Flags where needed, with the interpreter's rules for flags the hardware leaves undefined.
+// An instruction reading flags loads c.Flags into the host's, or, right after the instruction
+// that set them, uses the host's directly when they hold exactly what it reads.
 
 const jitSupported = true
 
@@ -25,20 +28,21 @@ var hostReg = [8]int{hRAX, hRCX, hRDX, hRBX, hR12, hRBP, hRSI, hRDI}
 func jitCall(prologue uintptr, c *CPU, target uintptr)
 
 var (
-	offRegs  = int32(unsafe.Offsetof(CPU{}.Regs))
-	offEIP   = int32(unsafe.Offsetof(CPU{}.EIP))
-	offFlags = int32(unsafe.Offsetof(CPU{}.Flags))
-	offSteps = int32(unsafe.Offsetof(CPU{}.Steps))
-	offXMM   = int32(unsafe.Offsetof(CPU{}.XMM))
-	offJit   = int32(unsafe.Offsetof(CPU{}.jit))
-	offMem   = offJit + int32(unsafe.Offsetof(jitState{}.mem))
-	offStore = offJit + int32(unsafe.Offsetof(jitState{}.stores))
-	offTable = offJit + int32(unsafe.Offsetof(jitState{}.table))
-	offLimit = offJit + int32(unsafe.Offsetof(jitState{}.limit))
-	offExit  = offJit + int32(unsafe.Offsetof(jitState{}.exit))
-	offEIdx  = offJit + int32(unsafe.Offsetof(jitState{}.exitIdx))
-	offEBlk  = offJit + int32(unsafe.Offsetof(jitState{}.exitBlk))
-	offSave  = offJit + int32(unsafe.Offsetof(jitState{}.save))
+	offRegs   = int32(unsafe.Offsetof(CPU{}.Regs))
+	offEIP    = int32(unsafe.Offsetof(CPU{}.EIP))
+	offFlags  = int32(unsafe.Offsetof(CPU{}.Flags))
+	offSteps  = int32(unsafe.Offsetof(CPU{}.Steps))
+	offXMM    = int32(unsafe.Offsetof(CPU{}.XMM))
+	offJit    = int32(unsafe.Offsetof(CPU{}.jit))
+	offMem    = offJit + int32(unsafe.Offsetof(jitState{}.mem))
+	offStore  = offJit + int32(unsafe.Offsetof(jitState{}.stores))
+	offTable  = offJit + int32(unsafe.Offsetof(jitState{}.table))
+	offBudget = offJit + int32(unsafe.Offsetof(jitState{}.budget))
+	offExit   = offJit + int32(unsafe.Offsetof(jitState{}.exit))
+	offEIdx   = offJit + int32(unsafe.Offsetof(jitState{}.exitIdx))
+	offEBlk   = offJit + int32(unsafe.Offsetof(jitState{}.exitBlk))
+	offSave   = offJit + int32(unsafe.Offsetof(jitState{}.save))
+	offRaw    = offJit + int32(unsafe.Offsetof(jitState{}.raw))
 )
 
 const (
@@ -100,6 +104,113 @@ type jitGen struct {
 	idx     int
 	ends    []jitChain
 	endStub int // label: exit with EIP already stored
+
+	capture  []bool       // per instruction setting flags: whether they are saved (they can be observed)
+	pend     jitPending   // saved flags not merged into c.Flags yet
+	slowPend []jitPending // per instruction: what its slow exit must merge
+	hostFrom int          // the instruction whose flags the host's flags hold (-1: none)
+	native   bool         // the current instruction reads the host's flags directly
+
+	resume    []int  // where each instruction's code starts
+	limitExit int    // label
+	hostOK    []bool // per instruction: the host's flags hold its flags when it ends
+
+	entryPend []jitPending // per instruction: saved flags its code expects on entry
+	natives   []bool       // per instruction: reads the host's flags directly
+}
+
+// jitPending is a flag-setting instruction's flags, saved in jitState.raw.
+type jitPending struct {
+	on           bool
+	value, clear uint32
+}
+
+// jitFx is how an instruction uses the guest flags.
+type jitFx struct {
+	writes       bool   // sets flags (value from the host's, the rest of clear zeroed)
+	value, clear uint32 //
+	dynamic      bool   // whether it sets them depends on run-time values (shift by CL): it merges them itself
+	reads        bool   // reads flags
+	native       bool   // can read them from the host's flags right after the instruction that set them
+	cc           uint8  // the condition it reads (native readers)
+}
+
+func jitFlagFx(d *dInst) jitFx {
+	switch d.kind {
+	case dAluRMR32, dAluRMR32R, dAluRRM32, dAluRRM32R, dAluEAXImm, dGrp1RM32, dGrp1RM32R, dGrp1RM8,
+		dAlu8RMR, dAlu8RRM, dAluALImm, dAlu16RMR, dAlu16RRM, dGrp1RM16:
+		v, c := aluFlags(d.aux)
+		return jitFx{writes: true, value: v, clear: c, reads: d.aux == 2 || d.aux == 3}
+	case dTestRMR32, dTestRMI8, dTestRMR8, dTestALImm, dTest16:
+		return jitFx{writes: true, value: flagsLogic, clear: flagsArith}
+	case dIncR, dDecR, dIncRM32, dDecRM32:
+		return jitFx{writes: true, value: flagsArith &^ FlagCF, clear: flagsArith &^ FlagCF}
+	case dNeg32, dNeg8, dUcomiss, dUcomisd:
+		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
+	case dImul32, dImulRRM32:
+		return jitFx{writes: true, value: FlagCF | FlagOF, clear: FlagCF | FlagOF}
+	case dShift32:
+		cnt := uint8(d.imm) & 0x1F
+		if cnt == 0 {
+			return jitFx{}
+		}
+		v, c := shiftFlags(d.aux, cnt)
+		return jitFx{writes: true, value: v, clear: c, reads: d.aux == 2 || d.aux == 3}
+	case dShift32CL:
+		return jitFx{writes: true, dynamic: true, reads: d.aux == 2 || d.aux == 3}
+	case dJcc:
+		return jitFx{reads: true, native: true, cc: d.aux}
+	case dCmov, dSetcc:
+		return jitFx{reads: true, native: !d.isMem, cc: d.aux}
+	case dCmpRMRJcc, dCmpRRMJcc, dCmpRMIJcc, dCmpEAXJcc, dCmpRMI8Jcc:
+		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
+	case dTestRMRJcc, dTestRMIJcc:
+		return jitFx{writes: true, value: flagsLogic, clear: flagsArith}
+	}
+	return jitFx{}
+}
+
+// shiftFlags is what a shift or rotate by cnt (1..31) sets: rotates only CF (and OF for a
+// count of 1, rol); shifts CF, PF, ZF, SF and OF for a count of 1, zeroing AF and otherwise OF.
+func shiftFlags(op uint8, cnt uint8) (uint32, uint32) {
+	of := uint32(0)
+	if cnt == 1 {
+		of = FlagOF
+	}
+	switch op {
+	case 0:
+		return FlagCF | of, FlagCF | of
+	case 1, 2, 3:
+		return FlagCF, FlagCF
+	}
+	return FlagCF | FlagPF | FlagZF | FlagSF | of, flagsArith
+}
+
+// ccFlags is the flags condition cc tests.
+func ccFlags(cc uint8) uint32 {
+	return [8]uint32{FlagOF, FlagCF, FlagZF, FlagCF | FlagZF, FlagSF, FlagPF, FlagSF | FlagOF, FlagZF | FlagSF | FlagOF}[cc>>1&7]
+}
+
+// produce is called right after an instruction set the host's flags: they are saved when they
+// can be observed (capture), otherwise dropped (overwritten before anyone looks).
+func (g *jitGen) produce(value, clear uint32) {
+	g.hostFrom = g.idx
+	if !g.capture[g.idx] {
+		g.pend.on = false
+		return
+	}
+	g.a.pushfq()
+	g.a.inst(0, 0, []byte{0x8F}, 0, xm(hR15, offRaw)) // pop qword [raw]
+	g.pend = jitPending{on: true, value: value, clear: clear}
+}
+
+// emitMerge merges saved flags p into c.Flags (uses r11, changes the host's flags).
+func (g *jitGen) emitMerge(p jitPending) {
+	if !p.on {
+		return
+	}
+	g.a.load32(hR11, xm(hR15, offRaw))
+	g.merge(p.value, p.clear)
 }
 
 type jitChain struct {
@@ -170,14 +281,6 @@ func (g *jitGen) chkStore(r int) {
 	g.a.jcc(0x5, g.slowLabel()) // jne
 }
 
-// flags merges the host's flags into c.Flags: bits in value come from the host, the rest of
-// clear become 0.
-func (g *jitGen) flags(value, clear uint32) {
-	g.a.pushfq()
-	g.a.pop(hR11)
-	g.merge(value, clear)
-}
-
 // merge is flags with the host's flags already in r11.
 func (g *jitGen) merge(value, clear uint32) {
 	g.a.alu32I(4, xr(hR11), value)            // and r11d, value
@@ -211,8 +314,10 @@ func (g *jitGen) get8(r uint8, dst int) {
 	g.a.movzx8(dst, xr(dst))
 }
 
-// put8 stores the low byte of host register src (r9 or r10) into guest 8-bit register r.
+// put8 stores the low byte of host register src (r9 or r10) into guest 8-bit register r. It
+// changes the host's flags.
 func (g *jitGen) put8(r uint8, src int) {
+	g.hostFrom = -1
 	if r < 4 {
 		g.a.store8(xr(h(r)), src)
 		return
@@ -238,7 +343,7 @@ func (g *jitGen) rm32(d *dInst) xop {
 
 // end leaves the block for target: chained to its translation when there is one.
 func (g *jitGen) end(target uint32) {
-	g.addSteps(g.jb.steps)
+	g.emitMerge(g.pend)
 	if t := g.j.byEIP[target]; t != nil {
 		g.jmpAbs(t.head)
 		return
@@ -251,7 +356,7 @@ func (g *jitGen) end(target uint32) {
 
 // endReg leaves the block for the guest address in register r: through the lookup table.
 func (g *jitGen) endReg(r int) {
-	g.addSteps(g.jb.steps)
+	g.emitMerge(g.pend)
 	g.a.store32(xm(hR15, offEIP), r)
 	g.a.movRR32(hR10, r)
 	g.a.alu32I(4, xr(hR10), jitTableMask)
@@ -262,12 +367,6 @@ func (g *jitGen) endReg(r int) {
 	g.a.jmpMem(xm(hR10, 8))
 }
 
-func (g *jitGen) addSteps(n uint64) {
-	if n != 0 {
-		g.a.alu64I(0, xm(hR15, offSteps), int32(n))
-	}
-}
-
 func (g *jitGen) exit(reason uint32) {
 	g.a.storeI32(xm(hR15, offExit), reason)
 	g.jmpAbs(g.epi)
@@ -275,67 +374,62 @@ func (g *jitGen) exit(reason uint32) {
 
 // jitTranslate emits translated code for jb into j's buffer.
 func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
-	g := &jitGen{c: c, j: j, jb: jb, base: uintptr(unsafe.Pointer(&j.buf[0])) + uintptr(j.used)}
-	g.epi = j.epilogue
-	g.slow = make([]int, len(jb.insts))
-	for i := range g.slow {
-		g.slow[i] = -1
-	}
-	g.endStub = g.a.newLabel()
-	a := &g.a
-	resume := make([]int, len(jb.insts))
-	native := 0
-
-	// head: the step-limit check for chained entries
-	limitExit := a.newLabel()
-	a.load64(hR11, xm(hR15, offSteps))
-	a.alu64I(0, xr(hR11), int32(jb.steps))
-	a.inst(0, xW, []byte{0x3B}, hR11, xm(hR15, offLimit)) // cmp r11, [limit]
-	a.jcc(0x7, limitExit)                                 // ja
-
-	g.start = jb.eip
-	for i := range jb.insts {
-		d := &jb.insts[i]
-		g.idx = i
-		resume[i] = len(a.b)
-		if g.inst(d) {
-			native++
-		} else {
-			a.jmp(g.slowLabel())
-		}
-		g.start += uint32(d.len)
-		if isFused(d.kind) {
-			g.start += uint32(d.len2)
-		}
-	}
-	if native == 0 {
+	n := len(jb.insts)
+	// A dry run finds the instructions that can leave for the interpreter (and whether any is
+	// translated at all); then which flag results can be observed.
+	dry := newJitGen(c, j, jb, nil)
+	if dry.body() == 0 {
 		return false
 	}
-	last := &jb.insts[len(jb.insts)-1]
-	if !endsBlock(last.kind) && !isFused(last.kind) {
-		g.end(g.start) // the block stopped before an uncached instruction or at blockMax
+	exits := make([]bool, n)
+	for i := range exits {
+		exits[i] = dry.slow[i] >= 0
 	}
+	g := newJitGen(c, j, jb, jitCaptures(jb.insts, exits, dry.hostOK))
+	g.body()
+	a := &g.a
 
 	// exits
-	a.bind(limitExit)
+	a.bind(g.limitExit)
+	a.alu64I(0, xm(hR15, offBudget), int32(jb.steps)) // not run: give the charge back
 	a.storeI32(xm(hR15, offEIP), jb.eip)
 	g.exit(jitExitLimit)
 	a.bind(g.endStub)
 	g.exit(jitExitEnd)
-	eip := jb.eip
+	slowExit := a.newLabel() // r11d = the instruction's index
+	a.bind(slowExit)
+	a.store32(xm(hR15, offEIdx), hR11)
+	a.storeI32(xm(hR15, offEBlk), jb.id)
+	g.exit(jitExitSlow)
 	for i := range jb.insts {
 		if g.slow[i] >= 0 {
 			a.bind(g.slow[i])
-			a.storeI32(xm(hR15, offEIP), eip)
-			g.addSteps(jb.prefix[i])
-			a.storeI32(xm(hR15, offEIdx), uint32(i))
-			a.storeI32(xm(hR15, offEBlk), jb.id)
-			g.exit(jitExitSlow)
+			g.emitMerge(g.slowPend[i])
+			a.movRI32NoFlags(hR11, uint32(i))
+			a.jmp(slowExit)
 		}
-		eip += uint32(jb.insts[i].len)
-		if isFused(jb.insts[i].kind) {
-			eip += uint32(jb.insts[i].len2)
+	}
+	// Resuming after the interpreter ran the previous instruction: the host's flags and the saved
+	// ones are stale. Code that uses them is entered through a stub setting them from c.Flags
+	// (merging those again changes nothing: bits an instruction zeroes are 0 there already).
+	resumeAt := make([]int, n) // label, or -1: enter at the instruction's code
+	for i := 1; i < n; i++ {
+		resumeAt[i] = -1
+		if g.slow[i-1] < 0 || (!g.entryPend[i].on && !g.natives[i]) {
+			continue
 		}
+		resumeAt[i] = a.newLabel()
+		a.bind(resumeAt[i])
+		if g.entryPend[i].on {
+			a.load32(hR11, xm(hR15, offFlags))
+			a.store64(xm(hR15, offRaw), hR11)
+		}
+		if g.natives[i] {
+			g.loadFlags()
+		}
+		code := a.newLabel()
+		a.labels[code] = g.resume[i]
+		a.jmp(code)
 	}
 	type site struct {
 		at     int
@@ -362,8 +456,11 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	}
 	copy(j.buf[j.used:], a.b)
 	jb.head = g.base
-	jb.resume = make([]uintptr, len(jb.insts))
-	for i, r := range resume {
+	jb.resume = make([]uintptr, n)
+	for i, r := range g.resume {
+		if i > 0 && resumeAt[i] >= 0 {
+			r = a.labels[resumeAt[i]]
+		}
 		jb.resume[i] = g.base + uintptr(r)
 	}
 	for _, s := range sites {
@@ -372,6 +469,112 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	j.used += (len(a.b) + 15) &^ 15
 	j.Stats.Bytes += uint64(len(a.b))
 	return true
+}
+
+func newJitGen(c *CPU, j *jitCode, jb *jitBlock, capture []bool) *jitGen {
+	g := &jitGen{c: c, j: j, jb: jb, base: uintptr(unsafe.Pointer(&j.buf[0])) + uintptr(j.used), epi: j.epilogue,
+		capture: capture, hostFrom: -1}
+	n := len(jb.insts)
+	if g.capture == nil { // the dry run: save every flag result
+		g.capture = make([]bool, n)
+		for i := range g.capture {
+			g.capture[i] = true
+		}
+	}
+	g.slow = make([]int, n)
+	for i := range g.slow {
+		g.slow[i] = -1
+	}
+	g.slowPend = make([]jitPending, n)
+	g.resume = make([]int, n)
+	g.entryPend = make([]jitPending, n)
+	g.natives = make([]bool, n)
+	g.hostOK = make([]bool, n)
+	g.endStub = g.a.newLabel()
+	g.limitExit = g.a.newLabel()
+	return g
+}
+
+// jitCaptures decides, for each instruction setting flags, whether they must be saved: yes if
+// anything may observe them before an instruction overwrites them all (an instruction reading
+// flags other than straight from the host's, a slow exit, the block's end).
+func jitCaptures(insts []dInst, exits, hostOK []bool) []bool {
+	n := len(insts)
+	capture := make([]bool, n)
+	for i := range insts {
+		f := jitFlagFx(&insts[i])
+		if !f.writes || f.dynamic {
+			continue
+		}
+		for k := i + 1; ; k++ {
+			if k == n || exits[k] {
+				capture[i] = true
+				break
+			}
+			fk := jitFlagFx(&insts[k])
+			if fk.reads && !(fk.native && k == i+1 && hostOK[i] && ccFlags(fk.cc)&^f.value == 0) {
+				capture[i] = true
+				break
+			}
+			if fk.writes {
+				if fk.dynamic || fk.clear&f.clear != f.clear {
+					capture[i] = true // merged before it (it doesn't overwrite them all)
+				}
+				break
+			}
+		}
+	}
+	return capture
+}
+
+// body translates the block's instructions (the head with the step-limit check first); it
+// returns how many were translated.
+func (g *jitGen) body() int {
+	a := &g.a
+	jb := g.jb
+	a.alu64I(5, xm(hR15, offBudget), int32(jb.steps)) // sub [budget], steps
+	a.jcc(0x2, g.limitExit)                           // jb: it would pass the limit
+	native := 0
+	g.start = jb.eip
+	for i := range jb.insts {
+		d := &jb.insts[i]
+		g.idx = i
+		g.resume[i] = len(a.b)
+		f := jitFlagFx(d)
+		g.native = f.reads && f.native && g.hostFrom == i-1 && i > 0 && ccFlags(f.cc)&^g.hostValue(i-1) == 0
+		g.entryPend[i], g.natives[i] = g.pend, g.native
+		if g.pend.on && ((f.reads && !g.native) || (f.writes && (f.dynamic || f.clear&g.pend.clear != g.pend.clear))) {
+			g.emitMerge(g.pend)
+			g.pend.on = false
+		}
+		g.slowPend[i] = g.pend
+		if !f.writes || f.dynamic {
+			g.hostFrom = -1
+		}
+		if g.inst(d) {
+			native++
+		} else {
+			a.jmp(g.slowLabel())
+		}
+		g.hostOK[i] = g.hostFrom == i
+		if f.dynamic {
+			g.pend.on = false
+		}
+		g.start += uint32(d.len)
+		if isFused(d.kind) {
+			g.start += uint32(d.len2)
+		}
+	}
+	last := &jb.insts[len(jb.insts)-1]
+	if !endsBlock(last.kind) && !isFused(last.kind) {
+		g.end(g.start) // the block stopped before an uncached instruction or at blockMax
+	}
+	return native
+}
+
+// hostValue is the flags instruction i takes from the host.
+func (g *jitGen) hostValue(i int) uint32 {
+	return jitFlagFx(&g.jb.insts[i]).value
 }
 
 // inst translates one instruction; false if it isn't translated (the interpreter runs it).
@@ -432,7 +635,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			g.loadFlags()
 		}
 		a.alu32(int(d.aux), rm, h(d.reg))
-		g.flags(aluFlags(d.aux))
+		g.produce(aluFlags(d.aux))
 	case dAluRRM32, dAluRRM32R:
 		rm := xr(h(d.rm))
 		if d.isMem {
@@ -444,13 +647,13 @@ func (g *jitGen) inst(d *dInst) bool {
 			g.loadFlags()
 		}
 		a.alu32RM(int(d.aux), h(d.reg), rm)
-		g.flags(aluFlags(d.aux))
+		g.produce(aluFlags(d.aux))
 	case dAluEAXImm:
 		if d.aux == 2 || d.aux == 3 {
 			g.loadFlags()
 		}
 		a.alu32I(int(d.aux), xr(hRAX), d.imm)
-		g.flags(aluFlags(d.aux))
+		g.produce(aluFlags(d.aux))
 	case dGrp1RM32, dGrp1RM32R:
 		rm := xr(h(d.rm))
 		if d.isMem {
@@ -466,7 +669,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			g.loadFlags()
 		}
 		a.alu32I(int(d.aux), rm, d.imm)
-		g.flags(aluFlags(d.aux))
+		g.produce(aluFlags(d.aux))
 	case dGrp1RM8:
 		if d.isMem {
 			g.ea(d)
@@ -485,7 +688,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			}
 			a.alu8I(int(d.aux), rm8Legacy(d.rm), uint8(d.imm), xHigh)
 		}
-		g.flags(aluFlags(d.aux))
+		g.produce(aluFlags(d.aux))
 	case dTestRMR32:
 		rm := xr(h(d.rm))
 		if d.isMem {
@@ -494,16 +697,16 @@ func (g *jitGen) inst(d *dInst) bool {
 			rm = memAt
 		}
 		a.inst(0, 0, []byte{0x85}, h(d.reg), rm)
-		g.flags(flagsLogic, flagsArith)
+		g.produce(flagsLogic, flagsArith)
 	case dTestRMI8:
 		g.testRMI8(d)
-		g.flags(flagsLogic, flagsArith)
+		g.produce(flagsLogic, flagsArith)
 	case dTestRMR8:
 		g.testRMR8(d)
-		g.flags(flagsLogic, flagsArith)
+		g.produce(flagsLogic, flagsArith)
 	case dTestALImm:
 		a.emit(0xA8, uint8(d.imm))
-		g.flags(flagsLogic, flagsArith)
+		g.produce(flagsLogic, flagsArith)
 
 	case dIncR, dDecR:
 		op := 0
@@ -511,7 +714,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			op = 1
 		}
 		a.inst(0, 0, []byte{0xFF}, op, xr(h(d.reg)))
-		g.flags(flagsArith&^FlagCF, flagsArith&^FlagCF)
+		g.produce(flagsArith&^FlagCF, flagsArith&^FlagCF)
 	case dIncRM32, dDecRM32:
 		op := 0
 		if d.kind == dDecRM32 {
@@ -524,7 +727,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			rm = memAt
 		}
 		a.inst(0, 0, []byte{0xFF}, op, rm)
-		g.flags(flagsArith&^FlagCF, flagsArith&^FlagCF)
+		g.produce(flagsArith&^FlagCF, flagsArith&^FlagCF)
 	case dNot32, dNeg32:
 		op := 2
 		if d.kind == dNeg32 {
@@ -538,7 +741,7 @@ func (g *jitGen) inst(d *dInst) bool {
 		}
 		a.inst(0, 0, []byte{0xF7}, op, rm)
 		if d.kind == dNeg32 {
-			g.flags(flagsArith, flagsArith)
+			g.produce(flagsArith, flagsArith)
 		}
 
 	case dPushR:
@@ -593,7 +796,9 @@ func (g *jitGen) inst(d *dInst) bool {
 			g.chkLoad(4)
 			rm = memAt
 		}
-		g.loadFlags()
+		if !g.native {
+			g.loadFlags()
+		}
 		a.cmov(d.aux, h(d.reg), rm)
 	case dSetcc:
 		if d.isMem {
@@ -603,7 +808,9 @@ func (g *jitGen) inst(d *dInst) bool {
 			a.setcc(d.aux, xr(hR9), xByte)
 			a.store8(memAt, hR9)
 		} else {
-			g.loadFlags()
+			if !g.native {
+				g.loadFlags()
+			}
 			a.setcc(d.aux, rm8Legacy(d.rm), xHigh)
 		}
 
@@ -660,7 +867,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			a.inst(0, 0, []byte{0x69}, h(d.reg), rm)
 			a.emit32(d.imm)
 		}
-		g.flags(FlagCF|FlagOF, FlagCF|FlagOF)
+		g.produce(FlagCF|FlagOF, FlagCF|FlagOF)
 	case dImulRRM32:
 		rm := xr(h(d.rm))
 		if d.isMem {
@@ -669,7 +876,7 @@ func (g *jitGen) inst(d *dInst) bool {
 			rm = memAt
 		}
 		a.inst(0, 0, []byte{0x0F, 0xAF}, h(d.reg), rm)
-		g.flags(FlagCF|FlagOF, FlagCF|FlagOF)
+		g.produce(FlagCF|FlagOF, FlagCF|FlagOF)
 
 	case dMovssLoad:
 		if d.isMem {
@@ -748,7 +955,7 @@ func (g *jitGen) inst(d *dInst) bool {
 		}
 		a.sse(0xF3, 0x10, 0, xmmOp(d.reg)) // movss xmm0, [xmm reg]
 		a.sse(0, 0x2E, 0, src)             // ucomiss xmm0, src
-		g.flags(flagsArith, flagsArith)
+		g.produce(flagsArith, flagsArith)
 	case dXorps:
 		src := xmmOp(d.rm)
 		if d.isMem {
@@ -765,7 +972,9 @@ func (g *jitGen) inst(d *dInst) bool {
 	case dJmp:
 		g.end(d.imm)
 	case dJcc:
-		g.loadFlags()
+		if !g.native {
+			g.loadFlags()
+		}
 		taken := a.newLabel()
 		a.jcc(d.aux, taken)
 		g.end(next)
@@ -801,9 +1010,275 @@ func (g *jitGen) inst(d *dInst) bool {
 	case dCmpRMRJcc, dCmpRRMJcc, dCmpRMIJcc, dCmpEAXJcc, dTestRMRJcc, dTestRMIJcc, dCmpRMI8Jcc:
 		g.fused(d, next)
 	default:
+		return g.inst2(d)
+	}
+	return true
+}
+
+// inst2 translates the forms cached for the JIT (dAlu8RMR and after).
+func (g *jitGen) inst2(d *dInst) bool {
+	a := &g.a
+	adcSbb := d.aux == 2 || d.aux == 3
+	switch d.kind {
+	case dAlu8RMR: // op r/m8, r8
+		if !d.isMem {
+			if adcSbb {
+				g.loadFlags()
+			}
+			a.inst(0, xHigh, []byte{d.aux << 3}, int(d.reg), rm8Legacy(d.rm))
+			g.produce(aluFlags(d.aux))
+			break
+		}
+		g.ea(d)
+		if d.aux == 7 {
+			g.chkLoad(1)
+		} else {
+			g.chkStore(hR8)
+		}
+		r := h(d.reg)
+		if d.reg >= 4 {
+			g.get8(d.reg, hR9)
+			r = hR9
+		}
+		if adcSbb {
+			g.loadFlags()
+		}
+		a.inst(0, xByte, []byte{d.aux << 3}, r, memAt)
+		g.produce(aluFlags(d.aux))
+	case dAlu8RRM: // op r8, r/m8
+		if !d.isMem {
+			if adcSbb {
+				g.loadFlags()
+			}
+			a.inst(0, xHigh, []byte{d.aux<<3 | 2}, int(d.reg), rm8Legacy(d.rm))
+			g.produce(aluFlags(d.aux))
+			break
+		}
+		g.ea(d)
+		g.chkLoad(1)
+		if d.reg < 4 {
+			if adcSbb {
+				g.loadFlags()
+			}
+			a.inst(0, xByte, []byte{d.aux<<3 | 2}, h(d.reg), memAt)
+			g.produce(aluFlags(d.aux))
+			break
+		}
+		g.get8(d.reg, hR9)
+		if adcSbb {
+			g.loadFlags()
+		}
+		a.inst(0, xByte, []byte{d.aux<<3 | 2}, hR9, memAt)
+		g.produce(aluFlags(d.aux))
+		if d.aux != 7 {
+			g.put8(d.reg, hR9)
+		}
+	case dAluALImm:
+		if adcSbb {
+			g.loadFlags()
+		}
+		a.emit(d.aux<<3|4, uint8(d.imm))
+		g.produce(aluFlags(d.aux))
+	case dMovR8Imm:
+		a.emit(0xB0+d.reg, uint8(d.imm))
+	case dNot8, dNeg8:
+		op := 2
+		if d.kind == dNeg8 {
+			op = 3
+		}
+		if d.isMem {
+			g.ea(d)
+			g.chkStore(hR8)
+			a.inst(0, xByte, []byte{0xF6}, op, memAt)
+		} else {
+			a.inst(0, xHigh, []byte{0xF6}, op, rm8Legacy(d.rm))
+		}
+		if d.kind == dNeg8 {
+			g.produce(flagsArith, flagsArith)
+		}
+	case dRetImm:
+		a.movRR32(hR8, hR12)
+		g.chkLoad(4)
+		a.load32(hR9, memAt)
+		a.lea32(hR12, xm(hR12, 4+int32(d.imm)))
+		g.endReg(hR9)
+
+	case dMov16Store, dMov16Load, dAlu16RMR, dAlu16RRM, dTest16:
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			if d.kind == dMov16Store || d.kind == dAlu16RMR && d.aux != 7 {
+				g.chkStore(hR8)
+			} else {
+				g.chkLoad(2)
+			}
+			rm = memAt
+		}
+		var opc byte
+		switch d.kind {
+		case dMov16Store:
+			opc = 0x89
+		case dMov16Load:
+			opc = 0x8B
+		case dAlu16RMR:
+			opc = d.aux<<3 | 1
+		case dAlu16RRM:
+			opc = d.aux<<3 | 3
+		case dTest16:
+			opc = 0x85
+		}
+		alu := d.kind == dAlu16RMR || d.kind == dAlu16RRM
+		if alu && adcSbb {
+			g.loadFlags()
+		}
+		a.inst(0x66, 0, []byte{opc}, h(d.reg), rm)
+		switch {
+		case alu:
+			g.produce(aluFlags(d.aux))
+		case d.kind == dTest16:
+			g.produce(flagsLogic, flagsArith)
+		}
+	case dMov16Imm:
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			g.chkStore(hR8)
+			rm = memAt
+		}
+		a.inst(0x66, 0, []byte{0xC7}, 0, rm)
+		a.emit16(uint16(d.imm))
+	case dGrp1RM16:
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			if d.aux == 7 {
+				g.chkLoad(2)
+			} else {
+				g.chkStore(hR8)
+			}
+			rm = memAt
+		}
+		if adcSbb {
+			g.loadFlags()
+		}
+		a.inst(0x66, 0, []byte{0x81}, int(d.aux), rm)
+		a.emit16(uint16(d.imm))
+		g.produce(aluFlags(d.aux))
+
+	case dArithSS2:
+		src := xmmOp(d.rm)
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(4)
+			src = memAt
+		}
+		a.sse(0xF3, 0x10, 0, xmmOp(d.reg))
+		a.sse(0xF3, d.aux, 0, src)
+		a.sse(0xF3, 0x11, 0, xmmOp(d.reg))
+	case dArithSD:
+		src := xmmOp(d.rm)
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(8)
+			src = memAt
+		}
+		a.sse(0xF2, 0x10, 0, xmmOp(d.reg)) // movsd xmm0, [xmm reg]
+		a.sse(0xF2, d.aux, 0, src)         // addsd.. xmm0, src
+		a.sse(0xF2, 0x11, 0, xmmOp(d.reg)) // movsd [xmm reg], xmm0
+	case dArithPS, dLogicPS:
+		g.src128(d, 1)
+		a.sse(0, 0x10, 0, xmmOp(d.reg))
+		a.sse(0, d.aux, 0, xr(1))
+		a.sse(0, 0x11, 0, xmmOp(d.reg))
+	case dCvtSS2SD, dCvtSD2SS:
+		src := xmmOp(d.rm)
+		size, pfx, store := 4, byte(0xF3), byte(0xF2)
+		if d.kind == dCvtSD2SS {
+			size, pfx, store = 8, 0xF2, 0xF3
+		}
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(size)
+			src = memAt
+		}
+		a.sse(pfx, 0x5A, 0, src)
+		a.sse(store, 0x11, 0, xmmOp(d.reg)) // movsd / movss [xmm reg], xmm0
+	case dCvttSS2SI, dCvttSD2SI:
+		src := xmmOp(d.rm)
+		size, pfx := 4, byte(0xF3)
+		if d.kind == dCvttSD2SI {
+			size, pfx = 8, 0xF2
+		}
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(size)
+			src = memAt
+		}
+		a.sse(pfx, 0x2C, h(d.reg), src)
+	case dCvtSI2SS, dCvtSI2SD:
+		src := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(4)
+			src = memAt
+		}
+		pfx := byte(0xF3)
+		if d.kind == dCvtSI2SD {
+			pfx = 0xF2
+		}
+		a.sse(pfx, 0x10, 0, xmmOp(d.reg))
+		a.sse(pfx, 0x2A, 0, src)
+		a.sse(pfx, 0x11, 0, xmmOp(d.reg))
+	case dUcomisd:
+		src := xmmOp(d.rm)
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(8)
+			src = memAt
+		}
+		a.sse(0xF2, 0x10, 0, xmmOp(d.reg))
+		a.sse(0x66, 0x2E, 0, src)
+		g.produce(flagsArith, flagsArith)
+	case dPshufd:
+		g.src128(d, 1)
+		a.sse(0x66, 0x70, 0, xr(1))
+		a.emit(uint8(d.imm))
+		a.sse(0, 0x11, 0, xmmOp(d.reg))
+	case dMovdToX:
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(4)
+			a.load32(hR9, memAt)
+		} else {
+			a.movRR32(hR9, h(d.rm))
+		}
+		a.store64(xmmOp(d.reg), hR9) // zero-extended
+		a.inst(0, xW, []byte{0xC7}, 0, xm(hR15, offXMM+16*int32(d.reg)+8))
+		a.emit32(0)
+	case dMovdFromX:
+		a.load32(hR9, xmmOp(d.reg))
+		if d.isMem {
+			g.ea(d)
+			g.chkStore(hR8)
+			a.store32(memAt, hR9)
+		} else {
+			a.movRR32(h(d.rm), hR9)
+		}
+	default:
 		return false
 	}
 	return true
+}
+
+// src128 loads d's 128-bit source operand into host XMM register x.
+func (g *jitGen) src128(d *dInst, x int) {
+	if d.isMem {
+		g.ea(d)
+		g.chkLoad(16)
+		g.a.sse(0, 0x10, x, memAt)
+		return
+	}
+	g.a.sse(0, 0x10, x, xmmOp(d.rm))
 }
 
 // push stores the value in register val() (evaluated before ESP changes) at ESP-4.
@@ -896,7 +1371,7 @@ func (g *jitGen) fused(d *dInst, next uint32) {
 		}
 	}
 	a.setcc(d.cond, xr(hR10), xByte)
-	g.flags(value, clear)
+	g.produce(value, clear)
 	taken := a.newLabel()
 	a.inst(0, xByte, []byte{0x84}, hR10, xr(hR10)) // test r10b, r10b
 	a.jcc(0x5, taken)
@@ -929,11 +1404,11 @@ func (g *jitGen) shiftImm(d *dInst) {
 	}
 	switch op {
 	case 0: // rol
-		g.flags(FlagCF|of, FlagCF|of)
+		g.produce(FlagCF|of, FlagCF|of)
 	case 1, 2, 3: // ror, rcl, rcr
-		g.flags(FlagCF, FlagCF)
+		g.produce(FlagCF, FlagCF)
 	default: // shl, shr, sal, sar
-		g.flags(FlagCF|FlagPF|FlagZF|FlagSF|of, flagsArith)
+		g.produce(FlagCF|FlagPF|FlagZF|FlagSF|of, flagsArith)
 	}
 }
 

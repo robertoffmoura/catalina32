@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -21,6 +23,8 @@ const (
 	jtArray = 0x00201000 // ESI
 	jtStack = 0x00300000
 	jtSub   = 0x00180000 // a subroutine: add eax, 1; ret
+	jtThunk = 0x00180040 // a host function (intercept): changes EAX, EDX and memory, then returns
+	jtSub2  = 0x00180080 // add eax, [esp+4]; ret 4
 )
 
 // jtGen writes random guest instructions.
@@ -74,7 +78,7 @@ func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func (g *jtGen) inst() []byte {
 	r := g.r
 	op := uint8(r.Intn(8))
-	switch r.Intn(40) {
+	switch r.Intn(52) {
 	case 0: // op r/m32, r32
 		return cat([]byte{op<<3 | 1}, g.modrm(g.any(), g.dst(), true, op != 7))
 	case 1: // op r32, r/m32
@@ -180,6 +184,64 @@ func (g *jtGen) inst() []byte {
 		return cat([]byte{0xC7}, g.modrm(0, g.dst(), true, true), g.imm32())
 	case 34: // an untranslated form between translated ones: cdq
 		return []byte{0x99}
+	case 35: // 8-bit ALU: op r/m8, r8 / op r8, r/m8 / op al, imm8
+		switch r.Intn(3) {
+		case 0:
+			return cat([]byte{op << 3}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, op != 7))
+		case 1:
+			return cat([]byte{op<<3 | 2}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+		}
+		return []byte{op<<3 | 4, byte(r.Intn(256))}
+	case 36: // mov r8, imm8; not / neg r/m8
+		if r.Intn(2) == 0 {
+			return []byte{0xB0 + byte(r.Intn(8)), byte(r.Intn(256))}
+		}
+		return cat([]byte{0xF6}, g.modrm(uint8(2+r.Intn(2)), uint8(r.Intn(8)), true, true))
+	case 37: // 16-bit mov
+		switch r.Intn(3) {
+		case 0:
+			return cat([]byte{0x66, 0x89}, g.modrm(g.any(), g.dst(), true, true))
+		case 1:
+			return cat([]byte{0x66, 0x8B}, g.modrm(g.dst(), g.any(), true, false))
+		}
+		return cat([]byte{0x66, 0xC7}, g.modrm(0, g.dst(), true, true), []byte{byte(r.Intn(256)), byte(r.Intn(256))})
+	case 38: // 16-bit ALU and test
+		switch r.Intn(5) {
+		case 0:
+			return cat([]byte{0x66, op<<3 | 1}, g.modrm(g.any(), g.dst(), true, op != 7))
+		case 1:
+			return cat([]byte{0x66, op<<3 | 3}, g.modrm(g.dst(), g.any(), true, false))
+		case 2:
+			return cat([]byte{0x66, 0x81}, g.modrm(op, g.dst(), true, op != 7), []byte{byte(r.Intn(256)), byte(r.Intn(256))})
+		case 3:
+			return cat([]byte{0x66, 0x83}, g.modrm(op, g.dst(), true, op != 7), []byte{byte(r.Intn(256))})
+		}
+		return cat([]byte{0x66, 0x85}, g.modrm(g.any(), g.any(), true, false))
+	case 39: // sqrtss / minss / maxss, scalar double arithmetic
+		if r.Intn(2) == 0 {
+			o := []byte{0x51, 0x5D, 0x5F}[r.Intn(3)]
+			return cat([]byte{0xF3, 0x0F, o}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+		}
+		o := []byte{0x51, 0x58, 0x59, 0x5C, 0x5D, 0x5E, 0x5F}[r.Intn(7)]
+		return cat([]byte{0xF2, 0x0F, o}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+	case 40: // packed single arithmetic and logic
+		o := []byte{0x51, 0x58, 0x59, 0x5C, 0x5D, 0x5E, 0x5F, 0x54, 0x55, 0x56}[r.Intn(10)]
+		return cat([]byte{0x0F, o}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+	case 41: // conversions between single and double
+		return cat([]byte{[]byte{0xF3, 0xF2}[r.Intn(2)], 0x0F, 0x5A}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+	case 42: // float to int (truncating)
+		return cat([]byte{[]byte{0xF3, 0xF2}[r.Intn(2)], 0x0F, 0x2C}, g.modrm(g.dst(), uint8(r.Intn(8)), true, false))
+	case 43: // int to float
+		return cat([]byte{[]byte{0xF3, 0xF2}[r.Intn(2)], 0x0F, 0x2A}, g.modrm(uint8(r.Intn(8)), g.any(), true, false))
+	case 44: // ucomisd / comisd
+		return cat([]byte{0x66, 0x0F, byte(0x2E + r.Intn(2))}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+	case 45: // pshufd
+		return cat([]byte{0x66, 0x0F, 0x70}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false), []byte{byte(r.Intn(256))})
+	case 46: // movd xmm, r/m32 / movd r/m32, xmm
+		if r.Intn(2) == 0 {
+			return cat([]byte{0x66, 0x0F, 0x6E}, g.modrm(uint8(r.Intn(8)), g.any(), true, false))
+		}
+		return cat([]byte{0x66, 0x0F, 0x7E}, g.modrm(uint8(r.Intn(8)), g.dst(), true, true))
 	default: // compare or test, often followed by a Jcc (fused)
 		return g.compare()
 	}
@@ -214,13 +276,18 @@ func (g *jtGen) program(n int) []byte {
 		switch r.Intn(8) {
 		case 0, 1: // a Jcc over the next 0..3 items
 			skips[len(skips)-1] = r.Intn(4)
-		case 2: // call the subroutine (its rel32 is set at layout)
-			items = append(items, []byte{0xE8, 0, 0, 0, 0})
+		case 2: // call the subroutine or the host function (rel32 set at layout)
+			items = append(items, []byte{0xE8, byte(r.Intn(2)), 0, 0, 0})
 			skips = append(skips, -1)
 		case 3: // call [ebp+0x78] (the subroutine's address)
 			if r.Intn(4) == 0 {
 				items = append(items, []byte{0xFF, 0x55, 0x78})
 				skips = append(skips, -1)
+			}
+		case 4: // push an argument, call a function returning with ret 4
+			if r.Intn(2) == 0 {
+				items = append(items, []byte{0x50 + g.any()}, []byte{0xE8, 2, 0, 0, 0})
+				skips = append(skips, -1, -1)
 			}
 		}
 	}
@@ -234,7 +301,8 @@ func (g *jtGen) program(n int) []byte {
 		at := len(out)
 		out = append(out, it...)
 		if it[0] == 0xE8 && len(it) == 5 {
-			binary.LittleEndian.PutUint32(out[at+1:], jtSub-(jtCode+uint32(at)+5))
+			to := []uint32{jtSub, jtThunk, jtSub2}[it[1]]
+			binary.LittleEndian.PutUint32(out[at+1:], to-(jtCode+uint32(at)+5))
 		}
 		if k := skips[i]; k >= 0 {
 			skip := 0
@@ -275,8 +343,18 @@ func jtRun(t *testing.T, prog []byte, seed int64, jit bool, maxSteps uint64) jtS
 	c := NewCPU()
 	c.NoJIT = !jit
 	copy(c.Mem[jtCode:], prog)
-	copy(c.Mem[jtSub:], []byte{0x83, 0xC0, 0x01, 0xC3}) // add eax, 1; ret
+	copy(c.Mem[jtSub:], []byte{0x83, 0xC0, 0x01, 0xC3})              // add eax, 1; ret
+	copy(c.Mem[jtSub2:], []byte{0x03, 0x44, 0x24, 0x04, 0xC2, 4, 0}) // add eax, [esp+4]; ret 4
 	c.SetCodeRange(jtCode, jtSub+0x100)
+	if seed%2 == 1 { // translated code hands stores to the data area to the interpreter
+		c.jitSlowPages = [][2]uint32{{jtData, jtData + 0x1000}}
+	}
+	c.RegisterIntercept(jtThunk, "thunk", func(c *CPU) {
+		c.Regs[RegEAX] = c.Regs[RegEAX]*3 + c.Regs[RegECX]
+		c.Regs[RegEDX] ^= uint32(c.Steps)
+		c.Write32(jtData+0x60, c.Read32(jtData+0x60)+c.Regs[RegEAX])
+		c.Ret()
+	})
 	for i := range c.Regs {
 		c.Regs[i] = r.Uint32()
 		if r.Intn(3) == 0 {
@@ -318,6 +396,7 @@ func jtRun(t *testing.T, prog []byte, seed int64, jit bool, maxSteps uint64) jtS
 		st.halted = c.HaltReason
 	}
 	st.stats = c.JITStats()
+	c.Close()
 	return st
 }
 
@@ -363,6 +442,9 @@ func TestJITMatchesInterpreter(t *testing.T) {
 	if testing.Short() {
 		n = 300
 	}
+	if v, err := strconv.Atoi(os.Getenv("C32_JITN")); err == nil { // more programs
+		n = v
+	}
 	var total JITStats
 	halts := 0
 	for seed := int64(0); seed < int64(n); seed++ {
@@ -383,5 +465,27 @@ func TestJITMatchesInterpreter(t *testing.T) {
 	t.Logf("%d programs (%d halted): %d blocks translated, %d entries, %d slow exits", n, halts, total.Translated, total.Entries, total.SlowExits)
 	if total.Translated < uint64(n) || total.Entries < uint64(n) {
 		t.Errorf("translated code hardly ran")
+	}
+}
+
+// C32_JITSEED=<n> go test ./pkg/cpu -run JITBisect -v: the first step at which seed n's program
+// differs between the interpreter and the JIT (debugging TestJITMatchesInterpreter failures).
+func TestJITBisect(t *testing.T) {
+	v := os.Getenv("C32_JITSEED")
+	if v == "" {
+		t.Skip("C32_JITSEED not set")
+	}
+	seed, _ := strconv.ParseInt(v, 10, 64)
+	defer func(v uint32) { jitThreshold = v }(jitThreshold)
+	jitThreshold = 2
+	g := &jtGen{r: rand.New(rand.NewSource(seed))}
+	prog := g.program(5 + g.r.Intn(30))
+	for n := uint64(1); n < 20000; n++ {
+		a := jtRun(t, prog, seed, false, n)
+		b := jtRun(t, prog, seed, true, n)
+		if d := a.diff(b); d != "" && !strings.HasPrefix(d, "eip") {
+			c := jtRun(t, prog, seed, false, n-1)
+			t.Fatalf("first difference after %d steps (before it: eip %#x, regs %08x flags %#x):\n%s", n, c.eip, c.regs, c.flags, d)
+		}
 	}
 }

@@ -522,21 +522,15 @@ func (c *CPU) Step() {
 	}
 
 	// Check if current EIP is intercepted by a host thunk or lifted function
-	if c.EIP >= ArenaSize || c.icept[c.EIP>>6]&(1<<(c.EIP&63)) != 0 {
-		e := &c.thunkCache[c.EIP&uint32(len(c.thunkCache)-1)]
-		if e.fn == nil || e.eip != c.EIP {
-			fn, ok := c.Intercepts[c.EIP]
-			if !ok {
-				goto decode
-			}
-			e.eip, e.fn = c.EIP, fn
-		}
+	if fn := c.interceptAt(c.EIP); fn != nil {
 		c.Steps++
-		e.fn(c)
+		fn(c)
 		return
 	}
-decode:
 
+	if c.SlowOps != nil && c.EIP < ArenaSize-4 {
+		c.SlowOps[uint32(c.Mem[c.EIP])<<16|uint32(c.Mem[c.EIP+1])<<8|uint32(c.Mem[c.EIP+2])]++
+	}
 	if c.EIP >= c.CodeLo && c.EIP < c.CodeHi {
 		d := &c.dcache[c.EIP&dcacheMask]
 		if d.tag != c.EIP {
@@ -549,6 +543,22 @@ decode:
 		}
 	}
 	c.stepFull()
+}
+
+// interceptAt returns the host function intercepting eip, or nil.
+func (c *CPU) interceptAt(eip uint32) ThunkFunc {
+	if eip < ArenaSize && c.icept[eip>>6]&(1<<(eip&63)) == 0 {
+		return nil
+	}
+	e := &c.thunkCache[eip&uint32(len(c.thunkCache)-1)]
+	if e.fn == nil || e.eip != eip {
+		fn, ok := c.Intercepts[eip]
+		if !ok {
+			return nil
+		}
+		e.eip, e.fn = eip, fn
+	}
+	return e.fn
 }
 
 // StepRaw executes the instruction at EIP with the full decoder, ignoring intercepts and the
@@ -2087,7 +2097,7 @@ func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 				}
 			}
 			if b.jit != nil {
-				c.jitRun(b.jit, limit)
+				c.jitRun(b.jit, stopEIP, limit)
 				continue
 			}
 		}

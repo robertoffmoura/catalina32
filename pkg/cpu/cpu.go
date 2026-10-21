@@ -149,6 +149,11 @@ type CPU struct {
 	jit    jitState
 	jitc   *jitCode
 	jitGen uint32 // bumped when translations are discarded (dBlock.jitGen must match)
+	// Diagnostics: when non-nil, counts instructions Step decodes in full, by their first three
+	// bytes (forms worth adding to the decoded-instruction cache).
+	SlowOps map[uint32]uint64
+	// Tests: more pages whose stores translated code hands to the interpreter.
+	jitSlowPages [][2]uint32
 }
 
 // SetWatch calls fn for every guest load and store that touches [lo, hi). Accesses then all take
@@ -187,6 +192,22 @@ func NewCPU() *CPU {
 	c.Regs[RegESP] = StackTopAddr
 	c.Regs[RegEBP] = StackTopAddr
 	return c
+}
+
+// Close returns the CPU's memory (guest memory, translated code) to the system; the CPU must
+// not be used afterwards. Long-running processes making many CPUs (tests) need it: each
+// reserves gigabytes of address space.
+func (c *CPU) Close() {
+	freeArena(c.Mem)
+	freeBitmap(c.icept)
+	if c.textPages != nil {
+		c.textPages = nil
+	}
+	if c.jitc != nil && c.jitc.buf != nil {
+		freeArena(c.jitc.buf)
+		c.jitc.buf = nil
+	}
+	c.Mem, c.icept, c.jitc = nil, nil, nil
 }
 
 func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
