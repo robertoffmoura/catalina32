@@ -89,6 +89,7 @@ type glRemote struct {
 	token    uint32
 	frames   uint64
 	sent     uint64            // commands sent (diagnostics)
+	waited   time.Duration     // time spent waiting for the viewer (diagnostics)
 	asked    map[string]uint64 // questions (calls waiting for the window's answer) by name (diagnostics)
 	askedN   uint64
 	strings  map[uint32]uint32 // glGetString results, in guest memory
@@ -238,7 +239,9 @@ func (g *glRemote) pause() {
 	if glPauseStart.IsZero() {
 		glPauseStart = time.Now()
 	}
+	t := time.Now()
 	time.Sleep(50 * time.Microsecond)
+	g.waited += time.Since(t)
 	if time.Since(glPauseStart) > 10*time.Second {
 		g.gone = true
 		g.m.logf("[gl] the viewer stopped answering: drawing nothing from now on")

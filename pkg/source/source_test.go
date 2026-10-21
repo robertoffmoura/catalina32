@@ -10,11 +10,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"catalina32/pkg/cpu"
+	"golang.org/x/arch/x86/x86asm"
 )
 
 // C32_SOURCE_DIR=<folder with hl2_osx> [C32_STEPS=n] go test ./pkg/source -run Boot -v
@@ -96,6 +98,9 @@ func TestBoot(t *testing.T) {
 				if from != 0 && c.Steps >= from {
 					from = 0
 					c.Run0JITStats()
+					if c.SlowOps != nil {
+						clear(c.SlowOps) // C32_SLOWOPS: from here on too
+					}
 				}
 			}
 		}
@@ -123,22 +128,41 @@ func TestBoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,cpu_ms,host_calls,gl_commands,gl_kb,gl_questions,jit_slow,jit_end,jit_resets")
+		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,cpu_ms,host_calls,gl_commands,gl_kb,gl_questions,jit_slow,jit_end,jit_resets,gl_wait_ms,jit_translated,in_jit_pct")
 		var last struct {
-			steps, full, calls, cmds, bytes, asked, slow, end uint64
-			at                                                time.Time
-			cpu                                               time.Duration
+			steps, full, calls, cmds, bytes, asked, slow, end, translated uint64
+			at                                                            time.Time
+			cpu, waited                                                   time.Duration
 		}
 		last.at, last.cpu = time.Now(), processCPU()
 		frame := 0
+		var inJIT, samples atomic.Uint64 // a goroutine samples whether translated code is running
+		sampling := make(chan struct{})
+		defer close(sampling)
+		go func() { // (C32_INJIT=1: it wakes the scheduler often enough to cost a few percent)
+			for os.Getenv("C32_INJIT") == "1" {
+				select {
+				case <-sampling:
+					return
+				default:
+				}
+				time.Sleep(20 * time.Microsecond)
+				samples.Add(1)
+				if atomic.LoadUint32(&m.C.InJIT) != 0 {
+					inJIT.Add(1)
+				}
+			}
+		}()
 		m.OnFrame = func(c *cpu.CPU) {
 			frame++
 			now, st := time.Now(), c.JITStats()
 			cpuNow := processCPU()
-			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.1f,%d,%d,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
+			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.1f,%d,%d,%d,%d,%.2f,%d,%.0f\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
 				float64(now.Sub(last.at).Microseconds())/1000, float64((cpuNow-last.cpu).Microseconds())/1000, c.HostCalls-last.calls, m.glr.sent-last.cmds,
-				float64(m.glr.w-last.bytes)/1024, m.glr.askedN-last.asked, st.SlowExits-last.slow, st.EndExits-last.end, st.Resets)
+				float64(m.glr.w-last.bytes)/1024, m.glr.askedN-last.asked, st.SlowExits-last.slow, st.EndExits-last.end, st.Resets,
+				float64((m.glr.waited-last.waited).Microseconds())/1000, st.Translated-last.translated, 100*float64(inJIT.Swap(0))/float64(max(samples.Swap(0), 1)))
 			last.steps, last.full, last.calls, last.cmds, last.bytes, last.asked, last.slow, last.end, last.at, last.cpu = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, m.glr.askedN, st.SlowExits, st.EndExits, now, cpuNow
+			last.waited, last.translated = m.glr.waited, st.Translated
 		}
 	}
 	if p := os.Getenv("C32_CPUPROF"); p != "" { // the host's CPU profile from instruction C32_CPUPROF_AFTER on
@@ -252,6 +276,29 @@ func TestBoot(t *testing.T) {
 		t.Logf("  end exits by what runs there: %v", kinds)
 		for i := 0; i < len(top) && i < 25; i++ {
 			t.Logf("  end exit to %#x (%s, %s): %d", top[i].eip, m.where(top[i].eip), m.C.JITTargetKind(top[i].eip), top[i].n)
+		}
+		top = top[:0]
+		var trans uint64
+		for e, n := range st.TransAt {
+			top = append(top, kv{e, n})
+			trans += n
+		}
+		sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
+		t.Logf("  %d translations of %d blocks", trans, len(top))
+		for i := 0; i < len(top) && i < 25; i++ {
+			t.Logf("  translated %dx: %#x (%s)", top[i].n, top[i].eip, m.where(top[i].eip))
+		}
+		top = top[:0]
+		for e, n := range st.SlowAt {
+			top = append(top, kv{e, n})
+		}
+		sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
+		for i := 0; i < len(top) && i < 40; i++ {
+			inst := "?"
+			if in, err := x86asm.Decode(m.C.Bytes(top[i].eip, 16), 32); err == nil {
+				inst = x86asm.GNUSyntax(in, uint64(top[i].eip), nil)
+			}
+			t.Logf("  slow exit at %#x (%s): %s: %d", top[i].eip, m.where(top[i].eip), inst, top[i].n)
 		}
 	}
 	if m.C.TraceCalls {
