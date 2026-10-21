@@ -461,6 +461,8 @@ const (
 	a64VFdiv  = 0x6E20FC00
 	a64VFcmeq = 0x4E20E400
 	a64VFcmgt = 0x6EA0E400
+	a64VFcmge = 0x6E20E400
+	a64VZip1  = 0x4E803800 // .4s
 	a64VAnd   = 0x4E201C00 // .16b
 	a64VBic   = 0x4E601C00
 	a64VOrr   = 0x4EA01C00
@@ -472,6 +474,8 @@ const (
 func (a *a64) vop(op uint32, rd, rn, rm int) {
 	a.emit(op | uint32(rm)<<16 | uint32(rn)<<5 | uint32(rd))
 }
+
+func (a *a64) vnot(rd, rn int) { a.emit(0x6E205800 | uint32(rn)<<5 | uint32(rd)) } // .16b
 
 func (a *a64) vfsqrt(rd, rn int) { a.emit(0x6EA1F800 | uint32(rn)<<5 | uint32(rd)) }
 

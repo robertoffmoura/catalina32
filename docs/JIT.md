@@ -38,15 +38,25 @@ Measured on the Linux dev container, x86-64 backend, against the interpreter wit
 |---|---|---|
 | Before self-checking blocks | 177 ms | 140 ms |
 | With them and a bigger code buffer | 146 ms | 100 ms |
+| With x87 cached and translated | 122 ms | 92 ms |
 | Guest instructions per frame | 19.8 M | 16.5 M |
-| Of which the full decoder runs | 1.57 M, now 0.75 M | 1.61 M, now 0.75 M |
+| Of which the full decoder runs | 1.57 M, then 0.75 M, 0.22 M, now 0.1 M | 1.61 M, then 0.75 M, 0.19 M, now 0.09 M |
 | GL commands per frame | 3,645 | 1,730 |
+
+These are single runs on a container that shares the Mac's CPU (OrbStack): identical runs vary
+by up to 3× when the Mac is busy. Compare builds by alternating them and looking at the fastest
+frames (10th percentile), and trust the deterministic counters most. With the last forms added
+(`test r/m32, imm32`, `xchg`, `cmpxchg`, `bt`, `unpcklps`, `cmpps`, `shufps`, `movmskps`,
+`movhlps`/`movlps`): returns to Go per frame in the room view 198,000 → 117,000; the 10th
+percentile frame 122 → 93 ms over three alternating runs.
 
 - The full decoder had run Miles's MP3 decoder (`mssmp3.asi`), which Miles loads into heap
   memory itself: outside the code range, so neither cached nor translated. Self-checking
   blocks (below) now cover it.
-- **What is left:** its x87 and MMX instructions, which the cache doesn't decode (about 0.33 M
-  per frame), and Go round trips for host calls (about 40,000 a frame).
+- **What is left:** about 0.1 M instructions a frame the cache doesn't decode (MMX in the MP3
+  decoder, packed-double SSE, x87 compares), and Go round trips for host calls (about 45,000 a
+  frame). Those round trips (`jitRun`, `jitNext`, excluding the host functions' own work) are
+  under 10% of the profile; translated code itself is about half.
 - **What a larger view adds:** more translated game code, and more host calls and returns to
   Go.
 
@@ -130,8 +140,10 @@ Translated code must be indistinguishable from the interpreter.
   - truncating conversions out of range give 0x80000000 (`ToInt32`);
   - MINSS and MAXSS return the second operand unless strictly less (greater).
 - **Forms.** Every `dInst` kind the decoded-instruction cache has is translated, including the
-  fused compare+branch kinds, 8- and 16-bit ALU forms, and scalar and packed SSE. x87 isn't
-  cached, so it stays in the interpreter. Untranslated forms are slow exits.
+  fused compare+branch kinds, 8- and 16-bit ALU forms, scalar and packed SSE, and the common x87
+  (`fld`, `fst`/`fstp`, `fxch`, `fchs`, `fabs`, arithmetic with registers or m32/m64). The
+  interpreter's x87 is `float64` arithmetic on `FPUSt` from `FPUTop`; translated code loads the
+  top per instruction and does the same arithmetic in doubles. Untranslated forms are slow exits.
 
 ### x86-64 backend
 
@@ -235,9 +247,8 @@ Translated code must be indistinguishable from the interpreter.
 
 ## Ideas not done
 
-- **x87 (and MMX) in the cache and the JIT.** Miles's MP3 decoder is heavy in x87: `fld`,
-  `fxch`, `fmul`, `faddp`, `fstp`. The interpreter's x87 is plain `float64` arithmetic on eight
-  registers, which both backends can do with double-precision instructions.
+- **More forms:** MMX (the MP3 decoder), packed-double SSE, x87 compares (`fcomi`, `fnstsw`).
+  `C32_SLOWOPS` and `C32_JITSTATS=<instruction>` (exits by what runs there) show which.
 - **Host calls without leaving translated code** (the main cost left in Portal). It would
   need calling Go from generated code, or translating the hottest host functions.
 - **Superblocks or traces** across unconditional jumps and calls.

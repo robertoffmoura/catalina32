@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -81,8 +82,22 @@ func TestBoot(t *testing.T) {
 	if v := os.Getenv("C32_CMDS"); v != "" {
 		m.OnPoll = consoleAt(t, m, v)
 	}
-	if os.Getenv("C32_JITSTATS") != "" {
-		m.C.Run0JITStats()
+	if v := os.Getenv("C32_JITSTATS"); v != "" { // a number: count end exits from that instruction on
+		from, _ := strconv.ParseUint(v, 10, 64)
+		if from <= 1 {
+			m.C.Run0JITStats()
+		} else {
+			prev := m.OnPoll
+			m.OnPoll = func(c *cpu.CPU) {
+				if prev != nil {
+					prev(c)
+				}
+				if from != 0 && c.Steps >= from {
+					from = 0
+					c.Run0JITStats()
+				}
+			}
+		}
 	}
 	if os.Getenv("C32_SLOWOPS") != "" {
 		m.C.SlowOps = map[uint32]uint64{}
@@ -107,20 +122,22 @@ func TestBoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,host_calls,gl_commands,gl_kb,jit_slow,jit_end,jit_resets")
+		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,cpu_ms,host_calls,gl_commands,gl_kb,jit_slow,jit_end,jit_resets")
 		var last struct {
 			steps, full, calls, cmds, bytes, slow, end uint64
 			at                                         time.Time
+			cpu                                        time.Duration
 		}
-		last.at = time.Now()
+		last.at, last.cpu = time.Now(), processCPU()
 		frame := 0
 		m.OnFrame = func(c *cpu.CPU) {
 			frame++
 			now, st := time.Now(), c.JITStats()
-			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%d,%d,%.1f,%d,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
-				float64(now.Sub(last.at).Microseconds())/1000, c.HostCalls-last.calls, m.glr.sent-last.cmds,
+			cpuNow := processCPU()
+			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.1f,%d,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
+				float64(now.Sub(last.at).Microseconds())/1000, float64((cpuNow-last.cpu).Microseconds())/1000, c.HostCalls-last.calls, m.glr.sent-last.cmds,
 				float64(m.glr.w-last.bytes)/1024, st.SlowExits-last.slow, st.EndExits-last.end, st.Resets)
-			last.steps, last.full, last.calls, last.cmds, last.bytes, last.slow, last.end, last.at = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, st.SlowExits, st.EndExits, now
+			last.steps, last.full, last.calls, last.cmds, last.bytes, last.slow, last.end, last.at, last.cpu = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, st.SlowExits, st.EndExits, now, cpuNow
 		}
 	}
 	if p := os.Getenv("C32_CPUPROF"); p != "" { // the host's CPU profile from instruction C32_CPUPROF_AFTER on
@@ -184,8 +201,13 @@ func TestBoot(t *testing.T) {
 			top = append(top, kv{e, n})
 		}
 		sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
-		for i := 0; i < len(top) && i < 15; i++ {
-			t.Logf("  end exit to %#x (%s): %d", top[i].eip, m.where(top[i].eip), top[i].n)
+		kinds := map[string]uint64{}
+		for _, e := range top {
+			kinds[m.C.JITTargetKind(e.eip)] += e.n
+		}
+		t.Logf("  end exits by what runs there: %v", kinds)
+		for i := 0; i < len(top) && i < 25; i++ {
+			t.Logf("  end exit to %#x (%s, %s): %d", top[i].eip, m.where(top[i].eip), m.C.JITTargetKind(top[i].eip), top[i].n)
 		}
 	}
 	if m.C.TraceCalls {
@@ -251,4 +273,14 @@ func consoleAt(t *testing.T, m *Machine, spec string) func(c *cpu.CPU) {
 			queue = queue[1:]
 		}
 	}
+}
+
+// processCPU is the CPU time the process has used (user and system): steadier than the wall
+// clock when other work shares the machine.
+func processCPU() time.Duration {
+	var ru syscall.Rusage
+	if syscall.Getrusage(syscall.RUSAGE_SELF, &ru) != nil {
+		return 0
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }

@@ -214,8 +214,8 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_PROBE`, `C32_WATCH_NULL`, `C32_TRACECALLS` | log calls and returns of matching guest functions; catch NULL-pointer stores; keep a call stack for backtraces |
 | `C32_FONT_PNG`, `C32_MP3_OUT` | write a font sample (`HostFontSample`); the menu music's decoded PCM (`TestMenuSound`) |
 | `C32_LIVE` | `1`: wall clock (set by `catalina32 source`) |
-| `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters, per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
-| `C32_FRAMESTATS` | `TestBoot`: a CSV line per frame: instructions, those the full decoder ran, host milliseconds, host calls, GL commands and KB, JIT slow and end exits |
+| `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters (`C32_JITSTATS=<instruction>`: returns to Go from then on, by what runs where they go), per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
+| `C32_FRAMESTATS` | `TestBoot`: a CSV line per frame: instructions, those the full decoder ran, host and CPU milliseconds, host calls, GL commands and KB, JIT slow and end exits, resets |
 | `C32_CPUPROF`, `C32_CPUPROF_AFTER` | `TestBoot`: the host's CPU profile, from that instruction count on (e.g. after loading) |
 | `GLREPLAY_CLIP`, `GLREPLAY_SCREEN` | `tools/glreplay`: `position` imitates AMD's clipping (and reports an AMD GPU); the screen size the game sees |
 
@@ -226,4 +226,5 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `HLSL_TEST_DIR` | a `C32_DUMP_SHADERS` directory for the HLSL tests |
 | `LZHUF_TEST_DIR` | a `C32_DUMP_LZHUF` directory for `TestLZHUFMatchesGuest` |
 | `C32_JITN`, `C32_JITSEED` | `TestJITMatchesInterpreter`: how many random programs; `TestJITBisect`: the seed whose first difference to find |
+| `C32_JITPLAIN`, `C32_JITFROM` | `1`: compare every program with the full decoder alone too (TestJITBisect: that comparison); the instruction count TestJITBisect starts at |
 | `C32_BIN_PATH` | enables tests that read shaders or code from the game executable |

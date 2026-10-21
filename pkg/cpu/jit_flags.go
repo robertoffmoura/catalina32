@@ -24,14 +24,16 @@ func jitFlagFx(d *dInst) jitFx {
 		dAlu8RMR, dAlu8RRM, dAluALImm, dAlu16RMR, dAlu16RRM, dGrp1RM16:
 		v, c := aluFlags(d.aux)
 		return jitFx{writes: true, value: v, clear: c, reads: d.aux == 2 || d.aux == 3}
-	case dTestRMR32, dTestRMI8, dTestRMR8, dTestALImm, dTest16:
+	case dTestRMR32, dTestRMI8, dTestRMR8, dTestALImm, dTest16, dTestRMI32:
 		return jitFx{writes: true, value: flagsLogic, clear: flagsArith}
 	case dIncR, dDecR, dIncRM32, dDecRM32:
 		return jitFx{writes: true, value: flagsArith &^ FlagCF, clear: flagsArith &^ FlagCF}
-	case dNeg32, dNeg8, dUcomiss, dUcomisd:
+	case dNeg32, dNeg8, dUcomiss, dUcomisd, dCmpxchg:
 		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
 	case dImul32, dImulRRM32:
 		return jitFx{writes: true, value: FlagCF | FlagOF, clear: FlagCF | FlagOF}
+	case dBt:
+		return jitFx{writes: true, value: FlagCF, clear: FlagCF}
 	case dCmpxchg8b:
 		return jitFx{writes: true, value: FlagZF, clear: FlagZF}
 	case dShift32:

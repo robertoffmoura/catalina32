@@ -79,7 +79,7 @@ func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func (g *jtGen) inst() []byte {
 	r := g.r
 	op := uint8(r.Intn(8))
-	switch r.Intn(61) {
+	switch r.Intn(70) {
 	case 0: // op r/m32, r32
 		return cat([]byte{op<<3 | 1}, g.modrm(g.any(), g.dst(), true, op != 7))
 	case 1: // op r32, r/m32
@@ -281,6 +281,24 @@ func (g *jtGen) inst() []byte {
 			return cat([]byte{op}, g.fpuMem(ext, false))
 		}
 		return []byte{op, 0xC0 | ext<<3 | byte(r.Intn(8))}
+	case 61: // test r/m32, imm32
+		return cat([]byte{0xF7}, g.modrm(0, g.any(), true, false), g.imm32())
+	case 62: // xchg r/m32, r32
+		return cat([]byte{0x87}, g.modrm(g.dst(), g.dst(), true, true))
+	case 63: // [lock] cmpxchg r/m32, r32
+		m := g.modrm(g.dst(), g.dst(), true, true)
+		if m[0]>>6 != 3 && r.Intn(2) == 0 {
+			return cat([]byte{0xF0, 0x0F, 0xB1}, m)
+		}
+		return cat([]byte{0x0F, 0xB1}, m)
+	case 64: // bt r32, r32
+		return []byte{0x0F, 0xA3, 0xC0 | g.any()<<3 | g.any()}
+	case 65: // unpcklps, movhlps / movlps
+		return cat([]byte{0x0F, []byte{0x14, 0x12}[r.Intn(2)]}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
+	case 66, 67: // cmpps, shufps
+		return cat([]byte{0x0F, []byte{0xC2, 0xC6}[r.Intn(2)]}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false), []byte{byte(r.Intn(256))})
+	case 68: // movmskps
+		return []byte{0x0F, 0x50, 0xC0 | g.dst()<<3 | uint8(r.Intn(8))}
 	default: // compare or test, often followed by a Jcc (fused)
 		return g.compare()
 	}
@@ -594,7 +612,8 @@ func TestJITBisect(t *testing.T) {
 	jitThreshold = 2
 	g := &jtGen{r: rand.New(rand.NewSource(seed))}
 	prog := g.program(5 + g.r.Intn(30))
-	for n := uint64(1); n < 20000; n++ {
+	from, _ := strconv.ParseUint(os.Getenv("C32_JITFROM"), 10, 64) // where to start (a late difference)
+	for n := max(from, 1); n <= 20000; n++ {
 		a := jtRun(t, prog, seed, jtInterp, n)
 		b := jtRun(t, prog, seed, jtJIT, n)
 		if os.Getenv("C32_JITPLAIN") == "1" { // the full decoder against the cache

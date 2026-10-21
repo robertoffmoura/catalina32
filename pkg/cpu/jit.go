@@ -447,6 +447,26 @@ func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
 	}
 }
 
+// JITTargetKind says what runs at eip (diagnostics for JITStats.EndAt): "host" (an intercept),
+// "translated", "cached" (a block not translated), "uncached" (the full decoder's), or "none"
+// (no block there now).
+func (c *CPU) JITTargetKind(eip uint32) string {
+	switch {
+	case eip < ArenaSize && c.icept != nil && c.icept[eip>>6]&(1<<(eip&63)) != 0:
+		return "host"
+	case c.blocks == nil || c.blocks[eip&blockMask].tag != eip:
+		return "none"
+	}
+	b := &c.blocks[eip&blockMask]
+	switch {
+	case len(b.insts) == 0:
+		return "uncached"
+	case b.jit != nil && b.jitGen == c.jitGen:
+		return "translated"
+	}
+	return "cached"
+}
+
 // Run0JITStats starts counting where translated code returns to Go (diagnostics).
 func (c *CPU) Run0JITStats() {
 	if c.jitInit() {

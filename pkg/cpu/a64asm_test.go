@@ -117,6 +117,9 @@ func TestA64Encodings(t *testing.T) {
 		{func(a *a64) { a.vop(a64VBsl, 2, 0, 1) }, "bsl v2.16b, v0.16b, v1.16b"},
 		{func(a *a64) { a.vop(a64VBif, 1, 0, 2) }, "bif v1.16b, v0.16b, v2.16b"},
 		{func(a *a64) { a.vfsqrt(0, 1) }, "fsqrt v0.4s, v1.4s"},
+		{func(a *a64) { a.vop(a64VFcmge, 2, 1, 0) }, "fcmge v2.4s, v1.4s, v0.4s"},
+		{func(a *a64) { a.vop(a64VZip1, 0, 0, 1) }, "zip1 v0.4s, v0.4s, v1.4s"},
+		{func(a *a64) { a.vnot(2, 2) }, "mvn v2.16b, v2.16b"},
 		{func(a *a64) { a.insS(0, 3, 1, 2) }, "mov v0.s[3], v1.s[2]"},
 		{func(a *a64) { a.br(16) }, "br x16"},
 		{func(a *a64) { a.emit(0x1B000000 | 4<<16 | 31<<10 | 19<<5 | 16) }, "mul w16, w19, w4"}, // endReg

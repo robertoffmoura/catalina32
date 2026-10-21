@@ -1,6 +1,9 @@
 package cpu
 
-import "math"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // Decoded-instruction cache.
 //
@@ -132,6 +135,15 @@ const (
 	dMovdFromX  // 66 0F 7E: r/m32 = xmm
 	dCmpxchg8b  // [F0] 0F C7 /1 m64
 	dBswap      // 0F C8+r
+	dTestRMI32  // F7 /0: test r/m32, imm32
+	dXchg       // 87: xchg r/m32, r32
+	dCmpxchg    // [F0] 0F B1: cmpxchg r/m32, r32
+	dBt         // 0F A3 (register form): bt r32, r32
+	dUnpcklps   // 0F 14
+	dCmpps      // 0F C2 (imm = predicate)
+	dMovmskps   // 0F 50 (register form)
+	dShufps     // 0F C6 (imm = order)
+	dMovlps     // 0F 12: movhlps (register form) / movlps xmm, m64
 
 	// x87 (the interpreter's: float64 registers FPUSt, top FPUTop).
 	dFld    // push: aux = source (fld*), rm = i for ST(i)
@@ -189,6 +201,14 @@ type dBlock struct {
 	jitGen uint32
 
 	code []byte // a block outside [CodeLo, CodeHi): its instruction bytes (see codeSame)
+}
+
+// xmmSrc is d's 128-bit source operand (an XMM register or memory).
+func (c *CPU) xmmSrc(d *dInst) [16]byte {
+	if d.isMem {
+		return c.Read128(c.ea(d))
+	}
+	return c.XMM[d.rm]
 }
 
 // fpuOperand is dFArith operand k: ST(k), or m for fpuMem.
@@ -385,6 +405,14 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			d.kind, d.len = dNop, uint8(q+2+n-eip)
 			return
 		}
+	}
+	if m[p] == 0xF0 && m[p+1] == 0x0F && m[p+2] == 0xB1 { // lock cmpxchg (single guest core: as without lock)
+		n := decodeModRM(m, p+3, d)
+		d.kind, d.len = dCmpxchg, uint8(p+3+n-eip)
+		if !d.isMem {
+			d.kind = dSlow // (the full decoder; a lock with a register operand is invalid)
+		}
+		return
 	}
 	if m[p] == 0xF0 && m[p+1] == 0x0F && m[p+2] == 0xC7 { // lock cmpxchg8b
 		if n := decodeModRM(m, p+3, d); d.reg == 1 && d.isMem {
@@ -626,7 +654,10 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 		d.imm = p + 1 + uint32(int32(int8(m[p])))
 		set(dJmp, p+1)
 	case op == 0xF7:
-		if n := decodeModRM(m, p, d); d.reg == 2 {
+		if n := decodeModRM(m, p, d); d.reg == 0 || d.reg == 1 {
+			d.imm = le32(m, p+n)
+			set(dTestRMI32, p+n+4)
+		} else if d.reg == 2 {
 			set(dNot32, p+n)
 		} else if d.reg == 3 {
 			set(dNeg32, p+n)
@@ -690,6 +721,28 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			if n := decodeModRM(m, p, d); d.reg == 1 && d.isMem {
 				set(dCmpxchg8b, p+n)
 			}
+		case op2 == 0xB1:
+			set(dCmpxchg, p+decodeModRM(m, p, d))
+		case op2 == 0xA3:
+			if n := decodeModRM(m, p, d); !d.isMem {
+				set(dBt, p+n)
+			}
+		case op2 == 0x14:
+			set(dUnpcklps, p+decodeModRM(m, p, d))
+		case op2 == 0xC2 || op2 == 0xC6:
+			n := decodeModRM(m, p, d)
+			d.imm = uint32(m[p+n])
+			if op2 == 0xC2 {
+				set(dCmpps, p+n+1)
+			} else {
+				set(dShufps, p+n+1)
+			}
+		case op2 == 0x50:
+			if n := decodeModRM(m, p, d); !d.isMem {
+				set(dMovmskps, p+n)
+			}
+		case op2 == 0x12:
+			set(dMovlps, p+decodeModRM(m, p, d))
 		case op2 >= 0xC8 && op2 <= 0xCF:
 			d.reg = op2 & 7
 			set(dBswap, p)
@@ -1267,6 +1320,77 @@ func (c *CPU) execBlock(insts []dInst) {
 			c.EIP = c.rm32(d)
 		case dPushRM32:
 			c.Push32(c.rm32(d))
+		case dTestRMI32:
+			c.UpdateFlagsLogic32(c.rm32(d) & d.imm)
+		case dXchg:
+			var addr, a uint32
+			if d.isMem {
+				addr = c.ea(d)
+				a = c.Read32(addr)
+				c.Write32(addr, c.Regs[d.reg])
+			} else {
+				a = c.Regs[d.rm]
+				c.Regs[d.rm] = c.Regs[d.reg]
+			}
+			c.Regs[d.reg] = a
+		case dCmpxchg:
+			var addr, dst uint32
+			if d.isMem {
+				addr = c.ea(d)
+				dst = c.Read32(addr)
+			} else {
+				dst = c.Regs[d.rm]
+			}
+			eax := c.Regs[RegEAX]
+			c.UpdateFlagsSub32(eax, dst, eax-dst)
+			switch {
+			case eax != dst:
+				c.Regs[RegEAX] = dst
+			case d.isMem:
+				c.Write32(addr, c.Regs[d.reg])
+			default:
+				c.Regs[d.rm] = c.Regs[d.reg]
+			}
+		case dBt:
+			c.SetFlag(FlagCF, c.Regs[d.rm]>>(c.Regs[d.reg]&31)&1 != 0)
+		case dUnpcklps, dCmpps, dShufps:
+			src := c.xmmSrc(d)
+			dst := c.XMM[d.reg]
+			switch d.kind {
+			case dUnpcklps:
+				copy(c.XMM[d.reg][4:8], src[0:4])
+				copy(c.XMM[d.reg][8:12], dst[4:8])
+				copy(c.XMM[d.reg][12:16], src[4:8])
+			case dCmpps:
+				for i := 0; i < 4; i++ {
+					a := c.getXMMF32(int(d.reg), i)
+					b := math.Float32frombits(binary.LittleEndian.Uint32(src[i*4:]))
+					v := uint32(0)
+					if evalSSECompareF32(a, b, uint8(d.imm)) {
+						v = 0xFFFFFFFF
+					}
+					c.setXMMU32(int(d.reg), i, v)
+				}
+			default:
+				var res [16]byte
+				copy(res[0:4], dst[(d.imm&3)*4:])
+				copy(res[4:8], dst[(d.imm>>2&3)*4:])
+				copy(res[8:12], src[(d.imm>>4&3)*4:])
+				copy(res[12:16], src[(d.imm>>6&3)*4:])
+				c.XMM[d.reg] = res
+			}
+		case dMovmskps:
+			v := uint32(0)
+			for i := 0; i < 4; i++ {
+				v |= uint32(c.XMM[d.rm][i*4+3]>>7) << i
+			}
+			c.Regs[d.reg] = v
+		case dMovlps:
+			if d.isMem {
+				binary.LittleEndian.PutUint64(c.XMM[d.reg][0:8], c.Read64(c.ea(d)))
+			} else {
+				copy(c.XMM[d.reg][0:8], c.XMM[d.rm][8:16])
+			}
 		case dFld:
 			var v float64
 			switch d.aux {

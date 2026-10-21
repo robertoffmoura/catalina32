@@ -1100,6 +1100,43 @@ func (g *jitGen) inst(d *dInst) bool {
 
 	case dBswap:
 		a.rev(gr(d.reg), gr(d.reg))
+	case dTestRMI32:
+		ra := g.loadRM(d, 4, false)
+		a.movI(rT3, d.imm)
+		a.logR(false, a64Ands, rT2, ra, rT3, a64LSL, 0)
+		g.produceLogic()
+	case dXchg:
+		if !d.isMem {
+			a.mov(rT1, gr(d.rm))
+			a.mov(gr(d.rm), gr(d.reg))
+			a.mov(gr(d.reg), rT1)
+			break
+		}
+		g.ea(d, rEA)
+		g.chkStore(rEA)
+		g.guest(2, a64Ld, false, rT1)
+		g.guest(2, a64St, false, gr(d.reg))
+		a.mov(gr(d.reg), rT1)
+	case dCmpxchg: // flags as cmp eax, r/m32; equal: r/m32 = r32, else eax = r/m32
+		dst := g.loadRM(d, 4, true)
+		if dst != rT1 {
+			a.mov(rT1, dst)
+		}
+		g.alu32(7, gr(0), rT1, 0)
+		ne, done := a.newLabel(), a.newLabel()
+		a.bcond(a64NE, ne)
+		if d.isMem {
+			g.guest(2, a64St, false, gr(d.reg))
+		} else {
+			a.mov(gr(d.rm), gr(d.reg))
+		}
+		a.b(done)
+		a.bind(ne)
+		a.mov(gr(0), rT1)
+		a.bind(done)
+	case dBt:
+		a.op2(a64Lsrv, rT2, gr(d.rm), gr(d.reg)) // (the shift takes the count mod 32)
+		g.produce(fmNone, FlagCF, func() { a.logI(a64AndI, rF1, rT2, 1) })
 	case dCmpxchg8b: // EDX:EAX vs m64; equal: m64 = ECX:EBX, otherwise EDX:EAX = m64
 		g.ea(d, rEA)
 		g.chkStore(rEA)
@@ -1587,6 +1624,54 @@ func (g *jitGen) sse(d *dInst) bool {
 		g.produce(fmFcmp, flagsArith, func() { g.nzcv(fmFcmp) })
 	case dFld, dFst, dFxch, dFsign, dFArith:
 		g.x87(d)
+	case dUnpcklps, dCmpps, dShufps:
+		g.src(d, 4, 1)
+		g.xmm(4, a64Ld, true, 0, d.reg, 0)
+		res := 0
+		switch d.kind {
+		case dUnpcklps:
+			a.vop(a64VZip1, 0, 0, 1)
+		case dShufps:
+			for i, v := range []int{0, 0, 1, 1} {
+				a.insS(2, i, v, int(d.imm>>(2*i)&3))
+			}
+			res = 2
+		default: // the predicate (imm&7) per lane, as evalSSECompareF32: comparisons with a NaN are false
+			switch p := d.imm & 3; p {
+			case 0: // eq
+				a.vop(a64VFcmeq, 2, 0, 1)
+			case 1: // lt: b > a
+				a.vop(a64VFcmgt, 2, 1, 0)
+			case 2: // le: b >= a
+				a.vop(a64VFcmge, 2, 1, 0)
+			case 3: // unordered: not (a == a and b == b)
+				a.vop(a64VFcmeq, 2, 0, 0)
+				a.vop(a64VFcmeq, 3, 1, 1)
+				a.vop(a64VAnd, 2, 2, 3)
+			}
+			if (d.imm&7 >= 4) != (d.imm&3 == 3) { // neq, nlt, nle, unord: the negation
+				a.vnot(2, 2)
+			}
+			res = 2
+		}
+		g.xmm(4, a64St, true, res, d.reg, 0)
+	case dMovmskps:
+		a.movI(rT1, 0)
+		for i := 0; i < 4; i++ {
+			g.xmm(2, a64Ld, false, rF1, d.rm, uint32(4*i))
+			a.lsrI(rF1, rF1, 31)
+			a.logR(false, a64Orr, rT1, rT1, rF1, a64LSL, i)
+		}
+		a.mov(gr(d.reg), rT1)
+	case dMovlps:
+		if d.isMem {
+			g.ea(d, rEA)
+			g.chkLoad(8)
+			g.guest(3, a64Ld, false, rT1)
+		} else {
+			g.xmm(3, a64Ld, false, rT1, d.rm, 8)
+		}
+		g.xmm(3, a64St, false, rT1, d.reg, 0)
 	case dPshufd:
 		g.src(d, 4, 1)
 		for i := 0; i < 4; i++ {

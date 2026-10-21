@@ -1250,6 +1250,64 @@ func (g *jitGen) inst2(d *dInst) bool {
 		}
 	case dFld, dFst, dFxch, dFsign, dFArith:
 		g.x87(d)
+	case dTestRMI32:
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(4)
+			rm = memAt
+		}
+		a.inst(0, 0, []byte{0xF7}, 0, rm) // test r/m32, imm32
+		a.emit32(d.imm)
+		g.produce(flagsLogic, flagsArith)
+	case dXchg:
+		if !d.isMem {
+			a.inst(0, 0, []byte{0x87}, h(d.reg), xr(h(d.rm)))
+			break
+		}
+		g.ea(d) // (without xchg's implicit lock)
+		g.chkStore(hR8)
+		a.load32(hR9, memAt)
+		a.store32(memAt, h(d.reg))
+		a.movRR32(h(d.reg), hR9)
+	case dCmpxchg: // flags as cmp eax, r/m32; equal: r/m32 = r32, else eax = r/m32
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			g.chkStore(hR8)
+			rm = memAt
+		}
+		a.inst(0, 0, []byte{0x0F, 0xB1}, h(d.reg), rm) // (memory: also written back when different; the page is checked)
+		g.produce(flagsArith, flagsArith)
+	case dBt:
+		a.inst(0, 0, []byte{0x0F, 0xA3}, h(d.reg), xr(h(d.rm)))
+		g.produce(FlagCF, FlagCF)
+	case dUnpcklps, dCmpps, dShufps:
+		g.src128(d, 1)
+		a.sse(0, 0x10, 0, xmmOp(d.reg))
+		switch d.kind {
+		case dUnpcklps:
+			a.sse(0, 0x14, 0, xr(1))
+		case dCmpps:
+			a.sse(0, 0xC2, 0, xr(1))
+			a.emit(uint8(d.imm & 7))
+		default:
+			a.sse(0, 0xC6, 0, xr(1))
+			a.emit(uint8(d.imm))
+		}
+		a.sse(0, 0x11, 0, xmmOp(d.reg))
+	case dMovmskps:
+		a.sse(0, 0x10, 0, xmmOp(d.rm))
+		a.sse(0, 0x50, h(d.reg), xr(0)) // movmskps r32, xmm0
+	case dMovlps:
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(8)
+			a.load64(hR9, memAt)
+		} else {
+			a.load64(hR9, xm(hR15, offXMM+16*int32(d.rm)+8))
+		}
+		a.store64(xmmOp(d.reg), hR9)
 	case dMovdFromX:
 		a.load32(hR9, xmmOp(d.reg))
 		if d.isMem {
