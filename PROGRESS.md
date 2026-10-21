@@ -42,13 +42,12 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
 - **Later:** an icon for Catalina32 itself.
 - **Speed:** release builds have no AOT code, so heavy scenes are choppier than with
   `run_on_mac.sh`; the JIT is the answer for players: designed in `docs/JIT.md`, left for later.
-- **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Branch `source`
-  (`pkg/dyld`, `pkg/source`, `viewer/C32GL.m`): a 3 GB guest space, the game's OpenGL streamed
-  to the window and drawn with the Mac's OpenGL, catalina32's fonts (which also fix the
-  current Mac build's broken font module), keyboard, mouse look, sound and controllers. The
-  first chamber plays on the Mac (`scripts/run_source.sh`), slowly: speed now needs the JIT.
-  Details and the plan: `docs/PORTAL.md`. The Feral
-  family layer waits for a second Feral game.
+- **Next game: Portal** (then Portal 2): Valve's own Mac ports, not Feral. Branch `source`.
+  On the user's Mac it plays from the menu through the first chambers with no known bugs:
+  New Game and Load Game, mouse look, keyboard, a controller, sound and music, text, portals.
+  It runs at a few frames per second: speed now needs the JIT. It runs from
+  `scripts/run_source.sh` only (no game app yet). Details, tests and next steps:
+  `docs/PORTAL.md`. The Feral family layer waits for a second Feral game.
 
 ## Backlog
 
@@ -93,3 +92,4 @@ is published** (`scripts/make_release.sh`; GitHub pre-release, universal, withou
 | 2026-10-16/17 | Cantina hub, audio (Ogg Vorbis music, sound effects), Episode I entry, controllers, real shaders (the game's HLSL and bytecode), AOT-compiled hot functions, decoded-instruction cache, pipelined parallel renderer |
 | 2026-10-18 | Two code-review passes (crash safety, cross-host determinism, reference-counted resources, saves); HLSL and bytecode translation to Metal; GPU command stream; Metal viewer in the repository |
 | 2026-10-19 | White-screen fixes (copies into textures, compressed uploads); SetViewport; cube maps; scissor, viewport reset, mipmaps, fog; double vision fixed (half-pixel offset); StretchRect rectangles; one save folder; docs split into `CONTEXT.md`, `PROGRESS.md`, `docs/` |
+| 2026-10-20 | Portal (branch `source`): dynamic linker, 3 GB guest space, the system libraries in Go, OpenGL streamed to the window, host fonts; then on the Mac: mouse look, sound and music (OpenAL, Miles' MP3 plug-in on new MMX support), controllers, the New Game dialog, portals on AMD GPUs; `tools/glreplay` to see frames on Linux |

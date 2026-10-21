@@ -23,19 +23,28 @@ Front-ends   Catalina32.app: wizard (find games, make game apps)    catalina32 C
                          │                                               │
 Game app     <Game>.app = window app + engine + game.json (game path, checksum, profile, saves)
                          │
-Host         window · Metal renderer · keyboard, controllers · audio      (viewer/, Objective-C)
-                         │  shared memory: framebuffer, GPU command stream, input, PCM audio
-Engine       x86 CPU (interpreter + block cache; JIT planned) · Mach-O loader ·          (Go)
-             MacDoze (Win32) and IndirectX (D3D9, DirectInput, DirectSound) shims ·
-             shader translation · native replacements found by signature
+Host         window · Metal renderer · OpenGL renderer · keyboard, mouse,    (viewer/, Objective-C)
+             controllers · audio
+                         │  shared memory: framebuffer, GPU command stream or OpenGL stream,
+                         │  input, PCM audio
+Engine       x86 CPU (interpreter + block cache; JIT planned) · Mach-O loader and   (Go)
+             dynamic linker · Feral games: MacDoze (Win32) and IndirectX (D3D9,
+             DirectInput, DirectSound) shims, shader translation · Valve's Source
+             games: the system libraries (C library, pthreads, C++ runtime, SDL2,
+             OpenAL, fonts) · native replacements found by signature
                          │
-Families     a porting house's runtime layer, found by signature: Feral's MacDoze  (planned)
+Families     a porting house's runtime layer, found by signature: Feral's MacDoze  (planned);
+             Valve's Source on Mac (SDL2 + ToGL)                                   (experimental)
                          │
 Games        profiles: checksums, names, folders, original save location, rare quirks
 ```
 
 - **Engine** (`pkg/cpu`, `pkg/macho32`, `pkg/crt`, `pkg/win32`, `pkg/d3d9`, `pkg/hlsl`,
   `pkg/d3dsm`, `pkg/msl`, `pkg/lh5`): no game addresses. See `CONTEXT.md`.
+- **Source games** *(experimental, branch `source`)*: `pkg/dyld` links a game's dozens of
+  dylibs; `pkg/source` replaces the macOS libraries under them. The game's Direct3D-on-OpenGL
+  layer (ToGL) runs emulated and its OpenGL calls are streamed to the window, which draws
+  them with the Mac's OpenGL. See `docs/PORTAL.md`.
 - **Families** *(planned)*: the 32-bit Mac ports of one porting house share a runtime layer.
   catalina32 replaces Feral's (MacDoze, a Win32 look-alike) at its boundary, so the entry
   points of that layer are what a game must give us. Found by signature
@@ -47,11 +56,13 @@ Games        profiles: checksums, names, folders, original save location, rare q
   product path.
 - **Host** (`viewer/`): one Objective-C executable with two modes. In a game app it is the
   game's window: it starts the engine as a child process, maps the shared memory, draws with
-  Metal, reads keyboard and controllers, plays audio, and stops the engine when the window
-  closes. In full screen it hides the mouse pointer unless the game wants it; the engine
-  decides that from what the game asks for (Win32 `ShowCursor`/`SetCursor`, a Direct3D device
-  cursor, a windowed device), never from which game it is. In Catalina32.app it is the wizard. Its output goes to
-  `~/Library/Logs/catalina32/<game>.log`.
+  Metal (`C32Metal.m`) or, for Source games, OpenGL (`C32GL.m`), reads keyboard, mouse and
+  controllers, plays audio, and stops the engine when the window closes. In full screen it
+  hides the mouse pointer unless the game wants it; the engine decides that from what the
+  game asks for (Win32 `ShowCursor`/`SetCursor`, a Direct3D device cursor, a windowed device),
+  never from which game it is. For mouse look (SDL's relative mode) the window captures the
+  pointer while it is the active window. In Catalina32.app it is
+  the wizard. Its output goes to `~/Library/Logs/catalina32/<game>.log`.
 - **Front-ends**: the `catalina32` binary is both the engine and the command line. The wizard
   calls the command line (`list --json`, `wrap`), so all the logic (finding games, deciding
   support, building game apps, save locations) is Go and testable without a Mac.
@@ -73,6 +84,7 @@ Games        profiles: checksums, names, folders, original save location, rare q
    catalina32 info <Game.app> [--json]   # what catalina32 knows about this game
    catalina32 wrap <Game.app> [-o dir]   # make a game app (default ~/Applications)
    catalina32 run <Game.app>             # play without making a game app
+   catalina32 source <folder>            # play a Valve Source game from its folder (experimental)
    catalina32 -game <executable>         # the engine alone (developer flow, run_on_mac.sh)
    ```
 

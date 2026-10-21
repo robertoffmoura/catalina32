@@ -4,7 +4,8 @@ Play 32-bit Mac games on modern macOS.
 
 macOS Catalina (10.15) dropped 32-bit apps, and with them a whole library of Mac games that
 players still own. catalina32 runs those games' original code on today's Macs: it emulates
-the 32-bit x86 code, replaces the old system libraries underneath it, and draws with Metal.
+the 32-bit x86 code, replaces the old system libraries underneath it, and draws with the
+Mac's graphics (Metal, or OpenGL for games written for it).
 You need your own copy of each game; catalina32 never copies or changes it.
 
 > **Status: early.** One game is supported and plays well. Download the app from
@@ -19,6 +20,12 @@ You need your own copy of each game; catalina32 never copies or changes it.
 
 Ports by Feral Interactive are the first target: they share one runtime layer, which
 catalina32 replaces, so each new Feral game should need little work.
+
+**In progress: Portal** (Valve's own Mac port). It plays, with sound, mouse, keyboard and
+controllers, but only a few frames per second until the emulator gets faster, and only from
+a developer build for now (`scripts/run_source.sh`, see `docs/PORTAL.md`). Valve's other Mac
+Source games of that generation (Half-Life 2 and its episodes) should follow from the same
+work.
 
 ## Playing
 
@@ -71,9 +78,9 @@ emulator is the limit there, and that's where work continues.
 
 - **Building and running:** `scripts/build-app.sh` builds `build/Catalina32.app` (macOS, Go,
   Xcode command-line tools). `go build ./cmd/catalina32` builds the engine and command line
-  (`catalina32 list`, `info`, `wrap`, `run`) on any system. `run_on_mac.sh` (outside the
-  repository) is the development loop: it builds both and starts a game with the developer
-  HUD.
+  (`catalina32 list`, `info`, `wrap`, `run`, `source`) on any system. `run_on_mac.sh` (outside
+  the repository) is the development loop: it builds both and starts a game with the
+  developer HUD.
 - **Releases:** `scripts/make_release.sh` builds, checks and zips the app and writes the release
   notes; `--publish` then tags it and creates the GitHub release.
 - **Tests:** `go test ./...`; with a game executable (`C32_BIN_PATH`), more tests run against
@@ -83,6 +90,7 @@ emulator is the limit there, and that's where work continues.
   - `CONTEXT.md`: the engine, conventions, where things are;
   - `docs/DEBUGGING.md`: every switch, recipe and tool;
   - `docs/LSWSAGA.md`: what we know about the first game;
+  - `docs/PORTAL.md`: Portal and Valve's Source games (running it, how it works);
   - `PROGRESS.md`: status and open work.
 - **Adding a game:** a profile in `pkg/games/<id>` (checksum, folders, save location) and,
   until the Feral family layer lands, its table of runtime-layer addresses. Native

@@ -182,7 +182,7 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_WATCH` | `lo-hi`: log the first access to a guest address range from each instruction |
 | `C32_VERIFY_MDCT` | run the native MDCT and the game's side by side and compare |
 
-**Viewer (`C32Window`, `C32Metal.m`)**
+**Viewer (`C32Window`, `C32Metal.m`, `C32GL.m`)**
 
 | Variable | Effect |
 |---|---|
@@ -191,6 +191,25 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_METAL_WINDING` | `ccw`: flip the front-face convention |
 | `C32_METAL_SYNC_SHADERS` | `1`: compile shaders on the render thread, waiting for each (by default they compile in the background and draws needing one are skipped until it is ready) |
 | `C32_PAD_DEBUG` | `1`: print raw controller events |
+| `C32_GL_DEBUG` | `1` (Source games, `C32GL.m`): check for a GL error after every call and log it with its arguments |
+
+**Source games** (`pkg/source`; `go test ./pkg/source -run <Test> -v`)
+
+| Variable | Effect |
+|---|---|
+| `C32_SOURCE_DIR` | the game folder (the one holding `hl2_osx`); enables the game tests |
+| `C32_STEPS`, `C32_LOG`, `C32_ARGS` | `TestBoot`: instructions to run, the game's log file, game options (e.g. `+map testchmb_a_00`) |
+| `C32_OVERLAY` | the folder the game writes to (default: a fresh one per run); keep one to test saved settings or saves |
+| `C32_GLCHECK`, `C32_GLSTATS` | `TestBoot`: consume the GL stream with `RunGLCheck` (protocol checks); print GL call counts |
+| `C32_GLTRACE` | with `C32_GLCHECK`: write every GL command (name, hash, bytes or arguments, shader sources) to a file, to diff two runs |
+| `C32_GL_SHM` | the stream file; with `TestBoot` and no `C32_GLCHECK`, another viewer (e.g. `glreplay`) reads it |
+| `C32_VIEWER_SHM` | tests using `withWindow` (`TestPlayIO`, `TestController`...): the stream file for another viewer instead of the built-in checker |
+| `C32_CMDS` | console commands typed in at instruction counts: `steps:cmd;cmd\|steps:...` (`TestBoot`, `TestController`) |
+| `C32_CTL_LOAD` | `TestController`: load this save (in `C32_OVERLAY`) from the menu first |
+| `C32_PROBE`, `C32_WATCH_NULL`, `C32_TRACECALLS` | log calls and returns of matching guest functions; catch NULL-pointer stores; keep a call stack for backtraces |
+| `C32_FONT_PNG`, `C32_MP3_OUT` | write a font sample (`HostFontSample`); the menu music's decoded PCM (`TestMenuSound`) |
+| `C32_LIVE` | `1`: wall clock (set by `catalina32 source`) |
+| `GLREPLAY_CLIP`, `GLREPLAY_SCREEN` | `tools/glreplay`: `position` imitates AMD's clipping (and reports an AMD GPU); the screen size the game sees |
 
 **Tests**
 

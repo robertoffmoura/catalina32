@@ -14,16 +14,21 @@ the libraries underneath it with Go:
 - **Feral's "MacDoze"** layer (a Win32 look-alike: files, threads, timers, registry).
 - **"IndirectX"** layer (Direct3D 9, D3DX, DirectInput, DirectSound, XInput).
 
-The first and so far only target is **LEGO Star Wars: The Complete Saga** (Feral's Mac port of
-Traveller's Tales' NuEngine game). The tool is meant to be general: everything specific to
-one game lives in `pkg/games/<id>`, and the other packages contain no game addresses.
+The first target is **LEGO Star Wars: The Complete Saga** (Feral's Mac port of Traveller's
+Tales' NuEngine game). The tool is meant to be general: everything specific to one game lives
+in `pkg/games/<id>`, and the other packages contain no game addresses.
+
+The second, on branch `source`, is **Portal**: Valve's own Mac port, a different kind of game
+(no MacDoze; dozens of dylibs over SDL2, OpenAL and ToGL, its Direct3D on OpenGL). It has its
+own runner, `pkg/source`, described in `docs/PORTAL.md`.
 
 **Goal:** make the game fully playable on a modern Mac.
 
 **State (October 2026):** it boots, plays with sound, controllers and saves, and draws
 through Metal at about 35–57 FPS on the user's Intel MacBook Pro. The whole of Episode I
-Chapter 1 (Negotiations) has been played through without crashes. See `PROGRESS.md` for open
-bugs.
+Chapter 1 (Negotiations) has been played through without crashes. Portal plays on the Mac
+with no known bugs but runs at a few frames per second (the JIT is next). See `PROGRESS.md`
+for open work.
 
 ## People, machines, paths
 
@@ -38,8 +43,11 @@ bugs.
   - `/workspace/Lego Star Wars Saga/LEGO Star Wars Saga.app/Contents/MacOS/LEGO Star Wars Saga`
     is the executable (`C32_BIN_PATH`).
   - `/workspace/Lego Star Wars Saga/LEGOStarWarsSagaData` is the data folder.
-- **`/workspace/run_on_mac.sh`** is how the user plays. It sits outside the repository (not
-  version-controlled). On the Mac it:
+- **Portal** (the user's copy, never committed or uploaded): `/workspace/Portal`
+  (`C32_SOURCE_DIR`). The user plays it with `scripts/run_source.sh` (in the repository);
+  what it writes goes to `~/Library/Application Support/catalina32/Portal`.
+- **`/workspace/run_on_mac.sh`** is how the user plays LEGO Star Wars. It sits outside the
+  repository (not version-controlled). On the Mac it:
   1. generates the AOT code;
   2. builds the engine into `catalina32/bin/`;
   3. compiles the viewer (`viewer/*.m`) into `/tmp/catalina32-mac-preview/C32Window`;
@@ -110,6 +118,11 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
     (`viewer/C32Metal.m`) replays it with Metal.
   - `cmd/gpucheck` stands in for the viewer on Linux: it consumes the stream and validates
     every command. **Keep its draw parser in sync with `encodeDraw`.**
+- **Source games** (`pkg/dyld`, `pkg/source`): the dynamic linker loads the game's dylibs and
+  `pkg/source` implements the macOS libraries under them in Go. The game's OpenGL calls go to
+  the window as a stream (`pkg/source/glspec.go`; bump `GLVersion` with the window's decoder,
+  generated into `viewer/C32GLCalls.h`), drawn by `viewer/C32GL.m`. `cmd/glcheck` stands in
+  for that window on Linux; `tools/glreplay` draws the stream with Mesa to PNGs.
 - **Input, audio, clock.**
   - The viewer writes keys and controller state into the framebuffer shared memory, and plays
     the PCM ring with AudioQueue.
@@ -131,8 +144,14 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
   2. A headless route with `cmd/gpucheck` attached: 0 protocol errors, plus its statistics.
   3. A syntax check of the viewer: `clang -fsyntax-only -x objective-c -fobjc-arc` against
      stub headers.
+  4. For Source games, frames you can look at: `tools/glreplay` replays the GL stream through
+     the window's own decoder on Mesa. Mesa isn't the Mac's driver; a driver difference can
+     be imitated there (`GLREPLAY_CLIP=position` for AMD's clipping) and must be said to be
+     an imitation.
 
-  Then the user runs it on the Mac. Say clearly what was and wasn't verified.
+  Then the user runs it on the Mac. Say clearly what was and wasn't verified. A bug the user
+  reports is reproduced here first (matching their screen size, settings, controllers), and
+  only called fixed once the reproduction is gone; show before/after frames.
 - `gofmt` everything you touch. Don't reformat files another session is editing.
 - **Background runs:** chain dependent steps in one command or `wait` on PIDs. Never poll
   with `pgrep -f "<pattern>"` (it matches its own shell). Give every run a `timeout`. When
@@ -150,6 +169,7 @@ i386 Mach-O ──► pkg/macho32 (loader) ──► pkg/cpu (x86 interpreter + 
 | Environment variables, routes, logs, profilers, gpucheck | `docs/DEBUGGING.md` |
 | Game addresses, input layout, how it loads/draws things | `docs/LSWSAGA.md` |
 | The JIT (designed, not started) | `docs/JIT.md` |
-| Portal / Valve Source games: survey and plan | `docs/PORTAL.md` |
+| Portal / Valve Source games: how it runs, tests, lessons, next | `docs/PORTAL.md` |
+| The OpenGL stream format | top of `pkg/source/glremote.go`, `pkg/source/glspec.go` |
 | GPU stream format | top of `pkg/d3d9/gpu.go` |
 | History and reasons for past decisions | `git log` (commit messages explain the why) |
