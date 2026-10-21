@@ -60,7 +60,8 @@ func (m *Machine) Probe(re *regexp.Regexp, maxPerFunc int) {
 }
 
 // Watch calls fn at every call of a function whose symbol matches re (in images loaded now
-// and later), before the function runs: for tests and diagnostics.
+// and later), before the function runs: for tests and diagnostics, and announcePads. A second
+// Watch (or Around) of the same function is ignored.
 func (m *Machine) Watch(re *regexp.Regexp, fn func(name string, c *cpu.CPU)) {
 	watch := func(img *dyld.Image) {
 		img.ForEachSymbol(func(name string, addr uint32) {

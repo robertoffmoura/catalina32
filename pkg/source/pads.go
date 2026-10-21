@@ -38,7 +38,8 @@ type padInput struct {
 	last    [d3d9.ShmPads]padState
 	pending [][]byte           // SDL events not yet delivered
 	heard   [d3d9.ShmPads]bool // the first input from each slot was logged
-	polling bool               // the game has polled its events (controllers show from then on)
+	polling bool               // the game has polled its events, or announcePads ran (controllers show from then on)
+	replug  bool               // announcePads ran: the first poll shows its controllers unplugged and plugged in again
 	handles map[uint32]int     // SDL_GameController / SDL_Joystick handles -> slot
 }
 
@@ -69,6 +70,37 @@ func (m *Machine) readPad(i int) padState {
 	return p
 }
 
+// announcePads shows the controllers already connected to the game's event watches (inputsystem)
+// just before the engine reads its saved configuration (Host_ReadConfiguration), unless the game
+// has polled its events already. Bindings are saved by name, and a controller's buttons have
+// other names once inputsystem knows an Xbox-style controller is there ("R_TRIGGER" against
+// "Z AXIS NEG"). Announced only at the first event poll, after config.cfg has run, the saved
+// controller bindings don't parse ("isn't a valid key") and are lost for good
+// (joy_xcontroller_cfg_loaded keeps the game from binding them again).
+//
+// config.cfg may then switch the controller off ("joystick 0", as the shipped one does), so the
+// first event poll shows these controllers unplugged and plugged in again (replug), which switches
+// it back on as a controller connected while the game runs does.
+func (m *Machine) announcePads(c *cpu.CPU) {
+	if m.pads.polling {
+		return
+	}
+	m.pollPads()
+	events := m.pads.pending
+	m.pads.pending = nil
+	if len(events) == 0 {
+		return
+	}
+	m.pads.replug = true
+	m.logf("[controller] %d controller event(s) shown to the game before it reads its configuration", len(events))
+	p := c.Malloc(sdlEventSize)
+	for _, e := range events {
+		copy(c.WBytes(p, sdlEventSize), e)
+		m.watchEvent(c, p)
+	}
+	c.Free(p)
+}
+
 // pollPads turns controller changes into pending SDL events.
 func (m *Machine) pollPads() {
 	pi := &m.pads
@@ -79,6 +111,17 @@ func (m *Machine) pollPads() {
 		binary.LittleEndian.PutUint32(e[4:], uint32(m.micros()/1000))
 		fill(e)
 		pi.pending = append(pi.pending, e)
+	}
+	if pi.replug { // see announcePads
+		pi.replug = false
+		for i := range pi.last {
+			if pi.last[i].connected {
+				which := func(e []byte) { binary.LittleEndian.PutUint32(e[8:], uint32(i)) }
+				ev(sdlControllerRemoved, which)
+				ev(sdlControllerAdded, which)
+				pi.last[i] = padState{connected: true}
+			}
+		}
 	}
 	for i := range pi.last {
 		now, was := m.readPad(i), pi.last[i]

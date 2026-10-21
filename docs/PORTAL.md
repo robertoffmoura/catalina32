@@ -59,7 +59,7 @@ also runs the game tests (minutes each):
 |---|---|
 | `TestBoot` | boots and runs `C32_STEPS` instructions; the developer harness (switches in `docs/DEBUGGING.md`) |
 | `TestPlayIO` | first chamber: mouse look (the view turns), controller, sound reaching the window |
-| `TestController` | a controller connected at launch moves the player (also after loading a save: `C32_CTL_LOAD`) |
+| `TestController` | a controller connected at launch moves the player and its triggers fire the portal gun (`+attack`, `+attack2`); also after loading a save (`C32_CTL_LOAD`) |
 | `TestMenuSound` | the menu's MP3 music decodes through Miles' plug-in |
 | `TestNewGameDialog` | the dialog lists the chapters, draws their pictures, and Start begins chapter 1 |
 | `TestRendererClipMode` | the launcher sees an AMD GPU and turns off native clip-vertex mode |
@@ -122,10 +122,21 @@ Each of these cost a bug; most are generic to Source on Mac.
   and on AMD turns off "native clip vertex" mode: AMD's Mac drivers clip against
   `gl_Position`, so ToGL moves portal clip planes into that space itself. Without the vendor,
   walls and floors seen through portals were cut away on an AMD Mac.
-- **Controllers at launch:** inputsystem enumerates controllers before the client (which owns
-  the `joystick` setting) exists, then `config.cfg` sets `joystick 0`. A controller is
-  therefore shown to the game from its first event poll, as if just plugged in, which switches
-  joystick input on.
+- **Controllers at launch** (`pkg/source/pads.go`, `announcePads`). Three constraints:
+  - Inputsystem enumerates controllers before the client exists. The client owns the `joystick`
+    setting, and inputsystem caches its references to that setting the first time it sees a
+    controller, so a controller found that early can never switch joystick input on.
+  - Bindings are saved by name, and controller buttons are named differently once inputsystem
+    knows an Xbox-style controller is there (`R_TRIGGER` against `Z AXIS NEG`).
+  - `config.cfg` may set `joystick 0`, as the shipped one does.
+
+  So a controller connected at launch is shown to the game just before the engine reads its
+  configuration (`Host_ReadConfiguration`), after the client loaded. Then, at the first event
+  poll, it is shown unplugged and plugged in again, which switches joystick input on.
+  - Shown only at the first poll, the saved controller bindings didn't parse ("isn't a valid
+    key"), so from the second launch on the triggers (the portal gun), A and more did nothing.
+  - `TestController` with a kept `C32_OVERLAY` and `C32_CMDS=8800000000:host_writeconfig`,
+    run twice, checks that.
 - **Saved settings shadow the game's:** listing a folder must merge the game's files with
   those the game wrote, or the New Game dialog finds no chapters once `cfg/config.cfg` is saved.
 - **The menu's loading picture is random** once every chapter is unlocked (the shipped

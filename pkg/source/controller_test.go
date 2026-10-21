@@ -16,8 +16,10 @@ import (
 // C32_SOURCE_DIR=<Portal> go test ./pkg/source -run Controller -v: plays the first chamber with a
 // controller connected before the game starts, the left stick pushed right and A pressed on and
 // off, and follows them through the game: inputsystem's axis and button handling, the client's
-// joystick move, the player's command (sidemove). C32_CTL_LOAD=<save> loads a saved game from
-// the menu first (with C32_OVERLAY holding it).
+// joystick move, the player's command (sidemove). The triggers are pulled too (the right one on
+// and off, then the left), and followed to the commands they are bound to (+attack, +attack2:
+// the portal gun). C32_CTL_LOAD=<save> loads a saved game from the menu first (with C32_OVERLAY
+// holding it).
 func TestController(t *testing.T) {
 	dir := os.Getenv("C32_SOURCE_DIR")
 	if dir == "" {
@@ -41,13 +43,13 @@ func TestController(t *testing.T) {
 
 	calls := map[string]int{}
 	var axes, buttons []string
-	m.Watch(regexp.MustCompile(`^__ZN12CInputSystem(18JoystickAxisMotionEiii|22PostButtonPressedEvent.*|12PollJoystickEv)$|^__ZN6CInput(18ControllerCommandsEv|19Joystick_GetForwardEv|16Joystick_GetSideEv)$`),
+	m.Watch(regexp.MustCompile(`^__ZN12CInputSystem(18JoystickAxisMotionEiii|22PostButtonPressedEvent.*|12PollJoystickEv)$|^__ZN6CInput(18ControllerCommandsEv|19Joystick_GetForwardEv|16Joystick_GetSideEv)$|^__Z1[34]IN_Attack2?DownRK8CCommand$`),
 		func(name string, c *cpu.CPU) {
 			calls[name]++
 			switch {
-			case strings.Contains(name, "AxisMotion") && len(axes) < 8:
+			case strings.Contains(name, "AxisMotion") && len(axes) < 16:
 				axes = append(axes, strings.Join([]string{strconv.Itoa(int(c.Arg(1))), strconv.Itoa(int(c.Arg(2))), strconv.Itoa(int(int32(c.Arg(3))))}, "/"))
-			case strings.Contains(name, "PostButtonPressed") && len(buttons) < 8:
+			case strings.Contains(name, "PostButtonPressed") && len(buttons) < 16:
 				buttons = append(buttons, strconv.Itoa(int(c.Arg(3))))
 			}
 		})
@@ -82,6 +84,13 @@ func TestController(t *testing.T) {
 		}
 		binary.LittleEndian.PutUint16(r[4:], a)
 		binary.LittleEndian.PutUint16(r[8:], 0x6000) // left stick right
+		r[6], r[7] = 0, 0                            // triggers: right on and off, then left
+		switch k := (c.Steps - injectFrom) / 250_000_000; {
+		case k == 2 || k == 4:
+			r[7] = 255
+		case k == 6:
+			r[6] = 255
+		}
 	}
 	finish(end)
 	t.Logf("calls: %v", calls)
@@ -92,5 +101,11 @@ func TestController(t *testing.T) {
 	}
 	if len(buttons) == 0 {
 		t.Error("inputsystem saw no button press")
+	}
+	if calls["__Z13IN_AttackDownRK8CCommand"] == 0 {
+		t.Error("the right trigger didn't reach +attack")
+	}
+	if calls["__Z14IN_Attack2DownRK8CCommand"] == 0 {
+		t.Error("the left trigger didn't reach +attack2")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -133,6 +134,7 @@ func New(dir string, args []string, overlay string, log io.Writer) (*Machine, er
 		Skip:   func(p string) bool { return m.Skip[filepath.Base(p)] },
 		Mapped: m.mapped,
 	}
+	m.Watch(regexp.MustCompile(`^__Z22Host_ReadConfigurationv$`), func(_ string, c *cpu.CPU) { m.announcePads(c) })
 	m.initStdio()
 	m.initThreads()
 	if dir == "" { // the system libraries alone (tests)
