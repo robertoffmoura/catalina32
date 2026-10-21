@@ -100,6 +100,7 @@ type CPU struct {
 	Steps         uint64
 	MaxSteps      uint64
 	HostCalls     uint64 // calls of host functions (intercepts): diagnostics
+	InJIT         uint32 // 1 while translated code runs (diagnostics: sampled by another goroutine)
 	FullDecodes   uint64 // instructions run by the full decoder (stepFull: forms not cached, so not translated): diagnostics
 	Halted        bool
 	HaltReason    string
@@ -117,7 +118,11 @@ type CPU struct {
 	CodeCacheFlushes uint64
 	checkedLo        uint32 // self-checking blocks (outside [CodeLo, CodeHi)) lie in [checkedLo, checkedHi)
 	checkedHi        uint32
-	dcacheUsed       bool // something was decoded; only then do intercept changes need a flush
+	dcacheUsed       bool     // something was decoded; only then do intercept changes need a flush
+	filled           struct { // cache entries filled since the last flush (FlushCodeCache)
+		insts, blocks []uint32
+		all           bool // too many: clear everything
+	}
 	// With several images in the code range, their data lies between their code: textPages marks
 	// the 4 KB pages holding code, and only stores to those flush (nil: the whole range is code).
 	textPages []uint64

@@ -42,6 +42,9 @@ const (
 	jitExitLimit        // the next block would cross the step limit: EIP is its start
 )
 
+// jitRestOfBlock in exitIdx: the interpreter runs the block from that instruction on.
+const jitRestOfBlock = 1 << 31
+
 // jitDisabled switches translation off (C32_NO_JIT=1): for A/B comparisons, and a way out. Where
 // the JIT is opt-in (jitOptIn: hosts it hasn't been verified on), C32_JIT=1 switches it on.
 var jitDisabled = os.Getenv("C32_NO_JIT") == "1" || jitOptIn && os.Getenv("C32_JIT") != "1"
@@ -204,6 +207,8 @@ type JITStats struct {
 	LimitExits uint64            // returns to Go at the step limit
 	Resets     uint64            // times all translations were discarded
 	EndAt      map[uint32]uint64 // where EndExits went (when non-nil: diagnostics)
+	SlowAt     map[uint32]uint64 // the instructions SlowExits ran (with EndAt)
+	TransAt    map[uint32]uint64 // the blocks translated (with EndAt)
 }
 
 // JITStats returns the JIT's counters (zero if it never ran).
@@ -231,13 +236,19 @@ func (c *CPU) jitReset() {
 		j.Stats.Resets++
 	}
 	j.used, j.cold = j.fixed, j.coldAt
+	if len(j.blocks) < len(j.table)/16 { // the table holds only these blocks' entries
+		for _, jb := range j.blocks {
+			j.table[jitHash(jb.eip)] = jitTableEntry{eip: dNoTag}
+		}
+	} else {
+		for i := range j.table {
+			j.table[i] = jitTableEntry{eip: dNoTag}
+		}
+	}
 	j.blocks = j.blocks[:0]
 	clear(j.byEIP)
 	clear(j.pending)
 	clear(j.failed)
-	for i := range j.table {
-		j.table[i] = jitTableEntry{eip: dNoTag}
-	}
 }
 
 // jitInit sets up the code buffer and shared code on first use; false if the host can't run
@@ -334,6 +345,9 @@ func (c *CPU) jitCompile(b *dBlock) *jitBlock {
 	j.blocks = append(j.blocks, jb)
 	j.byEIP[jb.eip] = jb
 	j.Stats.Translated++
+	if j.Stats.TransAt != nil {
+		j.Stats.TransAt[jb.eip]++
+	}
 	e := &j.table[jitHash(jb.eip)]
 	e.eip, e.code = jb.eip, jb.head
 	for _, site := range j.pending[jb.eip] {
@@ -391,7 +405,9 @@ func (c *CPU) jitRun(jb *jitBlock, stopEIP uint32, limit uint64) {
 		if idx > 0 {
 			c.jit.budget -= jb.steps - jb.prefix[idx]
 		}
+		c.InJIT = 1
 		jitCall(j.prologue, c, entry)
+		c.InJIT = 0
 		j.Stats.Entries++
 		c.Steps = c.jit.limit - c.jit.budget
 		if m := c.jit.pmask; m != 0 { // flags translated code left pending
@@ -414,8 +430,25 @@ func (c *CPU) jitRun(jb *jitBlock, stopEIP uint32, limit uint64) {
 		case jitExitSlow:
 			j.Stats.SlowExits++
 			jb = j.blocks[c.jit.exitBlk]
+			if c.jit.exitIdx&jitRestOfBlock != 0 { // a memory window's check failed (jit_amd64.go)
+				i := int(c.jit.exitIdx &^ jitRestOfBlock)
+				c.EIP = jb.starts[i]
+				c.Steps -= jb.steps - jb.prefix[i]
+				c.execBlock(jb.insts[i:])
+				if c.Halted {
+					return
+				}
+				if jb = c.jitNext(stopEIP, &limit); jb == nil {
+					return
+				}
+				entry, idx = jb.head, 0
+				continue
+			}
 			i := int(c.jit.exitIdx)
 			c.EIP = jb.starts[i]
+			if j.Stats.SlowAt != nil {
+				j.Stats.SlowAt[c.EIP]++
+			}
 			c.Steps -= jb.steps - jb.prefix[i] // charged, not run
 			flushes := c.CodeCacheFlushes
 			c.execBlock(jb.insts[i : i+1])
@@ -455,13 +488,37 @@ func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
 			continue
 		}
 		b := &c.blocks[eip&blockMask]
-		if b.tag != eip || b.jit == nil || b.jitGen != c.jitGen || uint64(b.steps) > *limit-c.Steps || b.code != nil && !c.codeSame(b) {
+		if b.tag != eip { // another block took its place: its translation may still be there
+			jb := c.jitc.byEIP[eip]
+			if jb == nil || jb.steps > *limit-c.Steps || jb.code != nil && string(jb.code) != string(c.Mem[eip:eip+uint32(len(jb.code))]) {
+				return nil
+			}
+			if e := &c.jitc.table[jitHash(eip)]; e.eip != eip {
+				e.eip, e.code = eip, jb.head
+			}
+			// Take the slot back (a block evicted again is found here again).
+			c.fill(&c.filled.blocks, eip&blockMask)
+			b.tag, b.steps, b.insts, b.code, b.hits, b.jit, b.jitGen, b.shared = eip, int(jb.steps), jb.insts, jb.code, 0, jb, c.jitGen, true
+			return jb
+		}
+		if b.jit == nil || b.jitGen != c.jitGen || uint64(b.steps) > *limit-c.Steps || b.code != nil && !c.codeSame(b) {
 			return nil
 		}
 		if e := &c.jitc.table[jitHash(eip)]; e.eip != eip { // another block took its place: take it back
 			e.eip, e.code = eip, b.jit.head
 		}
 		return b.jit
+	}
+}
+
+// jitAdopt gives freshly built block b the translation an earlier block at its address got, if
+// any (blocks share the cache's slots, so a hot block can lose its slot and be built again).
+func (c *CPU) jitAdopt(b *dBlock) {
+	if c.jitc == nil || len(b.insts) == 0 {
+		return
+	}
+	if jb := c.jitc.byEIP[b.tag]; jb != nil && jb.steps == uint64(b.steps) && string(jb.code) == string(b.code) {
+		b.jit, b.jitGen = jb, c.jitGen
 	}
 }
 
@@ -526,6 +583,8 @@ func (c *CPU) JITTargetKind(eip uint32) string {
 func (c *CPU) Run0JITStats() {
 	if c.jitInit() {
 		c.jitc.Stats.EndAt = map[uint32]uint64{}
+		c.jitc.Stats.SlowAt = map[uint32]uint64{}
+		c.jitc.Stats.TransAt = map[uint32]uint64{}
 	}
 }
 

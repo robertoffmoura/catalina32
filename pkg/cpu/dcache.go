@@ -146,6 +146,9 @@ const (
 	dMovlps     // 0F 12: movhlps (register form) / movlps xmm, m64
 	dMul1       // F7 /4, /5: mul / imul r/m32 (EDX:EAX = EAX * r/m32; aux = 4 or 5)
 	dXadd       // [F0] 0F C1: xadd r/m32, r32
+	dPushImm    // 68 / 6A, and E8 00000000 (PIC "call $+5": pushes the next address) (imm = the value)
+	dSSE        // sseForms (not stores): xmm reg = f(xmm reg, xmm/m) (aux = op2, cond = prefix, imm = imm8)
+	dSSEStore   // sseForms stores: xmm/m = f(xmm/m, xmm reg) (aux, cond, imm as dSSE)
 
 	// x87 (the interpreter's: float64 registers FPUSt, top FPUTop).
 	dFld    // push: aux = source (fld*), rm = i for ST(i)
@@ -203,6 +206,8 @@ type dBlock struct {
 	jitGen uint32
 
 	code []byte // a block outside [CodeLo, CodeHi): its instruction bytes (see codeSame)
+
+	shared bool // insts and code are its translation's (jitNext): building it again needs new ones
 }
 
 // xmmSrc is d's 128-bit source operand (an XMM register or memory).
@@ -229,16 +234,43 @@ func (c *CPU) codeSame(b *dBlock) bool {
 // FlushCodeCache discards all decoded instructions and blocks (call after modifying guest code
 // from the host).
 func (c *CPU) FlushCodeCache() {
-	for i := range c.dcache {
-		c.dcache[i].tag = dNoTag
+	// Only the entries filled since the last flush, unless there were many (code that rewrites
+	// itself in a loop flushes often, and the arrays are large).
+	if c.filled.all {
+		for i := range c.dcache {
+			c.dcache[i].tag = dNoTag
+		}
+		for i := range c.blocks {
+			c.blocks[i].tag = dNoTag
+		}
+	} else {
+		for _, i := range c.filled.insts {
+			c.dcache[i].tag = dNoTag
+		}
+		for _, i := range c.filled.blocks {
+			c.blocks[i].tag = dNoTag
+		}
 	}
-	for i := range c.blocks {
-		c.blocks[i].tag = dNoTag
-	}
+	c.filled.insts, c.filled.blocks, c.filled.all = c.filled.insts[:0], c.filled.blocks[:0], false
 	c.checkedLo, c.checkedHi = 0, 0
 	c.CodeCacheFlushes++
 	c.jitReset()
 }
+
+// fill records that cache entry i was filled (for FlushCodeCache).
+func (c *CPU) fill(list *[]uint32, i uint32) {
+	if c.filled.all {
+		return
+	}
+	if len(*list) == maxFilled {
+		c.filled.all = true
+		return
+	}
+	*list = append(*list, i)
+}
+
+// maxFilled is how many filled entries of each cache FlushCodeCache clears one by one.
+const maxFilled = 4096
 
 func endsBlock(kind uint8) bool {
 	switch kind {
@@ -270,6 +302,10 @@ func fusedJcc(d *dInst) uint8 {
 }
 
 func (c *CPU) buildBlock(b *dBlock, eip uint32) {
+	c.fill(&c.filled.blocks, eip&blockMask)
+	if b.shared {
+		b.insts, b.code, b.shared = nil, nil, false
+	}
 	b.tag = eip
 	b.steps = 0
 	b.insts = b.insts[:0]
@@ -337,6 +373,7 @@ func (c *CPU) SetCodeRange(lo, hi uint32) {
 	if c.dcache == nil {
 		c.dcache = newDCache()
 		c.blocks = make([]dBlock, 1<<blockBits)
+		c.filled.all = true // (the blocks' tags start at 0)
 	}
 	c.FlushCodeCache()
 }
@@ -394,6 +431,7 @@ func le32(m []byte, p uint32) uint32 {
 func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	c.dcacheUsed = true
 	m := c.Mem
+	c.fill(&c.filled.insts, eip&dcacheMask)
 	d.tag = eip
 	d.kind = dSlow
 	d.isMem = false
@@ -452,12 +490,15 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	}
 
 	if pfx != 0 {
-		// Only scalar SSE forms take a prefix.
+		// Only SSE forms take a prefix.
 		if op != 0x0F {
 			return
 		}
 		op2 := m[p]
 		p++
+		if decodeSSE(d, m, pfx, op2, p, set) {
+			return
+		}
 		switch op2 {
 		case 0x10, 0x11:
 			n := decodeModRM(m, p, d)
@@ -648,11 +689,18 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	case op == 0xE8:
 		rel := le32(m, p)
 		d.imm = p + 4 + rel
-		d.aux = 0
-		if rel != 0 {
-			d.aux = 1 // records a call frame when TraceCalls is on (PIC "call $+5" does not)
+		if rel == 0 { // PIC "call $+5": a push of the next address that doesn't end the block
+			set(dPushImm, p+4)
+			break
 		}
+		d.aux = 1 // records a call frame when TraceCalls is on
 		set(dCall, p+4)
+	case op == 0x68:
+		d.imm = le32(m, p)
+		set(dPushImm, p+4)
+	case op == 0x6A:
+		d.imm = uint32(int32(int8(m[p])))
+		set(dPushImm, p+1)
 	case op == 0xE9:
 		d.imm = p + 4 + le32(m, p)
 		set(dJmp, p+4)
@@ -745,6 +793,7 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			}
 		case op2 == 0x14:
 			set(dUnpcklps, p+decodeModRM(m, p, d))
+		case decodeSSE(d, m, 0, op2, p, set):
 		case op2 == 0xC2 || op2 == 0xC6:
 			n := decodeModRM(m, p, d)
 			d.imm = uint32(m[p+n])
@@ -925,6 +974,9 @@ func (c *CPU) decode66(d *dInst, eip, p uint32, set func(uint8, uint32)) {
 	case op == 0x0F:
 		op2 := m[p]
 		p++
+		if decodeSSE(d, m, 0x66, op2, p, set) {
+			return
+		}
 		switch op2 {
 		case 0x2E, 0x2F:
 			set(dUcomisd, p+decodeModRM(m, p, d))
@@ -938,6 +990,117 @@ func (c *CPU) decode66(d *dInst, eip, p uint32, set func(uint8, uint32)) {
 			set(dMovdFromX, p+decodeModRM(m, p, d))
 		}
 	}
+}
+
+// sseForm is an SSE/SSE2 form that reads and writes only XMM registers and memory (no flags, no
+// general registers, nothing that depends on the guest's MXCSR beyond what the interpreter
+// assumes): the interpreter runs it with the full decoder, the x86-64 JIT as the same host
+// instruction on copies of the guest's registers.
+type sseForm struct {
+	store   bool  // the r/m operand is the destination
+	mem     uint8 // the memory operand's size: 16, or 8 (no alignment required)
+	memOnly bool  // no register form (or one that isn't the same operation)
+	imm     bool  // an imm8 follows
+}
+
+// sseForms, by prefix (0, 0x66, 0xF2, 0xF3) and the byte after 0F. Forms with their own kinds
+// (movaps, the scalar arithmetic, ...) decode as those.
+var sseForms = map[[2]uint8]sseForm{
+	{0, 0x13}: {store: true, mem: 8, memOnly: true}, // movlps m64, xmm
+	{0, 0x15}: {mem: 16},                            // unpckhps
+	{0, 0x16}: {mem: 8},                             // movhps xmm, m64 / movlhps
+	{0, 0x17}: {store: true, mem: 8, memOnly: true}, // movhps m64, xmm
+	{0, 0x5A}: {mem: 8},                             // cvtps2pd
+	{0, 0x5B}: {mem: 16},                            // cvtdq2ps
+
+	{0x66, 0x10}: {mem: 16},                            // movupd
+	{0x66, 0x11}: {store: true, mem: 16},               // movupd
+	{0x66, 0x12}: {mem: 8, memOnly: true},              // movlpd xmm, m64
+	{0x66, 0x13}: {store: true, mem: 8, memOnly: true}, // movlpd m64, xmm
+	{0x66, 0x14}: {mem: 16},                            // unpcklpd
+	{0x66, 0x15}: {mem: 16},                            // unpckhpd
+	{0x66, 0x16}: {mem: 8, memOnly: true},              // movhpd xmm, m64
+	{0x66, 0x17}: {store: true, mem: 8, memOnly: true}, // movhpd m64, xmm
+	{0x66, 0x28}: {mem: 16},                            // movapd
+	{0x66, 0x29}: {store: true, mem: 16},               // movapd
+	{0x66, 0x51}: {mem: 16},                            // sqrtpd
+	{0x66, 0x54}: {mem: 16},                            // andpd
+	{0x66, 0x55}: {mem: 16},                            // andnpd
+	{0x66, 0x56}: {mem: 16},                            // orpd
+	{0x66, 0x57}: {mem: 16},                            // xorpd
+	{0x66, 0x58}: {mem: 16},                            // addpd
+	{0x66, 0x59}: {mem: 16},                            // mulpd
+	{0x66, 0x5A}: {mem: 16},                            // cvtpd2ps
+	{0x66, 0x5B}: {mem: 16},                            // cvtps2dq
+	{0x66, 0x5C}: {mem: 16},                            // subpd
+	{0x66, 0x5D}: {mem: 16},                            // minpd
+	{0x66, 0x5E}: {mem: 16},                            // divpd
+	{0x66, 0x5F}: {mem: 16},                            // maxpd
+	{0x66, 0x60}: {mem: 16},                            // punpcklbw
+	{0x66, 0x61}: {mem: 16},                            // punpcklwd
+	{0x66, 0x62}: {mem: 16},                            // punpckldq
+	{0x66, 0x68}: {mem: 16},                            // punpckhbw
+	{0x66, 0x69}: {mem: 16},                            // punpckhwd
+	{0x66, 0x6A}: {mem: 16},                            // punpckhdq
+	{0x66, 0x6C}: {mem: 16},                            // punpcklqdq
+	{0x66, 0x6D}: {mem: 16},                            // punpckhqdq
+	{0x66, 0x6F}: {mem: 16},                            // movdqa
+	{0x66, 0x74}: {mem: 16},                            // pcmpeqb
+	{0x66, 0x75}: {mem: 16},                            // pcmpeqw
+	{0x66, 0x76}: {mem: 16},                            // pcmpeqd
+	{0x66, 0x64}: {mem: 16},                            // pcmpgtb
+	{0x66, 0x65}: {mem: 16},                            // pcmpgtw
+	{0x66, 0x66}: {mem: 16},                            // pcmpgtd
+	{0x66, 0x7F}: {store: true, mem: 16},               // movdqa
+	{0x66, 0xC2}: {mem: 16, imm: true},                 // cmppd
+	{0x66, 0xC6}: {mem: 16, imm: true},                 // shufpd
+	{0x66, 0xD4}: {mem: 16},                            // paddq
+	{0x66, 0xD5}: {mem: 16},                            // pmullw
+	{0x66, 0xD6}: {store: true, mem: 8},                // movq xmm/m64, xmm
+	{0x66, 0xDB}: {mem: 16},                            // pand
+	{0x66, 0xDF}: {mem: 16},                            // pandn
+	{0x66, 0xE6}: {mem: 16},                            // cvttpd2dq
+	{0x66, 0xEB}: {mem: 16},                            // por
+	{0x66, 0xEF}: {mem: 16},                            // pxor
+	{0x66, 0xF4}: {mem: 16},                            // pmuludq
+	{0x66, 0xF8}: {mem: 16},                            // psubb
+	{0x66, 0xF9}: {mem: 16},                            // psubw
+	{0x66, 0xFA}: {mem: 16},                            // psubd
+	{0x66, 0xFB}: {mem: 16},                            // psubq
+	{0x66, 0xFC}: {mem: 16},                            // paddb
+	{0x66, 0xFD}: {mem: 16},                            // paddw
+	{0x66, 0xFE}: {mem: 16},                            // paddd
+
+	{0xF2, 0xE6}: {mem: 16}, // cvtpd2dq
+
+	{0xF3, 0x5B}: {mem: 16},              // cvttps2dq
+	{0xF3, 0x6F}: {mem: 16},              // movdqu
+	{0xF3, 0x7E}: {mem: 8},               // movq xmm, xmm/m64
+	{0xF3, 0x7F}: {store: true, mem: 16}, // movdqu
+	{0xF3, 0xE6}: {mem: 8},               // cvtdq2pd
+}
+
+// decodeSSE decodes an sseForms form (op2 at m[p-1]); false if it isn't one.
+func decodeSSE(d *dInst, m []byte, pfx, op2 uint8, p uint32, set func(uint8, uint32)) bool {
+	f, ok := sseForms[[2]uint8{pfx, op2}]
+	if !ok {
+		return false
+	}
+	n := decodeModRM(m, p, d)
+	if f.memOnly && !d.isMem {
+		return false
+	}
+	d.aux, d.cond = op2, pfx
+	if f.imm {
+		d.imm = uint32(m[p+n])
+		n++
+	}
+	if f.store {
+		set(dSSEStore, p+n)
+	} else {
+		set(dSSE, p+n)
+	}
+	return true
 }
 
 func (c *CPU) ea(d *dInst) uint32 {
@@ -1336,6 +1499,8 @@ func (c *CPU) execBlock(insts []dInst) {
 			c.EIP = c.rm32(d)
 		case dPushRM32:
 			c.Push32(c.rm32(d))
+		case dPushImm:
+			c.Push32(d.imm)
 		case dTestRMI32:
 			c.UpdateFlagsLogic32(c.rm32(d) & d.imm)
 		case dXchg:

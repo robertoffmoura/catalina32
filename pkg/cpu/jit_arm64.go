@@ -621,11 +621,19 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	for i := range exits {
 		exits[i] = dry.slow[i] >= 0
 	}
-	g := newJitGen(c, j, jb, jitCaptures(jb.insts, exits, func(i, k int) bool {
+	capture := jitCaptures(jb.insts, exits, c.jitLiveOut(jb.insts, jb.starts[n]), func(i, k int) bool {
 		cc := jitFlagFx(&jb.insts[k]).cc
 		_, ok := a64Cond(dry.modes[i], cc)
 		return dry.hostOK[i] && ok && ccFlags(cc)&^jitFlagFx(&jb.insts[i]).value == 0
-	}))
+	})
+	// A fused compare and branch on a condition the host's NZCV can't give (parity, or ones the
+	// mode lacks) branches on w8: its flags are saved there whether or not anything after reads them.
+	if last := &jb.insts[n-1]; isFused(last.kind) {
+		if _, ok := a64Cond(dry.modes[n-1], last.cond); !ok {
+			capture[n-1] = true
+		}
+	}
+	g := newJitGen(c, j, jb, capture)
 	g.body()
 	a := &g.a
 	jb.cost.Insts = uint64(n)
@@ -971,6 +979,9 @@ func (g *jitGen) inst(d *dInst) bool {
 
 	case dPushR:
 		g.push(gr(d.reg))
+	case dPushImm:
+		a.movI(rT1, d.imm)
+		g.push(rT1)
 	case dPushRM32:
 		g.push(g.loadRM(d, 4, false))
 	case dPopR:
@@ -1323,7 +1334,7 @@ func (g *jitGen) fused(d *dInst, next uint32) {
 		g.aluN(7, 8, ra, rT3)
 	}
 	cond, ok := a64Cond(g.mode, d.cond)
-	if !ok { // w8 holds the flags (the block's last instruction's always do)
+	if !ok { // w8 holds the flags (jitTranslate saves them)
 		cond = g.condFromFlags(d.cond)
 	}
 	taken := a.newLabel()

@@ -2085,6 +2085,9 @@ func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 		b := &c.blocks[eip&blockMask]
 		if b.tag != eip || b.code != nil && !c.codeSame(b) {
 			c.buildBlock(b, eip)
+			if jit {
+				c.jitAdopt(b) // translated before another block took its place
+			}
 		}
 		if len(b.insts) == 0 || uint64(b.steps) > limit-c.Steps {
 			return // uncached instruction, or the block would cross the next event: single-step
