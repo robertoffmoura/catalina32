@@ -31,7 +31,6 @@ var jitThreshold uint32 = 32
 
 const (
 	jitSlice     = 4_000_000 // most steps per entry into translated code (chained blocks): Go gets control back that often
-	jitCodeSize  = 64 << 20  // the code buffer; when full, all translated code is discarded
 	jitTableBits = 18        // the table translated code looks indirect targets up in (hashed)
 	jitTableMask = 1<<jitTableBits - 1
 )
@@ -100,6 +99,7 @@ type jitBlock struct {
 	resume []uintptr // where translated code for instruction i starts (0: never resumed there)
 	head   uintptr   // entry with the step-limit check (chaining)
 	steps  uint64    // all its steps
+	code   []byte    // a self-checking block's instruction bytes (dBlock.code): its head compares them with memory
 
 	// Diagnostics (C32_JITPROF=1): how often the block was entered at its head, and what its
 	// code does per run.
@@ -241,7 +241,7 @@ func (c *CPU) jitInit() bool {
 	j.stores = make([]byte, 1<<20) // every page of the 32-bit address space
 	j.used = jitShared(j)
 	j.fixed = j.used
-	j.coldAt = len(j.buf) / 8 * 5
+	j.coldAt = len(j.buf) * jitHotEighths / 8
 	j.cold = j.coldAt
 	c.jit.mem = uintptr(unsafe.Pointer(&c.Mem[0]))
 	c.jit.stores = uintptr(unsafe.Pointer(&j.stores[0]))
@@ -291,10 +291,11 @@ func (c *CPU) jitCompile(b *dBlock) *jitBlock {
 	if j.failed[b.tag] {
 		return nil
 	}
-	if j.coldAt-j.used < 1<<16 || len(j.buf)-j.cold < 1<<16 {
+	if j.coldAt-j.used < 1<<16 || j.coldAt < len(j.buf) && len(j.buf)-j.cold < 1<<16 {
 		c.jitReset() // full: start again
 	}
-	jb := &jitBlock{id: uint32(len(j.blocks)), eip: b.tag, insts: append([]dInst(nil), b.insts...), steps: uint64(b.steps)}
+	jb := &jitBlock{id: uint32(len(j.blocks)), eip: b.tag, insts: append([]dInst(nil), b.insts...), steps: uint64(b.steps),
+		code: append([]byte(nil), b.code...)}
 	jb.prefix = make([]uint64, len(jb.insts)+1)
 	jb.starts = make([]uint32, len(jb.insts)+1)
 	jb.starts[0] = jb.eip
@@ -320,6 +321,27 @@ func (c *CPU) jitCompile(b *dBlock) *jitBlock {
 	}
 	delete(j.pending, jb.eip)
 	return jb
+}
+
+// jitCodeChunks splits a self-checking block's n code bytes into the loads its head compares:
+// (offset, size) with sizes 8, 4 or 1, the last ones overlapping rather than reading past the end.
+func jitCodeChunks(n int) (chunks [][2]int) {
+	switch {
+	case n >= 8:
+		for off := 0; off+8 <= n; off += 8 {
+			chunks = append(chunks, [2]int{off, 8})
+		}
+		if n%8 != 0 {
+			chunks = append(chunks, [2]int{n - 8, 8})
+		}
+	case n >= 4:
+		chunks = append(chunks, [2]int{0, 4}, [2]int{n - 4, 4})
+	default:
+		for off := 0; off < n; off++ {
+			chunks = append(chunks, [2]int{off, 1})
+		}
+	}
+	return chunks
 }
 
 func isFused(k uint8) bool {
@@ -413,7 +435,7 @@ func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
 			continue
 		}
 		b := &c.blocks[eip&blockMask]
-		if b.tag != eip || b.jit == nil || b.jitGen != c.jitGen || uint64(b.steps) > *limit-c.Steps {
+		if b.tag != eip || b.jit == nil || b.jitGen != c.jitGen || uint64(b.steps) > *limit-c.Steps || b.code != nil && !c.codeSame(b) {
 			return nil
 		}
 		if e := &c.jitc.table[jitHash(eip)]; e.eip != eip { // another block took its place: take it back

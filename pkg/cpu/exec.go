@@ -2070,19 +2070,20 @@ func (c *CPU) nextEventStep() uint64 {
 }
 
 // runCached executes cached straight-line blocks until limit steps, stopEIP, a halt, or an
-// instruction that needs the full decoder (intercepts, uncached forms, code outside
-// [CodeLo, CodeHi)). Stop addresses lie outside guest code, so they can only be reached by a
+// instruction that needs the full decoder (intercepts, uncached forms). Stop addresses lie outside guest code, so they can only be reached by a
 // control transfer, which always ends a block; checking them at block starts is enough.
 func (c *CPU) runCached(stopEIP uint32, limit uint64) {
-	span := c.CodeHi - c.CodeLo
+	if c.blocks == nil {
+		return // no decoded-instruction cache (SetCodeRange)
+	}
 	jit := c.jitUsable()
 	for c.Steps < limit {
 		eip := c.EIP
-		if eip == stopEIP || c.Halted || eip-c.CodeLo >= span || c.icept[eip>>6]&(1<<(eip&63)) != 0 {
-			return
+		if eip == stopEIP || c.Halted || eip > ArenaSize-maxInstLen || c.icept[eip>>6]&(1<<(eip&63)) != 0 {
+			return // (Step halts outside guest memory)
 		}
 		b := &c.blocks[eip&blockMask]
-		if b.tag != eip {
+		if b.tag != eip || b.code != nil && !c.codeSame(b) {
 			c.buildBlock(b, eip)
 		}
 		if len(b.insts) == 0 || uint64(b.steps) > limit-c.Steps {

@@ -4,7 +4,11 @@ package cpu
 
 // No JIT backend for this architecture: blocks run in the interpreter.
 
-const jitSupported = false
+const (
+	jitSupported  = false
+	jitCodeSize   = 0
+	jitHotEighths = 0
+)
 
 func jitShared(j *jitCode) int                           { return 0 }
 func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool { return false }

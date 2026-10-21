@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -346,14 +347,34 @@ type jtState struct {
 	stats  JITStats
 }
 
-func jtRun(t *testing.T, prog []byte, seed int64, jit bool, maxSteps uint64) jtState {
+// How jtRun runs a program.
+type jtMode int
+
+const (
+	jtInterp jtMode = iota // the interpreter with its decoded-instruction cache
+	jtJIT                  // translated code
+	jtPlain                // the full decoder only (no cache): the reference for code outside the code range
+)
+
+var jtHaltAt = regexp.MustCompile(` at EIP=0x[0-9a-f]+`)
+
+// jtChecked says whether seed's program runs outside the code range (self-checking blocks).
+func jtChecked(seed int64) bool { return seed%3 == 2 }
+
+func jtRun(t *testing.T, prog []byte, seed int64, mode jtMode, maxSteps uint64) jtState {
 	r := rand.New(rand.NewSource(seed))
 	c := NewCPU()
-	c.NoJIT = !jit
+	c.NoJIT = mode != jtJIT
 	copy(c.Mem[jtCode:], prog)
 	copy(c.Mem[jtSub:], []byte{0x83, 0xC0, 0x01, 0xC3})              // add eax, 1; ret
 	copy(c.Mem[jtSub2:], []byte{0x03, 0x44, 0x24, 0x04, 0xC2, 4, 0}) // add eax, [esp+4]; ret 4
-	c.SetCodeRange(jtCode, jtSub+0x100)
+	switch {
+	case mode == jtPlain:
+	case jtChecked(seed): // all the code lies outside the range
+		c.SetCodeRange(0x00400000, 0x00401000)
+	default:
+		c.SetCodeRange(jtCode, jtSub+0x100)
+	}
 	if seed%2 == 1 { // translated code hands stores to the data area to the interpreter
 		c.jitSlowPages = [][2]uint32{{jtData, jtData + 0x1000}}
 	}
@@ -469,10 +490,18 @@ func TestJITMatchesInterpreter(t *testing.T) {
 	for seed := int64(0); seed < int64(n); seed++ {
 		g := &jtGen{r: rand.New(rand.NewSource(seed))}
 		prog := g.program(5 + g.r.Intn(30))
-		a := jtRun(t, prog, seed, false, 20000)
-		b := jtRun(t, prog, seed, true, 20000)
+		a := jtRun(t, prog, seed, jtInterp, 20000)
+		b := jtRun(t, prog, seed, jtJIT, 20000)
 		if d := a.diff(b); d != "" {
 			t.Fatalf("seed %d, program % x:\ninterpreter vs JIT: %s", seed, prog, d)
+		}
+		if jtChecked(seed) {
+			// (The full decoder's halt messages give a different EIP within the instruction.)
+			p, q := jtRun(t, prog, seed, jtPlain, 20000), a
+			p.halted, q.halted = jtHaltAt.ReplaceAllString(p.halted, ""), jtHaltAt.ReplaceAllString(q.halted, "")
+			if d := p.diff(q); d != "" {
+				t.Fatalf("seed %d, program % x (outside the code range):\nfull decoder vs interpreter: %s", seed, prog, d)
+			}
 		}
 		total.Translated += b.stats.Translated
 		total.Entries += b.stats.Entries
@@ -500,11 +529,62 @@ func TestJITBisect(t *testing.T) {
 	g := &jtGen{r: rand.New(rand.NewSource(seed))}
 	prog := g.program(5 + g.r.Intn(30))
 	for n := uint64(1); n < 20000; n++ {
-		a := jtRun(t, prog, seed, false, n)
-		b := jtRun(t, prog, seed, true, n)
+		a := jtRun(t, prog, seed, jtInterp, n)
+		b := jtRun(t, prog, seed, jtJIT, n)
 		if d := a.diff(b); d != "" && !strings.HasPrefix(d, "eip") {
-			c := jtRun(t, prog, seed, false, n-1)
+			c := jtRun(t, prog, seed, jtInterp, n-1)
 			t.Fatalf("first difference after %d steps (before it: eip %#x, regs %08x flags %#x):\n%s", n, c.eip, c.regs, c.flags, d)
+		}
+	}
+}
+
+// TestJITSelfCheckingCode runs code outside the code range that patches its own instructions
+// every 8 iterations (the immediate of its first instruction): each self-checking block, and its
+// translation, must notice and be rebuilt. Interpreter, JIT and the full decoder must agree.
+func TestJITSelfCheckingCode(t *testing.T) {
+	if !jitSupported || jitDisabled {
+		t.Skip("no JIT on this host")
+	}
+	defer func(v uint32) { jitThreshold = v }(jitThreshold)
+	jitThreshold = 2
+	const at = 0x05000000 // the heap
+	prog := []byte{
+		0xB8, 0x11, 0x11, 0x11, 0x11, // top: mov eax, 0x11111111
+		0x01, 0xC3, //                       add ebx, eax
+		0xF6, 0x45, 0x7C, 0x07, //           test byte [ebp+0x7C], 7
+		0x75, 0x09, //                       jnz skip
+		0x89, 0x4E, 0x01, //                 mov [esi+1], ecx (the immediate above)
+		0x81, 0xC1, 0x01, 0x01, 0x01, 0x01, // add ecx, 0x01010101
+		0xFF, 0x4D, 0x7C, //                 skip: dec dword [ebp+0x7C]
+		0x75, 0xE4, //                       jnz top
+		0xC3, //                             ret
+	}
+	run := func(mode jtMode) (uint32, uint32, uint64, JITStats) {
+		c := NewCPU()
+		defer c.Close()
+		c.NoJIT = mode != jtJIT
+		if mode != jtPlain {
+			c.SetCodeRange(0x00400000, 0x00401000)
+		}
+		copy(c.Mem[at:], prog)
+		c.Regs[RegEBP], c.Regs[RegESI], c.Regs[RegECX], c.Regs[RegESP] = jtData, at, 0x22222222, jtStack
+		c.Write32(jtData+0x7C, 200)
+		c.Push32(SentinelReturnEIP)
+		c.EIP = at
+		c.MaxSteps = 100000
+		if err := c.RunUntil(SentinelReturnEIP); err != nil {
+			t.Fatal(err)
+		}
+		return c.Regs[RegEBX], c.Read32(at + 1), c.Steps, c.JITStats()
+	}
+	pb, pi, ps, _ := run(jtPlain)
+	for _, mode := range []jtMode{jtInterp, jtJIT} {
+		b, i, s, st := run(mode)
+		if b != pb || i != pi || s != ps {
+			t.Errorf("mode %d: ebx %#x, immediate %#x, %d steps; the full decoder: %#x, %#x, %d", mode, b, i, s, pb, pi, ps)
+		}
+		if mode == jtJIT && st.Translated < 10 {
+			t.Errorf("translated %d blocks: the patched block wasn't translated again", st.Translated)
 		}
 	}
 }

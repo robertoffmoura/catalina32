@@ -23,6 +23,11 @@ import (
 
 const jitSupported = true
 
+const (
+	jitCodeSize   = 256 << 20 // the code buffer (reserved; pages are used as code fills it); when full, all translated code is discarded
+	jitHotEighths = 5         // how much of it holds blocks' bodies (hot code); their exits go in the rest
+)
+
 var hostReg = [8]int{hRAX, hRCX, hRDX, hRBX, hR12, hRBP, hRSI, hRDI}
 
 // jitCall runs translated code: prologue saves the host registers Go needs back, loads the guest
@@ -94,6 +99,7 @@ type jitGen struct {
 	resume    []int    // where each instruction's code starts
 	limitExit int      // label
 	hostOK    []bool   // per instruction: the host's flags hold its flags when it ends
+	changed   int      // label: a self-checking block's code changed (-1: not one)
 
 	entryPend []jitPending // per instruction: saved flags its code expects on entry
 	natives   []bool       // per instruction: reads the host's flags directly
@@ -341,6 +347,11 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	g.exit(jitExitLimit)
 	a.bind(g.endStub)
 	g.exit(jitExitEnd)
+	if g.changed >= 0 {
+		a.bind(g.changed)
+		a.storeI32(xm(hR15, offEIP), jb.eip)
+		g.exit(jitExitEnd)
+	}
 	slowExit := a.newLabel() // r11d = the instruction's index
 	a.bind(slowExit)
 	a.store32(xm(hR15, offEIdx), hR11)
@@ -454,7 +465,31 @@ func newJitGen(c *CPU, j *jitCode, jb *jitBlock, capture []bool) *jitGen {
 	g.hostOK = make([]bool, n)
 	g.endStub = g.a.newLabel()
 	g.limitExit = g.a.newLabel()
+	g.changed = -1
 	return g
+}
+
+// codeCheck: a self-checking block (jitBlock.code) first compares its instruction bytes with
+// memory; if they changed it leaves for Go (which rebuilds the block) before charging its steps.
+func (g *jitGen) codeCheck() {
+	a := &g.a
+	code := g.jb.code
+	g.changed = a.newLabel()
+	a.movRI32NoFlags(hR9, g.jb.eip)
+	for _, ch := range jitCodeChunks(len(code)) {
+		off, at := ch[0], xmi(hR14, hR9, 0, int32(ch[0]))
+		switch ch[1] {
+		case 8:
+			a.emit(0x49, 0xBB) // mov r11, imm64
+			a.emit64(binary.LittleEndian.Uint64(code[off:]))
+			a.inst(0, xW, []byte{0x39}, hR11, at) // cmp [mem], r11
+		case 4:
+			a.alu32I(7, at, binary.LittleEndian.Uint32(code[off:]))
+		default:
+			a.alu8I(7, at, code[off], xByte)
+		}
+		a.jcc(0x5, g.changed)
+	}
 }
 
 // body translates the block's instructions (the head with the step-limit check first); it
@@ -462,6 +497,9 @@ func newJitGen(c *CPU, j *jitCode, jb *jitBlock, capture []bool) *jitGen {
 func (g *jitGen) body() int {
 	a := &g.a
 	jb := g.jb
+	if len(jb.code) > 0 {
+		g.codeCheck()
+	}
 	a.alu64I(5, xm(hR15, offBudget), int32(jb.steps)) // sub [budget], steps
 	a.jcc(0x2, g.limitExit)                           // jb: it would pass the limit
 	if jitProf {

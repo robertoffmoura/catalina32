@@ -115,6 +115,8 @@ type CPU struct {
 	blocks           []dBlock
 	CodeLo, CodeHi   uint32
 	CodeCacheFlushes uint64
+	checkedLo        uint32 // self-checking blocks (outside [CodeLo, CodeHi)) lie in [checkedLo, checkedHi)
+	checkedHi        uint32
 	dcacheUsed       bool // something was decoded; only then do intercept changes need a flush
 	// With several images in the code range, their data lies between their code: textPages marks
 	// the 4 KB pages holding code, and only stores to those flush (nil: the whole range is code).
@@ -224,7 +226,7 @@ func (c *CPU) RegisterIntercept(addr uint32, name string, fn ThunkFunc) {
 	if addr < ArenaSize {
 		c.icept[addr>>6] |= 1 << (addr & 63)
 	}
-	if addr >= c.CodeLo && addr < c.CodeHi && c.dcacheUsed {
+	if c.inBlocks(addr) {
 		c.FlushCodeCache() // blocks are built assuming no intercept inside them
 	}
 	c.InterceptTag[addr] = name
@@ -241,9 +243,14 @@ func (c *CPU) SetInterceptEnabled(addr uint32, on bool) {
 	} else {
 		c.icept[addr>>6] &^= 1 << (addr & 63)
 	}
-	if addr >= c.CodeLo && addr < c.CodeHi && c.dcacheUsed {
+	if c.inBlocks(addr) {
 		c.FlushCodeCache()
 	}
+}
+
+// inBlocks says whether a cached block may contain addr.
+func (c *CPU) inBlocks(addr uint32) bool {
+	return c.dcacheUsed && (addr >= c.CodeLo && addr < c.CodeHi || addr >= c.checkedLo && addr < c.checkedHi)
 }
 
 // Memory accessors

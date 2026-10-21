@@ -31,9 +31,24 @@ Measured on the Linux dev container, x86-64 backend, against the interpreter wit
 | Portal `TestBoot`, 12 billion instructions | 182 s | ~50 s | byte-identical OpenGL stream (`C32_GLTRACE`) |
 | Portal gameplay | ~75M instructions/s | ~280M instructions/s | |
 
-**What is left in Portal:** Go round trips for calls to host functions, about 14 million a
-second in gameplay (the C library, SDL, OpenAL ... are Go). Each one leaves translated code and
-enters it again.
+**Portal, looking into a room against facing a wall** (`testchmb_a_15`, the same spot,
+`TestBoot` with `C32_FRAMESTATS`; host milliseconds per frame on the container):
+
+| | Room view | Wall |
+|---|---|---|
+| Before self-checking blocks | 177 ms | 140 ms |
+| With them and a bigger code buffer | 146 ms | 100 ms |
+| Guest instructions per frame | 19.8 M | 16.5 M |
+| Of which the full decoder runs | 1.57 M, now 0.75 M | 1.61 M, now 0.75 M |
+| GL commands per frame | 3,645 | 1,730 |
+
+- The full decoder had run Miles's MP3 decoder (`mssmp3.asi`), which Miles loads into heap
+  memory itself: outside the code range, so neither cached nor translated. Self-checking
+  blocks (below) now cover it.
+- **What is left:** its x87 and MMX instructions, which the cache doesn't decode (about 0.33 M
+  per frame), and Go round trips for host calls (about 40,000 a frame).
+- **What a larger view adds:** more translated game code, and more host calls and returns to
+  Go.
 
 **arm64:** QEMU emulates the host, so speed there says little about real hardware. The
 arm64 backend's numbers are in "Testing".
@@ -49,6 +64,12 @@ Generic part: `pkg/cpu/jit.go` and `jit_flags.go`. The two backends: `jit_amd64.
   `jitThreshold` (32) it translates the block, the same block `buildBlock` made: same
   boundaries, same step count. A block whose first instruction can't be translated is
   remembered (`failed`) and stays interpreted.
+- **Code outside the code range** (code the game loaded or made in its own memory, like Miles's
+  plug-ins) runs in **self-checking blocks**: stores there don't flush anything (they stay on
+  the fast path), so such a block keeps its instruction bytes (`dBlock.code`) and compares
+  them with memory before it runs, in Go and at the head of its translated code. If they
+  changed, the block is rebuilt. A block that changes its own bytes while running keeps its
+  old instructions to its end. `TestJITSelfCheckingCode` patches code in a loop.
 - **Running.** `jitRun` enters translated code through `jitCall`, an assembly trampoline that
   calls the backend's prologue. The prologue loads the guest registers into host registers and
   jumps to the block.
@@ -73,7 +94,8 @@ Generic part: `pkg/cpu/jit.go` and `jit_flags.go`. The two backends: `jit_amd64.
 - **Invalidation.**
   - `FlushCodeCache` (self-modifying code, patches, intercepts registered later) discards all
     translated code (`jitReset`).
-  - A full code buffer (64 MB) does the same.
+  - A full code buffer does the same: 256 MB reserved on x86-64; 112 MB on arm64, where a B
+    instruction reaches ±128 MB.
   - `SetCodeRange` and `MarkTextPages` mark the store table stale.
 - **Off** with `C32_NO_JIT=1` (or `CPU.NoJIT`). It is also off while the interpreter's
   per-instruction hooks are wanted: call tracing, watchpoints, the guest profiler.
@@ -213,6 +235,9 @@ Translated code must be indistinguishable from the interpreter.
 
 ## Ideas not done
 
+- **x87 (and MMX) in the cache and the JIT.** Miles's MP3 decoder is heavy in x87: `fld`,
+  `fxch`, `fmul`, `faddp`, `fstp`. The interpreter's x87 is plain `float64` arithmetic on eight
+  registers, which both backends can do with double-precision instructions.
 - **Host calls without leaving translated code** (the main cost left in Portal). It would
   need calling Go from generated code, or translating the hottest host functions.
 - **Superblocks or traces** across unconditional jumps and calls.

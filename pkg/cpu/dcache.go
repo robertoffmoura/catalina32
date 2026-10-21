@@ -9,8 +9,13 @@ package cpu
 // uncached execution are identical; forms that are not cached (and any instruction with segment or
 // operand-size prefixes) are marked dSlow once and always take the full decoder.
 //
-// Only instructions inside [CodeLo, CodeHi) are cached. Guest writes into that range flush the
-// cache (see the Write* slow paths); host code that patches guest code must call FlushCodeCache.
+// Instructions inside [CodeLo, CodeHi) (the images' code) are cached, and guest writes into that
+// range flush the cache (see the Write* slow paths); host code that patches guest code must call
+// FlushCodeCache. Code elsewhere (that the game loaded or made in its own memory, e.g. Miles's
+// MP3 decoder) is cached in self-checking blocks: such a block keeps its instruction bytes and
+// compares them with memory before it runs (dBlock.code; translated code does the same), so
+// stores there stay on the fast path. A block that changes its own bytes while it runs keeps
+// running its old instructions to its end (as execBlock always did when code changed under it).
 
 const (
 	dcacheBits = 18
@@ -172,6 +177,13 @@ type dBlock struct {
 	hits   uint32    // runs, until it is translated (jit.go)
 	jit    *jitBlock // its translation, valid while jitGen == c.jitGen
 	jitGen uint32
+
+	code []byte // a block outside [CodeLo, CodeHi): its instruction bytes (see codeSame)
+}
+
+// codeSame says whether self-checking block b's instructions are still those in memory.
+func (c *CPU) codeSame(b *dBlock) bool {
+	return string(b.code) == string(c.Mem[b.tag:b.tag+uint32(len(b.code))])
 }
 
 // FlushCodeCache discards all decoded instructions and blocks (call after modifying guest code
@@ -183,6 +195,7 @@ func (c *CPU) FlushCodeCache() {
 	for i := range c.blocks {
 		c.blocks[i].tag = dNoTag
 	}
+	c.checkedLo, c.checkedHi = 0, 0
 	c.CodeCacheFlushes++
 	c.jitReset()
 }
@@ -221,11 +234,36 @@ func (c *CPU) buildBlock(b *dBlock, eip uint32) {
 	b.steps = 0
 	b.insts = b.insts[:0]
 	b.hits, b.jit = 0, nil
-	defer func() { b.steps += len(b.insts) }()
+	b.code = b.code[:0]
+	c.buildInsts(b, eip)
+	b.steps += len(b.insts)
+	if eip-c.CodeLo < c.CodeHi-c.CodeLo || len(b.insts) == 0 {
+		b.code = nil
+		return
+	}
+	end := eip
+	for i := range b.insts {
+		end += uint32(b.insts[i].len)
+		if isFused(b.insts[i].kind) {
+			end += uint32(b.insts[i].len2)
+		}
+	}
+	b.code = append(b.code, c.Mem[eip:end]...)
+	if c.checkedHi == 0 {
+		c.checkedLo, c.checkedHi = eip, end
+	}
+	c.checkedLo, c.checkedHi = min(c.checkedLo, eip), max(c.checkedHi, end)
+}
+
+// buildInsts decodes block b's instructions from eip: up to blockMax, a control transfer, an
+// intercepted address, an uncached form, or the edge of [CodeLo, CodeHi) (a block is all inside
+// it or all outside).
+func (c *CPU) buildInsts(b *dBlock, eip uint32) {
 	span := c.CodeHi - c.CodeLo
-	for len(b.insts) < blockMax && eip-c.CodeLo < span && c.icept[eip>>6]&(1<<(eip&63)) == 0 {
+	inside := eip-c.CodeLo < span
+	for len(b.insts) < blockMax && (eip-c.CodeLo < span) == inside && eip <= ArenaSize-maxInstLen && c.icept[eip>>6]&(1<<(eip&63)) == 0 {
 		d := &c.dcache[eip&dcacheMask]
-		if d.tag != eip {
+		if d.tag != eip || !inside { // outside, memory may have changed since d was decoded
 			c.decodeCached(d, eip)
 		}
 		if d.kind == dSlow {

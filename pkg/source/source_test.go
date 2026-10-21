@@ -107,7 +107,7 @@ func TestBoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,host_calls,gl_commands,gl_kb,jit_slow,jit_end")
+		fmt.Fprintln(f, "frame,steps,instructions,full_decodes,host_ms,host_calls,gl_commands,gl_kb,jit_slow,jit_end,jit_resets")
 		var last struct {
 			steps, full, calls, cmds, bytes, slow, end uint64
 			at                                         time.Time
@@ -117,9 +117,9 @@ func TestBoot(t *testing.T) {
 		m.OnFrame = func(c *cpu.CPU) {
 			frame++
 			now, st := time.Now(), c.JITStats()
-			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%d,%d,%.1f,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
+			fmt.Fprintf(f, "%d,%d,%d,%d,%.2f,%d,%d,%.1f,%d,%d,%d\n", frame, c.Steps, c.Steps-last.steps, c.FullDecodes-last.full,
 				float64(now.Sub(last.at).Microseconds())/1000, c.HostCalls-last.calls, m.glr.sent-last.cmds,
-				float64(m.glr.w-last.bytes)/1024, st.SlowExits-last.slow, st.EndExits-last.end)
+				float64(m.glr.w-last.bytes)/1024, st.SlowExits-last.slow, st.EndExits-last.end, st.Resets)
 			last.steps, last.full, last.calls, last.cmds, last.bytes, last.slow, last.end, last.at = c.Steps, c.FullDecodes, c.HostCalls, m.glr.sent, m.glr.w, st.SlowExits, st.EndExits, now
 		}
 	}
