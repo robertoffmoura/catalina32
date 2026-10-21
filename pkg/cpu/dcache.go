@@ -123,6 +123,8 @@ const (
 	dPshufd     // 66 0F 70 (imm = order)
 	dMovdToX    // 66 0F 6E: xmm = r/m32
 	dMovdFromX  // 66 0F 7E: r/m32 = xmm
+	dCmpxchg8b  // [F0] 0F C7 /1 m64
+	dBswap      // 0F C8+r
 )
 
 type dInst struct {
@@ -327,6 +329,12 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			d.kind, d.len = dNop, uint8(q+2+n-eip)
 			return
 		}
+	}
+	if m[p] == 0xF0 && m[p+1] == 0x0F && m[p+2] == 0xC7 { // lock cmpxchg8b
+		if n := decodeModRM(m, p+3, d); d.reg == 1 && d.isMem {
+			d.kind, d.len = dCmpxchg8b, uint8(p+3+n-eip)
+		}
+		return
 	}
 	pfx := uint8(0)
 	if b := m[p]; b == 0xF3 || b == 0xF2 {
@@ -620,6 +628,13 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			n := decodeModRM(m, p, d)
 			d.aux = op2
 			set(dLogicPS, p+n)
+		case op2 == 0xC7:
+			if n := decodeModRM(m, p, d); d.reg == 1 && d.isMem {
+				set(dCmpxchg8b, p+n)
+			}
+		case op2 >= 0xC8 && op2 <= 0xCF:
+			d.reg = op2 & 7
+			set(dBswap, p)
 		}
 	}
 }

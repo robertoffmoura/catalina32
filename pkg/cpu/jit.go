@@ -1,7 +1,9 @@
 package cpu
 
 import (
+	"fmt"
 	"os"
+	"sort"
 	"unsafe"
 )
 
@@ -30,7 +32,7 @@ var jitThreshold uint32 = 32
 const (
 	jitSlice     = 4_000_000 // most steps per entry into translated code (chained blocks): Go gets control back that often
 	jitCodeSize  = 64 << 20  // the code buffer; when full, all translated code is discarded
-	jitTableBits = 16        // the table translated code looks indirect targets up in
+	jitTableBits = 18        // the table translated code looks indirect targets up in (hashed)
 	jitTableMask = 1<<jitTableBits - 1
 )
 
@@ -56,6 +58,7 @@ type jitState struct {
 	exitBlk uint32
 	_       uint32
 	raw     uint64    // host flags saved by translated code, not yet merged into c.Flags
+	pmask   uint32    // which of raw are pending: value | clear<<16 (0: none); Go merges on every exit
 	save    [8]uint64 // host registers kept across translated code (the backend's prologue)
 }
 
@@ -76,13 +79,67 @@ type jitBlock struct {
 	resume []uintptr // where translated code for instruction i starts (0: never resumed there)
 	head   uintptr   // entry with the step-limit check (chaining)
 	steps  uint64    // all its steps
+
+	// Diagnostics (C32_JITPROF=1): how often the block was entered at its head, and what its
+	// code does per run.
+	runs *uint64
+	cost JITCost
+}
+
+// JITCost counts what a translated block's code does in one run.
+type JITCost struct {
+	Insts, Bytes                    uint64
+	FlagSaves, FlagLoads, Merges    uint64 // PUSHFQ, POPFQ (flags into the host), merges into c.Flags
+	DynMerges, Loads, Stores, Exits uint64 // merges of another block's flags; checked accesses; possible slow exits
+}
+
+// jitProf turns on per-block run counts (C32_JITPROF=1).
+var jitProf = os.Getenv("C32_JITPROF") == "1"
+
+// JITProfile returns, weighted by how often each block ran, the total of what translated code
+// did (C32_JITPROF=1), and the most expensive blocks.
+func (c *CPU) JITProfile() (total JITCost, runs uint64, top []string) {
+	if c.jitc == nil {
+		return
+	}
+	type bc struct {
+		jb *jitBlock
+		w  uint64
+	}
+	var all []bc
+	for _, jb := range c.jitc.blocks {
+		if jb.runs == nil {
+			continue
+		}
+		n := *jb.runs
+		runs += n
+		k := jb.cost
+		total.Insts += n * k.Insts
+		total.Bytes += n * k.Bytes
+		total.FlagSaves += n * k.FlagSaves
+		total.FlagLoads += n * k.FlagLoads
+		total.Merges += n * k.Merges
+		total.DynMerges += n * k.DynMerges
+		total.Loads += n * k.Loads
+		total.Stores += n * k.Stores
+		total.Exits += n * k.Exits
+		all = append(all, bc{jb, n * k.Bytes})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].w > all[j].w })
+	for i := 0; i < len(all) && i < 10; i++ {
+		jb := all[i].jb
+		top = append(top, fmt.Sprintf("%#x: %d runs x %d insts, %+v", jb.eip, *jb.runs, len(jb.insts), jb.cost))
+	}
+	return
 }
 
 // jitCode is one CPU's translated code.
 type jitCode struct {
-	buf      []byte // executable
-	used     int
-	fixed    int // bytes of shared code at the start (prologue, epilogue), kept across resets
+	buf      []byte // executable: shared code, then hot code (blocks' bodies), then cold code (their exits)
+	used     int    // hot code ends here
+	cold     int    // cold code ends here
+	coldAt   int    // where cold code starts
+	fixed    int    // bytes of shared code at the start (prologue, epilogue), kept across resets
 	prologue uintptr
 	epilogue uintptr
 	blocks   []*jitBlock
@@ -132,7 +189,7 @@ func (c *CPU) jitReset() {
 	if len(j.blocks) > 0 {
 		j.Stats.Resets++
 	}
-	j.used = j.fixed
+	j.used, j.cold = j.fixed, j.coldAt
 	j.blocks = j.blocks[:0]
 	clear(j.byEIP)
 	clear(j.pending)
@@ -160,9 +217,11 @@ func (c *CPU) jitInit() bool {
 	for i := range j.table {
 		j.table[i] = jitTableEntry{eip: dNoTag}
 	}
-	j.stores = make([]byte, ArenaSize>>12)
+	j.stores = make([]byte, 1<<20) // every page of the 32-bit address space
 	j.used = jitShared(j)
 	j.fixed = j.used
+	j.coldAt = len(j.buf) / 8 * 5
+	j.cold = j.coldAt
 	c.jit.mem = uintptr(unsafe.Pointer(&c.Mem[0]))
 	c.jit.stores = uintptr(unsafe.Pointer(&j.stores[0]))
 	c.jit.table = uintptr(unsafe.Pointer(&j.table[0]))
@@ -170,13 +229,17 @@ func (c *CPU) jitInit() bool {
 }
 
 // jitStores rebuilds the per-page store table: a store may be done by translated code unless it
-// touches a page holding code in [CodeLo, CodeHi) (the interpreter then flushes the code cache).
-// A store starting on the page before a code page may reach into it, so that page is marked too
-// and only the first page of a store needs checking (stores are at most 16 bytes).
+// touches a page holding code in [CodeLo, CodeHi) (the interpreter then flushes the code cache)
+// or isn't inside guest memory. A store starting on the page before such a page may reach into
+// it, so that page is marked too and only the first page of a store needs checking (stores are
+// at most 16 bytes).
 func (c *CPU) jitStores() {
 	j := c.jitc
 	j.stale = false
 	clear(j.stores)
+	for p := uint32(ArenaSize>>12) - 1; p < uint32(len(j.stores)); p++ {
+		j.stores[p] = 1
+	}
 	if c.CodeHi <= c.CodeLo {
 		return
 	}
@@ -207,7 +270,7 @@ func (c *CPU) jitCompile(b *dBlock) *jitBlock {
 	if j.failed[b.tag] {
 		return nil
 	}
-	if len(j.buf)-j.used < 1<<16 {
+	if j.coldAt-j.used < 1<<16 || len(j.buf)-j.cold < 1<<16 {
 		c.jitReset() // full: start again
 	}
 	jb := &jitBlock{id: uint32(len(j.blocks)), eip: b.tag, insts: append([]dInst(nil), b.insts...), steps: uint64(b.steps)}
@@ -229,7 +292,7 @@ func (c *CPU) jitCompile(b *dBlock) *jitBlock {
 	j.blocks = append(j.blocks, jb)
 	j.byEIP[jb.eip] = jb
 	j.Stats.Translated++
-	e := &j.table[jb.eip&jitTableMask]
+	e := &j.table[jitHash(jb.eip)]
 	e.eip, e.code = jb.eip, jb.head
 	for _, site := range j.pending[jb.eip] {
 		jitPatch(j, site, jb.head)
@@ -268,6 +331,10 @@ func (c *CPU) jitRun(jb *jitBlock, stopEIP uint32, limit uint64) {
 		jitCall(j.prologue, c, entry)
 		j.Stats.Entries++
 		c.Steps = c.jit.limit - c.jit.budget
+		if m := c.jit.pmask; m != 0 { // flags translated code left pending
+			c.Flags = c.Flags&^(m>>16) | uint32(c.jit.raw)&m&0xFFFF
+			c.jit.pmask = 0
+		}
 		switch c.jit.exit {
 		case jitExitEnd:
 			j.Stats.EndExits++
@@ -327,6 +394,9 @@ func (c *CPU) jitNext(stopEIP uint32, limit *uint64) *jitBlock {
 		if b.tag != eip || b.jit == nil || b.jitGen != c.jitGen || uint64(b.steps) > *limit-c.Steps {
 			return nil
 		}
+		if e := &c.jitc.table[jitHash(eip)]; e.eip != eip { // another block took its place: take it back
+			e.eip, e.code = eip, b.jit.head
+		}
 		return b.jit
 	}
 }
@@ -336,4 +406,31 @@ func (c *CPU) Run0JITStats() {
 	if c.jitInit() {
 		c.jitc.Stats.EndAt = map[uint32]uint64{}
 	}
+}
+
+// jitHash is the lookup table's index for guest address eip (Fibonacci hashing; translated code
+// computes the same).
+func jitHash(eip uint32) uint32 { return eip * jitHashMul >> (32 - jitTableBits) }
+
+const jitHashMul = 0x9E3779B1
+
+// JITCode returns the host code translated for the block at eip and the guest instructions
+// it came from (diagnostics; nil if there is none).
+func (c *CPU) JITCode(eip uint32) ([]byte, []byte) {
+	if c.jitc == nil {
+		return nil, nil
+	}
+	jb := c.jitc.byEIP[eip]
+	if jb == nil {
+		return nil, nil
+	}
+	base := uintptr(unsafe.Pointer(&c.jitc.buf[0]))
+	end := len(c.jitc.buf)
+	for _, o := range c.jitc.blocks { // the next block starts where this one's code ends
+		if o.head > jb.head && int(o.head-base) < end {
+			end = int(o.head - base)
+		}
+	}
+	end = min(end, c.jitc.used)
+	return c.jitc.buf[jb.head-base : end], c.Mem[jb.eip:jb.starts[len(jb.insts)]]
 }

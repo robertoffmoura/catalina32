@@ -78,7 +78,7 @@ func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func (g *jtGen) inst() []byte {
 	r := g.r
 	op := uint8(r.Intn(8))
-	switch r.Intn(52) {
+	switch r.Intn(54) {
 	case 0: // op r/m32, r32
 		return cat([]byte{op<<3 | 1}, g.modrm(g.any(), g.dst(), true, op != 7))
 	case 1: // op r32, r/m32
@@ -237,6 +237,14 @@ func (g *jtGen) inst() []byte {
 		return cat([]byte{0x66, 0x0F, byte(0x2E + r.Intn(2))}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
 	case 45: // pshufd
 		return cat([]byte{0x66, 0x0F, 0x70}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false), []byte{byte(r.Intn(256))})
+	case 47: // lock cmpxchg8b m64 (as often equal as not: EDX:EAX is set from memory first)
+		m := g.modrm(1, 0, true, true)
+		if m[0]>>6 == 3 {
+			m = []byte{0x4D, byte(r.Intn(0x58))}
+		}
+		return cat([]byte{0xF0, 0x0F, 0xC7}, m)
+	case 48: // bswap
+		return []byte{0x0F, 0xC8 + g.dst()}
 	case 46: // movd xmm, r/m32 / movd r/m32, xmm
 		if r.Intn(2) == 0 {
 			return cat([]byte{0x66, 0x0F, 0x6E}, g.modrm(uint8(r.Intn(8)), g.any(), true, false))

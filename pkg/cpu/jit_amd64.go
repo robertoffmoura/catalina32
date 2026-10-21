@@ -14,10 +14,12 @@ import (
 // &Mem[0], r15 the CPU, r13 the store table; r8 holds effective addresses, r9-r11 are scratch.
 // Guest flags live in c.Flags. An instruction that sets flags runs natively; when its flags can
 // be observed (by an instruction reading them, at the block's end, or at a slow exit before
-// something overwrites them all) they are saved (PUSHFQ to jitState.raw) and merged into
-// c.Flags where needed, with the interpreter's rules for flags the hardware leaves undefined.
-// An instruction reading flags loads c.Flags into the host's, or, right after the instruction
-// that set them, uses the host's directly when they hold exactly what it reads.
+// something overwrites them all) they are saved (PUSHFQ to jitState.raw, with which of them in
+// jitState.pmask) and stay pending: merged into c.Flags (with the interpreter's rules for flags
+// the hardware leaves undefined) when an instruction reads flags or sets only some of them, by
+// Go whenever translated code returns, and simply replaced when a later instruction sets them
+// all. An instruction reading flags loads c.Flags into the host's, or, right after the
+// instruction that set them, uses the host's directly when they hold exactly what it reads.
 
 const jitSupported = true
 
@@ -43,6 +45,7 @@ var (
 	offEBlk   = offJit + int32(unsafe.Offsetof(jitState{}.exitBlk))
 	offSave   = offJit + int32(unsafe.Offsetof(jitState{}.save))
 	offRaw    = offJit + int32(unsafe.Offsetof(jitState{}.raw))
+	offPMask  = offJit + int32(unsafe.Offsetof(jitState{}.pmask))
 )
 
 const (
@@ -93,11 +96,11 @@ func jitPatch(j *jitCode, site, target uintptr) {
 }
 
 type jitGen struct {
-	a       x64
-	c       *CPU
-	j       *jitCode
-	jb      *jitBlock
-	base    uintptr // where a.b[0] will be
+	a  x64
+	c  *CPU
+	j  *jitCode
+	jb *jitBlock
+
 	epi     uintptr // this buffer's epilogue
 	slow    []int   // per instruction: label of its slow exit (-1: none yet)
 	start   uint32  // guest address of the instruction being translated
@@ -111,9 +114,10 @@ type jitGen struct {
 	hostFrom int          // the instruction whose flags the host's flags hold (-1: none)
 	native   bool         // the current instruction reads the host's flags directly
 
-	resume    []int  // where each instruction's code starts
-	limitExit int    // label
-	hostOK    []bool // per instruction: the host's flags hold its flags when it ends
+	absFix    []jitAbs // jumps to absolute addresses
+	resume    []int    // where each instruction's code starts
+	limitExit int      // label
+	hostOK    []bool   // per instruction: the host's flags hold its flags when it ends
 
 	entryPend []jitPending // per instruction: saved flags its code expects on entry
 	natives   []bool       // per instruction: reads the host's flags directly
@@ -122,6 +126,7 @@ type jitGen struct {
 // jitPending is a flag-setting instruction's flags, saved in jitState.raw.
 type jitPending struct {
 	on           bool
+	dyn          bool // set by an earlier block: what is pending is only known from jitState.pmask
 	value, clear uint32
 }
 
@@ -149,6 +154,8 @@ func jitFlagFx(d *dInst) jitFx {
 		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
 	case dImul32, dImulRRM32:
 		return jitFx{writes: true, value: FlagCF | FlagOF, clear: FlagCF | FlagOF}
+	case dCmpxchg8b:
+		return jitFx{writes: true, value: FlagZF, clear: FlagZF}
 	case dShift32:
 		cnt := uint8(d.imm) & 0x1F
 		if cnt == 0 {
@@ -199,18 +206,39 @@ func (g *jitGen) produce(value, clear uint32) {
 		g.pend.on = false
 		return
 	}
+	g.jb.cost.FlagSaves++
 	g.a.pushfq()
 	g.a.inst(0, 0, []byte{0x8F}, 0, xm(hR15, offRaw)) // pop qword [raw]
+	g.a.storeI32(xm(hR15, offPMask), value|clear<<16)
 	g.pend = jitPending{on: true, value: value, clear: clear}
 }
 
-// emitMerge merges saved flags p into c.Flags (uses r11, changes the host's flags).
+// emitMerge merges pending flags p into c.Flags (uses r9-r11, changes the host's flags).
 func (g *jitGen) emitMerge(p jitPending) {
 	if !p.on {
 		return
 	}
-	g.a.load32(hR11, xm(hR15, offRaw))
-	g.merge(p.value, p.clear)
+	a := &g.a
+	if !p.dyn {
+		g.jb.cost.Merges++
+		a.load32(hR11, xm(hR15, offRaw))
+		g.merge(p.value, p.clear)
+		a.storeI32(xm(hR15, offPMask), 0)
+		return
+	}
+	g.jb.cost.DynMerges++
+	skip := a.newLabel()
+	a.load32(hR10, xm(hR15, offPMask))
+	a.inst(0, 0, []byte{0x85}, hR10, xr(hR10)) // test r10d, r10d
+	a.jcc(0x4, skip)
+	a.load32(hR11, xm(hR15, offRaw))
+	a.alu32(4, xr(hR11), hR10) // and r11d, r10d: the value bits (the mask's low half)
+	a.shiftI32(5, xr(hR10), 16)
+	a.inst(0, 0, []byte{0xF7}, 2, xr(hR10)) // not r10d: ^clear
+	a.alu32(4, xm(hR15, offFlags), hR10)
+	a.alu32(1, xm(hR15, offFlags), hR11)
+	a.storeI32(xm(hR15, offPMask), 0)
+	a.bind(skip)
 }
 
 type jitChain struct {
@@ -220,11 +248,16 @@ type jitChain struct {
 
 func h(g uint8) int { return hostReg[g] }
 
-// jmpAbs jumps to an absolute address (in the code buffer).
+// jmpAbs jumps to an absolute address (in the code buffer); the rel32 is set at placement.
 func (g *jitGen) jmpAbs(to uintptr) {
 	g.a.emit(0xE9)
-	at := g.base + uintptr(len(g.a.b))
-	g.a.emit32(uint32(int32(to - (at + 4))))
+	g.absFix = append(g.absFix, jitAbs{len(g.a.b), to})
+	g.a.emit32(0)
+}
+
+type jitAbs struct {
+	at int // rel32
+	to uintptr
 }
 
 func (g *jitGen) slowLabel() int {
@@ -260,6 +293,7 @@ func (g *jitGen) eaOp(d *dInst) xop {
 // chkLoad sends a load at r8d to the interpreter unless it is in range (the interpreter's fast
 // path: addr < ArenaSize-8, or for 16 bytes addr+16 <= ArenaSize-8).
 func (g *jitGen) chkLoad(size int) {
+	g.jb.cost.Loads++
 	if size == 16 {
 		g.a.alu32I(7, xr(hR8), ArenaSize-24)
 		g.a.jcc(0x7, g.slowLabel()) // ja
@@ -270,10 +304,9 @@ func (g *jitGen) chkLoad(size int) {
 }
 
 // chkStore sends a store at register r to the interpreter if it is out of range or on (or just
-// before) a page holding code.
+// before) a page holding code: the store table marks those pages.
 func (g *jitGen) chkStore(r int) {
-	g.a.alu32I(7, xr(r), ArenaSize-16)
-	g.a.jcc(0x7, g.slowLabel()) // ja
+	g.jb.cost.Stores++
 	g.a.movRR32(hR11, r)
 	g.a.shiftI32(5, xr(hR11), 12)                          // shr r11d, 12
 	g.a.inst(0, 0, []byte{0x80}, 7, xmi(hR13, hR11, 0, 0)) // cmp byte [r13+r11], 0
@@ -290,6 +323,7 @@ func (g *jitGen) merge(value, clear uint32) {
 
 // loadFlags puts the guest's arithmetic flags into the host's.
 func (g *jitGen) loadFlags() {
+	g.jb.cost.FlagLoads++
 	g.a.load32(hR11, xm(hR15, offFlags))
 	g.a.alu32I(4, xr(hR11), flagsArith)
 	g.a.push(hR11)
@@ -343,7 +377,6 @@ func (g *jitGen) rm32(d *dInst) xop {
 
 // end leaves the block for target: chained to its translation when there is one.
 func (g *jitGen) end(target uint32) {
-	g.emitMerge(g.pend)
 	if t := g.j.byEIP[target]; t != nil {
 		g.jmpAbs(t.head)
 		return
@@ -356,11 +389,12 @@ func (g *jitGen) end(target uint32) {
 
 // endReg leaves the block for the guest address in register r: through the lookup table.
 func (g *jitGen) endReg(r int) {
-	g.emitMerge(g.pend)
 	g.a.store32(xm(hR15, offEIP), r)
-	g.a.movRR32(hR10, r)
-	g.a.alu32I(4, xr(hR10), jitTableMask)
-	g.a.shiftI32(4, xr(hR10), 4)
+	g.a.inst(0, 0, []byte{0x69}, hR10, xr(r)) // imul r10d, r, jitHashMul
+	g.a.emit32(jitHashMul)
+	g.a.shiftI32(5, xr(hR10), 32-jitTableBits)
+	g.a.inst(0, xW, []byte{0xC1}, 4, xr(hR10)) // shl r10, 4
+	g.a.emit(4)
 	g.a.inst(0, xW, []byte{0x03}, hR10, xm(hR15, offTable)) // add r10, [table]
 	g.a.alu32RM(7, r, xm(hR10, 0))                          // cmp r, [r10]
 	g.a.jcc(0x5, g.endStub)                                 // jne
@@ -381,6 +415,7 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	if dry.body() == 0 {
 		return false
 	}
+	jb.cost = JITCost{}
 	exits := make([]bool, n)
 	for i := range exits {
 		exits[i] = dry.slow[i] >= 0
@@ -388,6 +423,13 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	g := newJitGen(c, j, jb, jitCaptures(jb.insts, exits, dry.hostOK))
 	g.body()
 	a := &g.a
+	jb.cost.Insts = uint64(n)
+	for i := range exits {
+		if g.slow[i] >= 0 {
+			jb.cost.Exits++
+		}
+	}
+	split := len(a.b) // the body is hot; everything after it (exits) goes to the cold region
 
 	// exits
 	a.bind(g.limitExit)
@@ -404,7 +446,6 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	for i := range jb.insts {
 		if g.slow[i] >= 0 {
 			a.bind(g.slow[i])
-			g.emitMerge(g.slowPend[i])
 			a.movRI32NoFlags(hR11, uint32(i))
 			a.jmp(slowExit)
 		}
@@ -415,12 +456,12 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	resumeAt := make([]int, n) // label, or -1: enter at the instruction's code
 	for i := 1; i < n; i++ {
 		resumeAt[i] = -1
-		if g.slow[i-1] < 0 || (!g.entryPend[i].on && !g.natives[i]) {
+		if g.slow[i-1] < 0 || (!(g.entryPend[i].on && !g.entryPend[i].dyn) && !g.natives[i]) {
 			continue
 		}
 		resumeAt[i] = a.newLabel()
 		a.bind(resumeAt[i])
-		if g.entryPend[i].on {
+		if g.entryPend[i].on && !g.entryPend[i].dyn {
 			a.load32(hR11, xm(hR15, offFlags))
 			a.store64(xm(hR15, offRaw), hR11)
 		}
@@ -449,30 +490,48 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 			}
 		}
 	}
-	a.resolve()
-
-	if len(j.buf)-j.used < len(a.b) {
+	// Placement: offsets below split go to the hot region, the rest to the cold one.
+	hotLen, coldLen := split, len(a.b)-split
+	if j.coldAt-j.used < hotLen || len(j.buf)-j.cold < coldLen {
 		return false
 	}
-	copy(j.buf[j.used:], a.b)
-	jb.head = g.base
+	bufAt := uintptr(unsafe.Pointer(&j.buf[0]))
+	hot, cold := bufAt+uintptr(j.used), bufAt+uintptr(j.cold)
+	final := func(o int) uintptr {
+		if o < split {
+			return hot + uintptr(o)
+		}
+		return cold + uintptr(o-split)
+	}
+	for _, f := range a.fixups {
+		to := a.labels[f.label]
+		binary.LittleEndian.PutUint32(a.b[f.at:], uint32(int32(final(to)-(final(f.at)+4))))
+	}
+	for _, f := range g.absFix {
+		binary.LittleEndian.PutUint32(a.b[f.at:], uint32(int32(f.to-(final(f.at)+4))))
+	}
+	copy(j.buf[j.used:], a.b[:split])
+	copy(j.buf[j.cold:], a.b[split:])
+	jb.head = hot
 	jb.resume = make([]uintptr, n)
 	for i, r := range g.resume {
 		if i > 0 && resumeAt[i] >= 0 {
 			r = a.labels[resumeAt[i]]
 		}
-		jb.resume[i] = g.base + uintptr(r)
+		jb.resume[i] = final(r)
 	}
 	for _, s := range sites {
-		j.pending[s.target] = append(j.pending[s.target], g.base+uintptr(s.at))
+		j.pending[s.target] = append(j.pending[s.target], final(s.at))
 	}
-	j.used += (len(a.b) + 15) &^ 15
+	j.used += (hotLen + 15) &^ 15
+	j.cold += (coldLen + 15) &^ 15
 	j.Stats.Bytes += uint64(len(a.b))
+	jb.cost.Bytes = uint64(hotLen)
 	return true
 }
 
 func newJitGen(c *CPU, j *jitCode, jb *jitBlock, capture []bool) *jitGen {
-	g := &jitGen{c: c, j: j, jb: jb, base: uintptr(unsafe.Pointer(&j.buf[0])) + uintptr(j.used), epi: j.epilogue,
+	g := &jitGen{c: c, j: j, jb: jb, epi: j.epilogue,
 		capture: capture, hostFrom: -1}
 	n := len(jb.insts)
 	if g.capture == nil { // the dry run: save every flag result
@@ -534,8 +593,17 @@ func (g *jitGen) body() int {
 	jb := g.jb
 	a.alu64I(5, xm(hR15, offBudget), int32(jb.steps)) // sub [budget], steps
 	a.jcc(0x2, g.limitExit)                           // jb: it would pass the limit
+	if jitProf {
+		if jb.runs == nil {
+			jb.runs = new(uint64)
+		}
+		a.emit(0x49, 0xBB) // mov r11, imm64
+		a.emit64(uint64(uintptr(unsafe.Pointer(jb.runs))))
+		a.inst(0, xW, []byte{0xFF}, 0, xm(hR11, 0)) // inc qword [r11]
+	}
 	native := 0
 	g.start = jb.eip
+	g.pend = jitPending{on: true, dyn: true} // an earlier block may have left flags pending
 	for i := range jb.insts {
 		d := &jb.insts[i]
 		g.idx = i
@@ -543,7 +611,11 @@ func (g *jitGen) body() int {
 		f := jitFlagFx(d)
 		g.native = f.reads && f.native && g.hostFrom == i-1 && i > 0 && ccFlags(f.cc)&^g.hostValue(i-1) == 0
 		g.entryPend[i], g.natives[i] = g.pend, g.native
-		if g.pend.on && ((f.reads && !g.native) || (f.writes && (f.dynamic || f.clear&g.pend.clear != g.pend.clear))) {
+		pendClear := g.pend.clear
+		if g.pend.dyn {
+			pendClear = flagsArith // unknown: only an instruction setting them all replaces them
+		}
+		if g.pend.on && ((f.reads && !g.native) || (f.writes && (f.dynamic || f.clear&pendClear != pendClear))) {
 			g.emitMerge(g.pend)
 			g.pend.on = false
 		}
@@ -1255,6 +1327,17 @@ func (g *jitGen) inst2(d *dInst) bool {
 		a.store64(xmmOp(d.reg), hR9) // zero-extended
 		a.inst(0, xW, []byte{0xC7}, 0, xm(hR15, offXMM+16*int32(d.reg)+8))
 		a.emit32(0)
+	case dCmpxchg8b: // EDX:EAX, ECX:EBX are rdx:rax, rcx:rbx
+		g.ea(d)
+		g.chkStore(hR8)
+		a.inst(0xF0, 0, []byte{0x0F, 0xC7}, 1, memAt)
+		g.produce(FlagZF, FlagZF)
+	case dBswap:
+		if hr := h(d.reg); hr >= 8 {
+			a.emit(0x41, 0x0F, 0xC8+byte(hr&7))
+		} else {
+			a.emit(0x0F, 0xC8+byte(hr))
+		}
 	case dMovdFromX:
 		a.load32(hR9, xmmOp(d.reg))
 		if d.isMem {

@@ -1,6 +1,7 @@
 package source
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -99,6 +100,25 @@ func TestBoot(t *testing.T) {
 		}()
 	}
 	err = m.Run(steps)
+	if v := os.Getenv("C32_JITDUMP"); v != "" { // eip,eip...: write those blocks' host and guest code to the temporary folder
+		for _, a := range strings.Split(v, ",") {
+			eip, _ := strconv.ParseUint(a, 0, 32)
+			host, guest := m.C.JITCode(uint32(eip))
+			os.WriteFile(filepath.Join(os.TempDir(), fmt.Sprintf("jit_%x.host", eip)), host, 0o644)
+			os.WriteFile(filepath.Join(os.TempDir(), fmt.Sprintf("jit_%x.guest", eip)), guest, 0o644)
+			t.Logf("jit dump %#x: %d host bytes for %d guest bytes", eip, len(host), len(guest))
+		}
+	}
+	if os.Getenv("C32_JITPROF") == "1" {
+		total, runs, top := m.C.JITProfile()
+		t.Logf("jit profile: %d block runs; per run: %.1f insts, %.0f bytes, %.2f flag saves, %.2f flag loads, %.2f merges, %.2f dynamic merges, %.2f loads, %.2f stores",
+			runs, float64(total.Insts)/float64(runs), float64(total.Bytes)/float64(runs), float64(total.FlagSaves)/float64(runs),
+			float64(total.FlagLoads)/float64(runs), float64(total.Merges)/float64(runs), float64(total.DynMerges)/float64(runs),
+			float64(total.Loads)/float64(runs), float64(total.Stores)/float64(runs))
+		for _, l := range top {
+			t.Logf("  %s", l)
+		}
+	}
 	if os.Getenv("C32_JITSTATS") != "" {
 		st := m.C.JITStats()
 		t.Logf("jit: %d translated (%d KB), %d entries, %d slow, %d end, %d limit exits, %d resets",
