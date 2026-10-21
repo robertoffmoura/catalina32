@@ -78,7 +78,44 @@ func TestBoot(t *testing.T) {
 	if v := os.Getenv("C32_CMDS"); v != "" {
 		m.OnPoll = consoleAt(t, m, v)
 	}
+	if os.Getenv("C32_JITSTATS") != "" {
+		m.C.Run0JITStats()
+	}
+	if os.Getenv("C32_SLOWOPS") != "" {
+		m.C.SlowOps = map[uint32]uint64{}
+		defer func() {
+			type kv struct {
+				op uint32
+				n  uint64
+			}
+			var top []kv
+			for op, n := range m.C.SlowOps {
+				top = append(top, kv{op, n})
+			}
+			sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
+			for i := 0; i < len(top) && i < 40; i++ {
+				t.Logf("  slow op %06x: %d", top[i].op, top[i].n)
+			}
+		}()
+	}
 	err = m.Run(steps)
+	if os.Getenv("C32_JITSTATS") != "" {
+		st := m.C.JITStats()
+		t.Logf("jit: %d translated (%d KB), %d entries, %d slow, %d end, %d limit exits, %d resets",
+			st.Translated, st.Bytes>>10, st.Entries, st.SlowExits, st.EndExits, st.LimitExits, st.Resets)
+		type kv struct {
+			eip uint32
+			n   uint64
+		}
+		var top []kv
+		for e, n := range st.EndAt {
+			top = append(top, kv{e, n})
+		}
+		sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
+		for i := 0; i < len(top) && i < 15; i++ {
+			t.Logf("  end exit to %#x (%s): %d", top[i].eip, m.where(top[i].eip), top[i].n)
+		}
+	}
 	if m.C.TraceCalls {
 		for _, f := range m.C.CallStack {
 			t.Logf("call %s -> %s", m.where(f.CallerEIP), m.where(f.TargetEIP))

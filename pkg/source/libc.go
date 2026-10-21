@@ -89,9 +89,10 @@ func (m *Machine) hostPath(p string, write bool) string {
 	p = filepath.Clean(p)
 	ov := filepath.Join(m.Overlay, p)
 	if write {
+		clear(m.ovMissing) // the game may be about to create files there
 		os.MkdirAll(filepath.Dir(ov), 0o755)
 		if _, err := os.Stat(ov); err != nil {
-			if src := foldCase(p); src != "" { // copy-on-write: start from the game's file
+			if src := m.fold(p); src != "" { // copy-on-write: start from the game's file
 				if b, err := os.ReadFile(src); err == nil {
 					os.WriteFile(ov, b, 0o644)
 				}
@@ -99,13 +100,66 @@ func (m *Machine) hostPath(p string, write bool) string {
 		}
 		return ov
 	}
-	if _, err := os.Stat(ov); err == nil {
+	if m.ovExists(ov) {
 		return ov
 	}
-	if q := foldCase(p); q != "" {
+	if q := m.fold(p); q != "" {
 		return q
 	}
 	return p
+}
+
+// Source games look for many files that aren't there (every search path, every frame), and
+// each miss used to cost directory reads; these caches answer them. The game's folder doesn't
+// change while it runs; the overlay only gains files through hostPath's write mode, which
+// forgets what the overlay was known not to have.
+
+// fold is foldCase, with its results and the directory listings it reads cached.
+func (m *Machine) fold(p string) string {
+	if q, ok := m.folded[p]; ok {
+		return q
+	}
+	if m.folded == nil {
+		m.folded = map[string]string{}
+		m.dirNames = map[string]map[string]string{}
+	}
+	q := ""
+	if _, err := os.Lstat(p); err == nil {
+		q = p
+	} else if dir, base := filepath.Split(p); base != "" && filepath.Clean(dir) != p {
+		if real := m.fold(filepath.Clean(dir)); real != "" {
+			names, ok := m.dirNames[real]
+			if !ok {
+				names = map[string]string{}
+				if ents, err := os.ReadDir(real); err == nil {
+					for _, e := range ents {
+						names[strings.ToLower(e.Name())] = e.Name()
+					}
+				}
+				m.dirNames[real] = names
+			}
+			if n, ok := names[strings.ToLower(base)]; ok {
+				q = filepath.Join(real, n)
+			}
+		}
+	}
+	m.folded[p] = q
+	return q
+}
+
+// ovExists says whether the overlay has ov (misses are remembered until the game writes).
+func (m *Machine) ovExists(ov string) bool {
+	if m.ovMissing[ov] {
+		return false
+	}
+	if _, err := os.Stat(ov); err == nil {
+		return true
+	}
+	if m.ovMissing == nil {
+		m.ovMissing = map[string]bool{}
+	}
+	m.ovMissing[ov] = true
+	return false
 }
 
 // foldCase returns the existing path matching p ignoring case, or "".
@@ -1963,7 +2017,7 @@ func (m *Machine) listDir(p string) (names []string, types []byte, ok bool) {
 		p = filepath.Join(m.cwd, p)
 	}
 	p = filepath.Clean(p)
-	game := foldCase(p)
+	game := m.fold(p)
 	if game == "" {
 		game = p
 	}

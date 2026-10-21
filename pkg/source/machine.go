@@ -83,7 +83,10 @@ type Machine struct {
 	hostFonts          fontRegistry
 	OnPoll             func(c *cpu.CPU) // tests: called when the game polls for events (to feed it input)
 	cfStrings          map[uint32]string
-	cfData             map[uint32][]byte // CFData objects -> their bytes
+	cfData             map[uint32][]byte            // CFData objects -> their bytes
+	folded             map[string]string            // fold's cache (libc.go)
+	dirNames           map[string]map[string]string // fold's directory listings: lower-case name -> name
+	ovMissing          map[string]bool              // overlay paths known not to exist (libc.go)
 	sdl                sdlState
 	gl                 nullGL
 	fonts              fontState
