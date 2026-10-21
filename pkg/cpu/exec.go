@@ -2063,6 +2063,7 @@ func (c *CPU) nextEventStep() uint64 {
 // control transfer, which always ends a block; checking them at block starts is enough.
 func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 	span := c.CodeHi - c.CodeLo
+	jit := c.jitUsable()
 	for c.Steps < limit {
 		eip := c.EIP
 		if eip == stopEIP || c.Halted || eip-c.CodeLo >= span || c.icept[eip>>6]&(1<<(eip&63)) != 0 {
@@ -2074,6 +2075,21 @@ func (c *CPU) runCached(stopEIP uint32, limit uint64) {
 		}
 		if len(b.insts) == 0 || uint64(b.steps) > limit-c.Steps {
 			return // uncached instruction, or the block would cross the next event: single-step
+		}
+		if jit {
+			if b.jit != nil && b.jitGen != c.jitGen { // its translation was discarded: translate again
+				b.jit = c.jitCompile(b)
+				b.jitGen = c.jitGen
+			} else if b.jit == nil {
+				if b.hits++; b.hits == jitThreshold {
+					b.jit = c.jitCompile(b)
+					b.jitGen = c.jitGen
+				}
+			}
+			if b.jit != nil {
+				c.jitRun(b.jit, limit)
+				continue
+			}
 		}
 		c.execBlock(b.insts)
 	}

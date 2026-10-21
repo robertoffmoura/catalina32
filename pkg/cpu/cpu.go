@@ -143,6 +143,12 @@ type CPU struct {
 	// Debug: optional watchpoint over [watchLo, watchHi) (SetWatch).
 	watchLo, watchHi uint32
 	watchFn          func(c *CPU, addr uint32, size int, write bool)
+
+	// JIT (jit.go): hot blocks translated to host code. NoJIT keeps this CPU interpreted.
+	NoJIT  bool
+	jit    jitState
+	jitc   *jitCode
+	jitGen uint32 // bumped when translations are discarded (dBlock.jitGen must match)
 }
 
 // SetWatch calls fn for every guest load and store that touches [lo, hi). Accesses then all take
@@ -388,6 +394,9 @@ func (c *CPU) noteCodeWrite(addr, size uint32) {
 
 // MarkTextPages records that [lo, hi) holds code (see textPages).
 func (c *CPU) MarkTextPages(lo, hi uint32) {
+	if c.jitc != nil {
+		c.jitc.stale = true
+	}
 	if c.textPages == nil {
 		c.textPages = make([]uint64, ArenaSize>>12/64)
 	}

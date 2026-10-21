@@ -134,6 +134,10 @@ type dBlock struct {
 	tag   uint32
 	steps int // guest instructions in the block (a fused pair counts as two)
 	insts []dInst
+
+	hits   uint32    // runs, until it is translated (jit.go)
+	jit    *jitBlock // its translation, valid while jitGen == c.jitGen
+	jitGen uint32
 }
 
 // FlushCodeCache discards all decoded instructions and blocks (call after modifying guest code
@@ -146,6 +150,7 @@ func (c *CPU) FlushCodeCache() {
 		c.blocks[i].tag = dNoTag
 	}
 	c.CodeCacheFlushes++
+	c.jitReset()
 }
 
 func endsBlock(kind uint8) bool {
@@ -181,6 +186,7 @@ func (c *CPU) buildBlock(b *dBlock, eip uint32) {
 	b.tag = eip
 	b.steps = 0
 	b.insts = b.insts[:0]
+	b.hits, b.jit = 0, nil
 	defer func() { b.steps += len(b.insts) }()
 	span := c.CodeHi - c.CodeLo
 	for len(b.insts) < blockMax && eip-c.CodeLo < span && c.icept[eip>>6]&(1<<(eip&63)) == 0 {
@@ -210,6 +216,9 @@ func (c *CPU) buildBlock(b *dBlock, eip uint32) {
 // SetCodeRange enables the decoded-instruction cache for guest code in [lo, hi).
 func (c *CPU) SetCodeRange(lo, hi uint32) {
 	c.CodeLo, c.CodeHi = lo, hi
+	if c.jitc != nil {
+		c.jitc.stale = true
+	}
 	if c.watchFn == nil {
 		c.writeSpan = ArenaSize - 7 - hi
 	}
