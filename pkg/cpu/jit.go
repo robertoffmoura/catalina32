@@ -43,8 +43,9 @@ const (
 	jitExitLimit        // the next block would cross the step limit: EIP is its start
 )
 
-// jitDisabled switches translation off (C32_NO_JIT=1): for A/B comparisons, and a way out.
-var jitDisabled = os.Getenv("C32_NO_JIT") == "1"
+// jitDisabled switches translation off (C32_NO_JIT=1): for A/B comparisons, and a way out. Where
+// the JIT is opt-in (jitOptIn: hosts it hasn't been verified on), C32_JIT=1 switches it on.
+var jitDisabled = os.Getenv("C32_NO_JIT") == "1" || jitOptIn && os.Getenv("C32_JIT") != "1"
 
 // jitState is what translated code reads and writes besides the CPU's registers.
 type jitState struct {
@@ -57,10 +58,30 @@ type jitState struct {
 	exitIdx uint32
 	exitBlk uint32
 	_       uint32
-	raw     uint64    // host flags saved by translated code, not yet merged into c.Flags
-	pmask   uint32    // which of raw are pending: value | clear<<16 (0: none); Go merges on every exit
-	save    [8]uint64 // host registers kept across translated code (the backend's prologue)
+	raw     uint64     // host flags saved by translated code, not yet merged into c.Flags (x86-64 backend)
+	pmask   uint32     // which of raw are pending: value | clear<<16 (0: none); Go merges on every exit
+	save    [10]uint64 // host registers kept across translated code (the backend's prologue)
 }
+
+// Offsets in the CPU of what translated code uses.
+var (
+	offRegs   = int32(unsafe.Offsetof(CPU{}.Regs))
+	offEIP    = int32(unsafe.Offsetof(CPU{}.EIP))
+	offFlags  = int32(unsafe.Offsetof(CPU{}.Flags))
+	offSteps  = int32(unsafe.Offsetof(CPU{}.Steps))
+	offXMM    = int32(unsafe.Offsetof(CPU{}.XMM))
+	offJit    = int32(unsafe.Offsetof(CPU{}.jit))
+	offMem    = offJit + int32(unsafe.Offsetof(jitState{}.mem))
+	offStore  = offJit + int32(unsafe.Offsetof(jitState{}.stores))
+	offTable  = offJit + int32(unsafe.Offsetof(jitState{}.table))
+	offBudget = offJit + int32(unsafe.Offsetof(jitState{}.budget))
+	offExit   = offJit + int32(unsafe.Offsetof(jitState{}.exit))
+	offEIdx   = offJit + int32(unsafe.Offsetof(jitState{}.exitIdx))
+	offEBlk   = offJit + int32(unsafe.Offsetof(jitState{}.exitBlk))
+	offSave   = offJit + int32(unsafe.Offsetof(jitState{}.save))
+	offRaw    = offJit + int32(unsafe.Offsetof(jitState{}.raw))
+	offPMask  = offJit + int32(unsafe.Offsetof(jitState{}.pmask))
+)
 
 // jitTableEntry maps a guest address to translated code (for indirect branches and returns).
 type jitTableEntry struct {

@@ -29,30 +29,6 @@ var hostReg = [8]int{hRAX, hRCX, hRDX, hRBX, hR12, hRBP, hRSI, hRDI}
 // registers and jumps to target (jit_amd64.s).
 func jitCall(prologue uintptr, c *CPU, target uintptr)
 
-var (
-	offRegs   = int32(unsafe.Offsetof(CPU{}.Regs))
-	offEIP    = int32(unsafe.Offsetof(CPU{}.EIP))
-	offFlags  = int32(unsafe.Offsetof(CPU{}.Flags))
-	offSteps  = int32(unsafe.Offsetof(CPU{}.Steps))
-	offXMM    = int32(unsafe.Offsetof(CPU{}.XMM))
-	offJit    = int32(unsafe.Offsetof(CPU{}.jit))
-	offMem    = offJit + int32(unsafe.Offsetof(jitState{}.mem))
-	offStore  = offJit + int32(unsafe.Offsetof(jitState{}.stores))
-	offTable  = offJit + int32(unsafe.Offsetof(jitState{}.table))
-	offBudget = offJit + int32(unsafe.Offsetof(jitState{}.budget))
-	offExit   = offJit + int32(unsafe.Offsetof(jitState{}.exit))
-	offEIdx   = offJit + int32(unsafe.Offsetof(jitState{}.exitIdx))
-	offEBlk   = offJit + int32(unsafe.Offsetof(jitState{}.exitBlk))
-	offSave   = offJit + int32(unsafe.Offsetof(jitState{}.save))
-	offRaw    = offJit + int32(unsafe.Offsetof(jitState{}.raw))
-	offPMask  = offJit + int32(unsafe.Offsetof(jitState{}.pmask))
-)
-
-const (
-	flagsArith = FlagCF | FlagPF | FlagAF | FlagZF | FlagSF | FlagOF
-	flagsLogic = flagsArith &^ FlagAF // logic ops: AF is 0 in the interpreter, undefined in hardware
-)
-
 func cpuReg(r int) xop  { return xm(hR15, offRegs+4*int32(r)) }
 func xmmOp(r uint8) xop { return xm(hR15, offXMM+16*int32(r)) }
 
@@ -128,74 +104,6 @@ type jitPending struct {
 	on           bool
 	dyn          bool // set by an earlier block: what is pending is only known from jitState.pmask
 	value, clear uint32
-}
-
-// jitFx is how an instruction uses the guest flags.
-type jitFx struct {
-	writes       bool   // sets flags (value from the host's, the rest of clear zeroed)
-	value, clear uint32 //
-	dynamic      bool   // whether it sets them depends on run-time values (shift by CL): it merges them itself
-	reads        bool   // reads flags
-	native       bool   // can read them from the host's flags right after the instruction that set them
-	cc           uint8  // the condition it reads (native readers)
-}
-
-func jitFlagFx(d *dInst) jitFx {
-	switch d.kind {
-	case dAluRMR32, dAluRMR32R, dAluRRM32, dAluRRM32R, dAluEAXImm, dGrp1RM32, dGrp1RM32R, dGrp1RM8,
-		dAlu8RMR, dAlu8RRM, dAluALImm, dAlu16RMR, dAlu16RRM, dGrp1RM16:
-		v, c := aluFlags(d.aux)
-		return jitFx{writes: true, value: v, clear: c, reads: d.aux == 2 || d.aux == 3}
-	case dTestRMR32, dTestRMI8, dTestRMR8, dTestALImm, dTest16:
-		return jitFx{writes: true, value: flagsLogic, clear: flagsArith}
-	case dIncR, dDecR, dIncRM32, dDecRM32:
-		return jitFx{writes: true, value: flagsArith &^ FlagCF, clear: flagsArith &^ FlagCF}
-	case dNeg32, dNeg8, dUcomiss, dUcomisd:
-		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
-	case dImul32, dImulRRM32:
-		return jitFx{writes: true, value: FlagCF | FlagOF, clear: FlagCF | FlagOF}
-	case dCmpxchg8b:
-		return jitFx{writes: true, value: FlagZF, clear: FlagZF}
-	case dShift32:
-		cnt := uint8(d.imm) & 0x1F
-		if cnt == 0 {
-			return jitFx{}
-		}
-		v, c := shiftFlags(d.aux, cnt)
-		return jitFx{writes: true, value: v, clear: c, reads: d.aux == 2 || d.aux == 3}
-	case dShift32CL:
-		return jitFx{writes: true, dynamic: true, reads: d.aux == 2 || d.aux == 3}
-	case dJcc:
-		return jitFx{reads: true, native: true, cc: d.aux}
-	case dCmov, dSetcc:
-		return jitFx{reads: true, native: !d.isMem, cc: d.aux}
-	case dCmpRMRJcc, dCmpRRMJcc, dCmpRMIJcc, dCmpEAXJcc, dCmpRMI8Jcc:
-		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
-	case dTestRMRJcc, dTestRMIJcc:
-		return jitFx{writes: true, value: flagsLogic, clear: flagsArith}
-	}
-	return jitFx{}
-}
-
-// shiftFlags is what a shift or rotate by cnt (1..31) sets: rotates only CF (and OF for a
-// count of 1, rol); shifts CF, PF, ZF, SF and OF for a count of 1, zeroing AF and otherwise OF.
-func shiftFlags(op uint8, cnt uint8) (uint32, uint32) {
-	of := uint32(0)
-	if cnt == 1 {
-		of = FlagOF
-	}
-	switch op {
-	case 0:
-		return FlagCF | of, FlagCF | of
-	case 1, 2, 3:
-		return FlagCF, FlagCF
-	}
-	return FlagCF | FlagPF | FlagZF | FlagSF | of, flagsArith
-}
-
-// ccFlags is the flags condition cc tests.
-func ccFlags(cc uint8) uint32 {
-	return [8]uint32{FlagOF, FlagCF, FlagZF, FlagCF | FlagZF, FlagSF, FlagPF, FlagSF | FlagOF, FlagZF | FlagSF | FlagOF}[cc>>1&7]
 }
 
 // produce is called right after an instruction set the host's flags: they are saved when they
@@ -330,13 +238,6 @@ func (g *jitGen) loadFlags() {
 	g.a.popfq()
 }
 
-func aluFlags(op uint8) (uint32, uint32) {
-	if op == 1 || op == 4 || op == 6 { // or, and, xor
-		return flagsLogic, flagsArith
-	}
-	return flagsArith, flagsArith
-}
-
 // get8 puts guest 8-bit register r (AL..BH) zero-extended into host register dst (r9..r11).
 func (g *jitGen) get8(r uint8, dst int) {
 	if r < 4 {
@@ -420,7 +321,9 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 	for i := range exits {
 		exits[i] = dry.slow[i] >= 0
 	}
-	g := newJitGen(c, j, jb, jitCaptures(jb.insts, exits, dry.hostOK))
+	g := newJitGen(c, j, jb, jitCaptures(jb.insts, exits, func(i, k int) bool {
+		return dry.hostOK[i] && ccFlags(jitFlagFx(&jb.insts[k]).cc)&^jitFlagFx(&jb.insts[i]).value == 0
+	}))
 	g.body()
 	a := &g.a
 	jb.cost.Insts = uint64(n)
@@ -552,38 +455,6 @@ func newJitGen(c *CPU, j *jitCode, jb *jitBlock, capture []bool) *jitGen {
 	g.endStub = g.a.newLabel()
 	g.limitExit = g.a.newLabel()
 	return g
-}
-
-// jitCaptures decides, for each instruction setting flags, whether they must be saved: yes if
-// anything may observe them before an instruction overwrites them all (an instruction reading
-// flags other than straight from the host's, a slow exit, the block's end).
-func jitCaptures(insts []dInst, exits, hostOK []bool) []bool {
-	n := len(insts)
-	capture := make([]bool, n)
-	for i := range insts {
-		f := jitFlagFx(&insts[i])
-		if !f.writes || f.dynamic {
-			continue
-		}
-		for k := i + 1; ; k++ {
-			if k == n || exits[k] {
-				capture[i] = true
-				break
-			}
-			fk := jitFlagFx(&insts[k])
-			if fk.reads && !(fk.native && k == i+1 && hostOK[i] && ccFlags(fk.cc)&^f.value == 0) {
-				capture[i] = true
-				break
-			}
-			if fk.writes {
-				if fk.dynamic || fk.clear&f.clear != f.clear {
-					capture[i] = true // merged before it (it doesn't overwrite them all)
-				}
-				break
-			}
-		}
-	}
-	return capture
 }
 
 // body translates the block's instructions (the head with the step-limit check first); it

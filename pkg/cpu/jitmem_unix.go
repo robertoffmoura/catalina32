@@ -1,4 +1,4 @@
-//go:build unix
+//go:build unix && !(darwin && arm64)
 
 package cpu
 
@@ -8,3 +8,5 @@ import "syscall"
 func mapExecutable(size int) ([]byte, error) {
 	return syscall.Mmap(-1, 0, size, syscall.PROT_READ|syscall.PROT_WRITE|syscall.PROT_EXEC, syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
 }
+
+const jitOptIn = false

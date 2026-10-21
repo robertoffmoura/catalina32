@@ -377,15 +377,26 @@ func jtRun(t *testing.T, prog []byte, seed int64, jit bool, maxSteps uint64) jtS
 	for i := range c.XMM {
 		for k := 0; k < 4; k++ {
 			v := math.Float32bits(float32(r.NormFloat64() * 100))
-			switch r.Intn(10) {
+			switch r.Intn(12) {
 			case 0:
 				v = 0x7FC00000 // NaN
 			case 1:
 				v = 0
 			case 2:
 				v = r.Uint32()
+			case 3: // quiet NaN with a payload
+				v = 0x7FC00000 | r.Uint32()&0x803FFFFF
+			case 4: // signaling NaN
+				v = 0x7F800001 | r.Uint32()&0x803FFFFF
 			}
 			binary.LittleEndian.PutUint32(c.XMM[i][4*k:], v)
+		}
+		if r.Intn(4) == 0 { // a double NaN, quiet or signaling
+			v := uint64(0x7FF0000000000001) | r.Uint64()&0x800FFFFFFFFFFFFF
+			if r.Intn(2) == 0 {
+				v |= 1 << 51
+			}
+			binary.LittleEndian.PutUint64(c.XMM[i][8*r.Intn(2):], v)
 		}
 	}
 	for i := uint32(0); i < 0x2000; i++ {
@@ -441,8 +452,8 @@ func (s jtState) diff(o jtState) string {
 }
 
 func TestJITMatchesInterpreter(t *testing.T) {
-	if !jitSupported {
-		t.Skip("no JIT on this architecture")
+	if !jitSupported || jitDisabled {
+		t.Skip("no JIT on this host (or C32_NO_JIT=1; where it is opt-in, C32_JIT=1 enables it)")
 	}
 	defer func(v uint32) { jitThreshold = v }(jitThreshold)
 	jitThreshold = 2
