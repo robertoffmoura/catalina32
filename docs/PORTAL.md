@@ -63,11 +63,28 @@ also runs the game tests (minutes each):
 | `TestMenuSound` | the menu's MP3 music decodes through Miles' plug-in |
 | `TestNewGameDialog` | the dialog lists the chapters, draws their pictures, and Start begins chapter 1 |
 | `TestRendererClipMode` | the launcher sees an AMD GPU and turns off native clip-vertex mode |
+| `TestSndDSPAgainstEngine` | the sound effects in Go against `engine.dylib`'s own code, on random delay lines, reverbs, diffusors and filters |
 
 To **see** frames on Linux, `tools/glreplay` replays the stream through the window's own
 decoding code into Mesa and saves PNGs; it can imitate AMD's Mac drivers
 (`GLREPLAY_CLIP=position`). `C32_CMDS` types console commands in at chosen points (open a
 portal, move the camera). Recipes: `docs/DEBUGGING.md`.
+
+**Measuring large areas.** Speed problems show where the player looks into a large room full of
+objects, so measure there: load a map, cheat, teleport, then compare builds with
+`C32_FRAMESTATS` over alternating runs. The views used so far (`escape_02`, loaded by about 12
+billion instructions):
+
+```
+C32_ARGS="+map escape_02" C32_STEPS=14100000000 C32_CMDS="12000000000:sv_cheats 1;noclip;god;\
+hud_draw_fixed_reticle 0;setpos 10000 1663 420;setang 5 -159 0|\
+12700000000:setpos -1832 -3108 -7364;setang 5 10 0|13400000000:setpos 7274 970 465;setang 5 -10 0"
+```
+
+GLaDOS's chamber, the storage room with the hanging spheres, and the foggy hall. Pick views from
+screenshots (`glreplay`): positions taken from the map's entities often face a wall, or lie
+outside the level. `testchmb_a_14` at `setpos 1504 384 1209; setang 5 60 0` faces a chamber
+with turrets and platforms (`god`: the turrets shoot).
 
 ## What the game is
 
@@ -141,11 +158,20 @@ Each of these cost a bug; most are generic to Source on Mac.
   those the game wrote, or the New Game dialog finds no chapters once `cfg/config.cfg` is saved.
 - **The menu's loading picture is random** once every chapter is unlocked (the shipped
   `config.cfg` says `sv_unlockedchapters "15"`): 2 of 13 draws show the cake.
+- **Large rooms are slow partly because of their reverb.** The engine picks a room's sound
+  preset by its size, and a large room's reverb runs every mixed sample through up to 12
+  delay lines, one `DLY_GetNext` call per sample per line: about a fifth of all the
+  instructions in GLaDOS's chamber. `pkg/source/snddsp.go` runs those functions in Go, bound
+  by symbol and only when their code bytes are the ones it follows; `C32_DSPCHECK=1` compares
+  every call with the game's code.
 
 ## Next
 
-1. **Speed:** play with the JIT on the Mac. What is left is mostly calls to host functions
-   (about 14 million a second in gameplay), each a return to Go (`docs/JIT.md`, Ideas).
+1. **Speed:** play on the Mac. Large areas went 1.3–1.6× faster headless in October 2026
+   (`docs/JIT.md`, Results); what is left: translated code (about 60% of a frame), host calls
+   (about 59,000 a frame, each a return to Go), the forms the cache doesn't decode
+   (`docs/JIT.md`, Ideas), and the engine's collision traces, a third of the translated code
+   in GLaDOS's chamber.
 2. **A game app for Portal:** teach `pkg/gamelib` (scan, identify, wrap) that a game can be a
    folder, identified by `steam_appid.txt`, `gameinfo.txt` and its engine's checksum
    (`hl2_osx` is the same launcher in every Source game).

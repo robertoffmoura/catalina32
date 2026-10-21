@@ -53,12 +53,37 @@ percentile frame 122 → 93 ms over three alternating runs.
 - The full decoder had run Miles's MP3 decoder (`mssmp3.asi`), which Miles loads into heap
   memory itself: outside the code range, so neither cached nor translated. Self-checking
   blocks (below) now cover it.
-- **What is left:** about 0.1 M instructions a frame the cache doesn't decode (MMX in the MP3
-  decoder, packed-double SSE, x87 compares), and Go round trips for host calls (about 45,000 a
-  frame). Those round trips (`jitRun`, `jitNext`, excluding the host functions' own work) are
+- **What was left then:** about 0.1 M instructions a frame the cache didn't decode (MMX in the
+  MP3 decoder, packed-double SSE, x87 compares), and Go round trips for host calls (about
+  45,000 a frame). Those round trips (`jitRun`, `jitNext`, excluding the host functions' own work) are
   under 10% of the profile; translated code itself is about half.
 - **What a larger view adds:** more translated game code, and more host calls and returns to
   Go.
+
+**Large areas** (October 2026). Three views in `escape_02` that face big rooms full of
+objects (GLaDOS's chamber; the storage room with the hanging spheres; the foggy hall: see
+`docs/PORTAL.md`), alternating runs in one session, milliseconds per frame:
+
+| View | Before (`e2fc8ad`) | After | Median speedup | Instructions per frame |
+|---|---|---|---|---|
+| GLaDOS's chamber | 123 (p10 93) | 75 (p10 67) | 1.64× | 35.2 M → 29.0 M |
+| Storage room | 83 (p10 69) | 56 (p10 49) | 1.48× | 25.2 M → 16.3 M |
+| Hall | 62 (p10 53) | 49 (p10 43) | 1.27× | 16.2 M → 13.9 M |
+
+- Fewer instructions: Source's reverb in Go (`pkg/source/snddsp.go`, not the JIT).
+- Faster translated code: memory windows, flag liveness across blocks, the SSE2 forms, `push`
+  and `call $+5` in blocks, translations kept when a block loses its cache slot.
+- Headless runs take time from the instruction count (50 per microsecond), so every frame
+  is a full 0.1 s of game time. On a player's Mac the clock is real: a slower frame
+  simulates more game ticks, which makes it slower still, so a gain here is a larger gain
+  there.
+- **Where a frame goes now** (GLaDOS and storage views): translated code 57–66% of the time
+  (`in_jit_pct`); per frame about 59,000 host calls (a third of them trivial:
+  `pthread_getspecific`/`setspecific`/`self`, `fminf`, `fmaxf`), 18,000 instructions the
+  cache doesn't decode (8-bit shifts, 16-bit `inc`/`dec`, `shrd`, `lock dec`, `cvtss2si`, x87
+  80-bit loads and stores, a few SSE forms), and a few thousand other returns to Go.
+- Measured and not worth it on its own: XMM registers in host registers (within noise; kept),
+  code size (doubling it costs 10–15%).
 
 **arm64:** QEMU emulates the host, so speed there says little about real hardware. The
 arm64 backend's numbers are in "Testing".
@@ -74,6 +99,9 @@ Generic part: `pkg/cpu/jit.go` and `jit_flags.go`. The two backends: `jit_amd64.
   `jitThreshold` (32) it translates the block, the same block `buildBlock` made: same
   boundaries, same step count. A block whose first instruction can't be translated is
   remembered (`failed`) and stays interpreted.
+- **Cache slots.** Blocks live in a direct-mapped table (`c.blocks`, by address), so a hot block
+  can lose its slot to another. Its translation stays (`byEIP`): `jitNext` and `jitAdopt`
+  give it back instead of interpreting the block 32 times and translating it again.
 - **Code outside the code range** (code the game loaded or made in its own memory, like Miles's
   plug-ins) runs in **self-checking blocks**: stores there don't flush anything (they stay on
   the fast path), so such a block keeps its instruction bytes (`dBlock.code`) and compares
@@ -103,7 +131,8 @@ Generic part: `pkg/cpu/jit.go` and `jit_flags.go`. The two backends: `jit_amd64.
   - `Limit`: the next block wouldn't fit before the limit.
 - **Invalidation.**
   - `FlushCodeCache` (self-modifying code, patches, intercepts registered later) discards all
-    translated code (`jitReset`).
+    translated code (`jitReset`). It clears only the cache entries filled since the last
+    flush (`c.filled`), unless there were many: code rewriting itself in a loop flushes often.
   - A full code buffer does the same: 256 MB reserved on x86-64; 112 MB on arm64, where a B
     instruction reaches ±128 MB.
   - `SetCodeRange` and `MarkTextPages` mark the store table stale.
@@ -121,6 +150,15 @@ Translated code must be indistinguishable from the interpreter.
   
   Anything else is a slow exit *before* the instruction changes anything. Generated code never
   faults.
+
+  On x86-64, accesses through a register and a displacement are checked a **window** at a time
+  (`jitWindows`): one check before the first access covers the range of addresses the window's
+  accesses reach (ESP's pushes, pops and `add`/`sub esp, imm` are tracked; any other write to
+  the register ends the window), including the store table for its first and last page when
+  it stores; the accesses then address `[r14 + reg + d]` directly. Stores are windowed only
+  through ESP and EBP: a block storing beside code through another register would fail its
+  check every time. If the check fails, the interpreter runs the rest of the block
+  (`jitRestOfBlock`). A window is used only when it saves more than it costs.
 - **Flags.** `c.Flags` gets exactly what the interpreter computes, including bits the
   hardware leaves undefined:
   - logic ops zero AF;
@@ -131,9 +169,17 @@ Translated code must be indistinguishable from the interpreter.
   - SSE `UCOMISS` clears OF, SF and AF.
   
   **Flag liveness** (`jitCaptures`, shared by both backends): a flag result is kept only if
-  something may observe it before an instruction overwrites all of it. Observers are an
-  instruction reading flags other than straight from the host's, a slow exit, and the block's
-  end.
+  something may read it before instructions overwrite all of it:
+  - an instruction reading flags other than straight from the host's;
+  - after the block's end, the code its branches lead to: `jitLiveOut` decodes up to 16
+    instructions at each known successor (a branch or call target in the code range) and
+    keeps the flags they may read before setting them. Returns, indirect jumps, host functions
+    and anything not decoded keep them all.
+  
+  An instruction that may leave for the interpreter needs them only if it reads them. The one
+  observable difference: when the guest crashes (a halt), the flags it reports may be earlier
+  ones. No game here handles faults (`sigaction` is a stub), and the random-program test
+  compares flags except after a halt.
 - **Floating point.** Translated SSE matches the interpreter's Go code on the same host, NaN
   payloads included:
   - ADD and MUL with two NaN operands return the first one, quieted (`sseAdd`, `sseMul`);
@@ -144,20 +190,31 @@ Translated code must be indistinguishable from the interpreter.
   (`fld`, `fst`/`fstp`, `fxch`, `fchs`, `fabs`, arithmetic with registers or m32/m64). The
   interpreter's x87 is `float64` arithmetic on `FPUSt` from `FPUTop`; translated code loads the
   top per instruction and does the same arithmetic in doubles. Untranslated forms are slow exits.
+  - `sseForms` (`dcache.go`): SSE and SSE2 forms that only read and write XMM registers and
+    memory (packed doubles, integer SIMD, moves, unpacks, shuffles, conversions). The
+    interpreter runs them with its full decoder; x86-64 translated code runs the same host
+    instruction. Adding one is a line in the table plus a generator case.
+  - `push imm`, and the PIC idiom `call $+5; pop reg` (a push of the next address that
+    doesn't end the block).
 
 ### x86-64 backend
 
 - **Registers.**
   - Guest registers EAX..EDI live in rax, rcx, rdx, rbx, r12, rbp, rsi, rdi, so most
-    instructions keep their encoding, including AH..BH.
-  - r15 holds the CPU, r14 guest memory, r13 the store table.
+    instructions keep their encoding, including AH..BH. Their upper halves are always zero
+    (memory windows rely on it).
+  - r15 holds the CPU, r14 guest memory, r13 the step budget.
   - r8 holds effective addresses; r9–r11 are scratch.
+  - Within a block, guest XMM registers live in xmm8–15 from their first use (`xget`). They go
+    back to `c.XMM` at the block's ends and in each slow exit's stub, and are loaded again
+    where code resumes after the interpreter. xmm0 and xmm1 are scratch; the epilogue zeroes
+    xmm15, Go's zero register.
 - **Flags** come from the host instruction itself:
   - When they must be kept: `PUSHFQ` into `jitState.raw`, with which bits in `pmask`.
   - They stay **pending** across blocks. They are merged into `c.Flags` only when something
     reads them or sets just some of them, and by Go on every exit.
   - A JCC, CMOV or SETCC right after the instruction that set the flags reads the host's
-    flags directly.
+    flags directly; so does a fused compare+branch (saving flags doesn't change the host's).
 - **Code placement.** Block bodies go in a hot region; exit stubs go in a cold one.
 
 ### arm64 backend
@@ -198,7 +255,16 @@ Translated code must be indistinguishable from the interpreter.
   XMM, memory, EIP, steps and halts. Set `C32_JITN` for more programs.
   - The programs cover every form, with forward Jccs, calls to a guest subroutine, to a host
     function, through memory, and to `ret 4`, in a 6-iteration loop.
-  - On odd seeds, stores to the data area are forced through the interpreter.
+  - On odd seeds, stores to the data area are forced through the interpreter. On some seeds EBP
+    points at the program, so `[ebp+d]` stores rewrite it.
+  - Memory operands include `[ebp+d8]`, `[esp+d8]`, `[esi+d8]`, `[ebx+d8]` and
+    `[esi+ebx*4+d8]`; EBX may become anything, so out-of-range accesses happen.
+  - Flags are compared except after a halt (see Exactness).
+  - Programs outside the code range are also compared with the full decoder. One that jumps
+    into data and stores next to the code it runs may differ there (a block that rewrites
+    itself keeps its old instructions): logged, not failed.
+  - **`TestJITWindowStoresToCode`**: a translated block whose stores through a memory window
+    rewrite code that runs next.
   - XMM registers start with quiet and signaling NaNs, single and double.
   - **`TestJITBisect`** (`C32_JITSEED=n`) finds the first step where seed n differs.
 - **`TestA64Encodings`** checks the arm64 encoder against `golang.org/x/arch`'s disassembler.
@@ -240,18 +306,26 @@ Translated code must be indistinguishable from the interpreter.
 | `C32_NO_JIT=1` | no JIT (A/B comparisons; a way out for players) |
 | `C32_JIT=1` | the JIT where it is opt-in (Apple Silicon) |
 | `C32_JITPROF=1` | per-block run counts and code costs; `TestBoot` prints the totals (flag saves, loads, stores, bytes per block run) and the costliest blocks |
-| `C32_JITSTATS=1` | `TestBoot`: translations, entries, exits by kind, and where translated code most often returns to Go |
+| `C32_JITSTATS=<instruction>` | `TestBoot`: translations, entries, exits by kind; from that instruction on, where translated code returns to Go and what runs there, the instructions it hands to the interpreter, and the blocks translated |
 | `C32_JITDUMP=eip,...` | `TestBoot`: write those blocks' host and guest code to the temporary folder (disassemble with `objdump -D -b binary -mi386:x86-64`) |
-| `C32_SLOWOPS=1` | `TestBoot`: the most frequent instructions the interpreter's full decoder runs (forms not cached, so not translated) |
+| `C32_SLOWOPS=1` | `TestBoot`: the most frequent instructions the interpreter's full decoder runs (forms not cached, so not translated); with `C32_JITSTATS`, from the same instruction on |
+| `C32_FRAMESTATS`, `C32_INJIT=1` | `TestBoot`: per frame, among others, blocks translated and the share of the time translated code ran (sampled: the CPU profiler loses most samples taken in translated code, which it shows as `_ExternalCode`) |
 | `C32_JITN`, `C32_JITSEED` | `TestJITMatchesInterpreter`: number of programs; `TestJITBisect`: the seed to bisect |
 
 ## Ideas not done
 
-- **More forms:** MMX (the MP3 decoder), packed-double SSE, x87 compares (`fcomi`, `fnstsw`).
-  `C32_SLOWOPS` and `C32_JITSTATS=<instruction>` (exits by what runs there) show which.
-- **Host calls without leaving translated code** (the main cost left in Portal). It would
-  need calling Go from generated code, or translating the hottest host functions.
+- **More forms:** MMX (the MP3 decoder), x87 compares (`fcomi`, `fnstsw`) and 80-bit loads and
+  stores, 8-bit shifts, 16-bit `inc`/`dec`, `lock inc`/`dec`, `shld`/`shrd`, `cvtss2si`,
+  `cmpss`, `haddpd`, SSE shifts by an immediate. `C32_SLOWOPS` and `C32_JITSTATS=<instruction>`
+  (exits by what runs there) show which.
+- **Host calls without leaving translated code** (about 59,000 a frame in Portal's big views).
+  The trivial ones could be translated: `pthread_getspecific`/`setspecific`/`self` (with TLS
+  kept in guest memory), `fminf`, `fmaxf`, `OSAtomicCompareAndSwap64`.
+- **Returns:** a guest `ret` is an indirect jump through the lookup table, which the host
+  predicts worse than a real return. Host `call`/`ret` pairs (bounded depth, unwound on exit)
+  would use its return predictor.
 - **Superblocks or traces** across unconditional jumps and calls.
+- **arm64:** memory windows and XMM registers in host registers, as on x86-64.
 - **arm64:** keep flags pending across blocks, as x86-64 does. Today every kept result is
   computed at once, and a compare at a block's end is always kept.
 - **Apple Silicon:** verify, then set `jitOptIn` to false in `jitmem_darwin_arm64.go`.

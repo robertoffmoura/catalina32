@@ -214,8 +214,9 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_PROBE`, `C32_WATCH_NULL`, `C32_TRACECALLS` | log calls and returns of matching guest functions; catch NULL-pointer stores; keep a call stack for backtraces |
 | `C32_FONT_PNG`, `C32_MP3_OUT` | write a font sample (`HostFontSample`); the menu music's decoded PCM (`TestMenuSound`) |
 | `C32_LIVE` | `1`: wall clock (set by `catalina32 source`) |
-| `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters (`C32_JITSTATS=<instruction>`: returns to Go from then on, by what runs where they go), per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
-| `C32_FRAMESTATS` | `TestBoot`: a CSV line per frame: instructions, those the full decoder ran, host and CPU milliseconds, host calls, GL commands and KB, JIT slow and end exits, resets |
+| `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters (`C32_JITSTATS=<instruction>`: from then on, returns to Go by what runs where they go, the instructions handed to the interpreter, the blocks translated; `C32_SLOWOPS` counts from there too), per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
+| `C32_FRAMESTATS` | `TestBoot`: a CSV line per frame: instructions, those the full decoder ran, host and CPU milliseconds, host calls, GL commands and KB, JIT slow and end exits, resets, milliseconds waiting for the GL stream's reader, blocks translated, and (`C32_INJIT=1`) the share of the frame translated code ran (sampled; the CPU profiler loses most samples taken in translated code) |
+| `C32_NATIVE_DSP`, `C32_DSPCHECK` | `0`: Source's sound effects run as the game's code; `1`: run them both ways and compare every call (`TestBoot` reports the counts; `pkg/source/snddsp.go`) |
 | `C32_CPUPROF`, `C32_CPUPROF_AFTER` | `TestBoot`: the host's CPU profile, from that instruction count on (e.g. after loading) |
 | `GLREPLAY_CLIP`, `GLREPLAY_SCREEN` | `tools/glreplay`: `position` imitates AMD's clipping (and reports an AMD GPU); the screen size the game sees |
 
