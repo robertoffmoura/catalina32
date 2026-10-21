@@ -331,6 +331,13 @@ func (a *a64) smull(rd, rn, rm int) {
 	a.emit(0x9B200000 | uint32(rm)<<16 | 31<<10 | uint32(rn)<<5 | uint32(rd))
 }
 
+// umull: Xd = Wn * Wm (unsigned, 64-bit product).
+func (a *a64) umull(rd, rn, rm int) {
+	a.emit(0x9BA00000 | uint32(rm)<<16 | 31<<10 | uint32(rn)<<5 | uint32(rd))
+}
+
+func (a *a64) fmovFromX(rd, rn int) { a.emit(0x9E670000 | uint32(rn)<<5 | uint32(rd)) } // Dd = Xn
+
 func (a *a64) rev(rd, rn int) { a.emit(0x5AC00800 | uint32(rn)<<5 | uint32(rd)) }
 
 // Conditional select (32-bit).

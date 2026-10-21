@@ -119,7 +119,7 @@ const (
 	dAlu16RRM   // 66 03..3B
 	dGrp1RM16   // 66 81 / 66 83 (imm sign-extended to 16 bits)
 	dTest16     // 66 85
-	dArithSS2   // F3 0F 51/5D/5F: sqrtss, minss, maxss (aux = op2)
+	dArithSS2   // F3 0F 51/52/53/5D/5F: sqrtss, rsqrtss, rcpss, minss, maxss (aux = op2)
 	dArithSD    // F2 0F 51/58/59/5C/5D/5E/5F (aux = op2)
 	dArithPS    // 0F 51/58/59/5C/5D/5E/5F (aux = op2)
 	dLogicPS    // 0F 54/55/56: andps, andnps, orps (aux = op2)
@@ -144,6 +144,8 @@ const (
 	dMovmskps   // 0F 50 (register form)
 	dShufps     // 0F C6 (imm = order)
 	dMovlps     // 0F 12: movhlps (register form) / movlps xmm, m64
+	dMul1       // F7 /4, /5: mul / imul r/m32 (EDX:EAX = EAX * r/m32; aux = 4 or 5)
+	dXadd       // [F0] 0F C1: xadd r/m32, r32
 
 	// x87 (the interpreter's: float64 registers FPUSt, top FPUTop).
 	dFld    // push: aux = source (fld*), rm = i for ST(i)
@@ -406,9 +408,12 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			return
 		}
 	}
-	if m[p] == 0xF0 && m[p+1] == 0x0F && m[p+2] == 0xB1 { // lock cmpxchg (single guest core: as without lock)
+	if m[p] == 0xF0 && m[p+1] == 0x0F && (m[p+2] == 0xB1 || m[p+2] == 0xC1) { // lock cmpxchg / xadd (single guest core: as without lock)
 		n := decodeModRM(m, p+3, d)
 		d.kind, d.len = dCmpxchg, uint8(p+3+n-eip)
+		if m[p+2] == 0xC1 {
+			d.kind = dXadd
+		}
 		if !d.isMem {
 			d.kind = dSlow // (the full decoder; a lock with a register operand is invalid)
 		}
@@ -465,13 +470,14 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 				k = dMovsdStore
 			}
 			set(k, p+n)
-		case 0x58, 0x59, 0x5C, 0x5E, 0x51, 0x5D, 0x5F:
+		case 0x58, 0x59, 0x5C, 0x5E, 0x51, 0x5D, 0x5F, 0x52, 0x53:
 			n := decodeModRM(m, p, d)
 			d.aux = op2
 			switch {
+			case pfx == 0xF2 && (op2 == 0x52 || op2 == 0x53): // (no such forms)
 			case pfx == 0xF2:
 				set(dArithSD, p+n)
-			case op2 == 0x51 || op2 == 0x5D || op2 == 0x5F:
+			case op2 == 0x51 || op2 == 0x52 || op2 == 0x53 || op2 == 0x5D || op2 == 0x5F:
 				set(dArithSS2, p+n)
 			default:
 				set(dArithSS, p+n)
@@ -653,10 +659,18 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 	case op == 0xEB:
 		d.imm = p + 1 + uint32(int32(int8(m[p])))
 		set(dJmp, p+1)
+	case op == 0x87:
+		set(dXchg, p+decodeModRM(m, p, d))
+	case op == 0xA9: // test eax, imm32
+		d.rm, d.imm = 0, le32(m, p)
+		set(dTestRMI32, p+4)
 	case op == 0xF7:
 		if n := decodeModRM(m, p, d); d.reg == 0 || d.reg == 1 {
 			d.imm = le32(m, p+n)
 			set(dTestRMI32, p+n+4)
+		} else if d.reg == 4 || d.reg == 5 {
+			d.aux = d.reg
+			set(dMul1, p+n)
 		} else if d.reg == 2 {
 			set(dNot32, p+n)
 		} else if d.reg == 3 {
@@ -723,6 +737,8 @@ func (c *CPU) decodeCached(d *dInst, eip uint32) {
 			}
 		case op2 == 0xB1:
 			set(dCmpxchg, p+decodeModRM(m, p, d))
+		case op2 == 0xC1:
+			set(dXadd, p+decodeModRM(m, p, d))
 		case op2 == 0xA3:
 			if n := decodeModRM(m, p, d); !d.isMem {
 				set(dBt, p+n)

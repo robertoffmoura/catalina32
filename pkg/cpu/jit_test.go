@@ -79,7 +79,7 @@ func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func (g *jtGen) inst() []byte {
 	r := g.r
 	op := uint8(r.Intn(8))
-	switch r.Intn(70) {
+	switch r.Intn(74) {
 	case 0: // op r/m32, r32
 		return cat([]byte{op<<3 | 1}, g.modrm(g.any(), g.dst(), true, op != 7))
 	case 1: // op r32, r/m32
@@ -299,6 +299,19 @@ func (g *jtGen) inst() []byte {
 		return cat([]byte{0x0F, []byte{0xC2, 0xC6}[r.Intn(2)]}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false), []byte{byte(r.Intn(256))})
 	case 68: // movmskps
 		return []byte{0x0F, 0x50, 0xC0 | g.dst()<<3 | uint8(r.Intn(8))}
+	case 69: // test eax, imm32 / mul, imul r/m32 (EDX:EAX)
+		if r.Intn(2) == 0 {
+			return cat([]byte{0xA9}, g.imm32())
+		}
+		return cat([]byte{0xF7}, g.modrm(uint8(4+r.Intn(2)), g.any(), true, false))
+	case 70: // [lock] xadd r/m32, r32
+		m := g.modrm(g.dst(), g.dst(), true, true)
+		if m[0]>>6 != 3 && r.Intn(2) == 0 {
+			return cat([]byte{0xF0, 0x0F, 0xC1}, m)
+		}
+		return cat([]byte{0x0F, 0xC1}, m)
+	case 71: // rsqrtss, rcpss
+		return cat([]byte{0xF3, 0x0F, byte(0x52 + r.Intn(2))}, g.modrm(uint8(r.Intn(8)), uint8(r.Intn(8)), true, false))
 	default: // compare or test, often followed by a Jcc (fused)
 		return g.compare()
 	}

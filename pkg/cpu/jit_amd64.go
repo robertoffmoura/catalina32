@@ -12,7 +12,8 @@ import (
 //	host   rax rcx rdx rbx r12 rbp rsi rdi
 //
 // so most instructions keep their encoding (and CL, AH..BH work as in the guest). r14 holds
-// &Mem[0], r15 the CPU, r13 the store table; r8 holds effective addresses, r9-r11 are scratch.
+// &Mem[0], r15 the CPU, r13 the step budget (jitState.budget while Go runs); r8 holds effective
+// addresses, r9-r11 are scratch.
 // Guest flags live in c.Flags. An instruction that sets flags runs natively; when its flags can
 // be observed (by an instruction reading them, at the block's end, or at a slow exit before
 // something overwrites them all) they are saved (PUSHFQ to jitState.raw, with which of them in
@@ -51,7 +52,7 @@ func jitShared(j *jitCode) int {
 	a.inst(0, xW, []byte{0x89}, hRDI, xr(hR15)) // mov r15, rdi
 	a.inst(0, xW, []byte{0x89}, hRSI, xr(hR11)) // mov r11, rsi
 	a.load64(hR14, xm(hR15, offMem))
-	a.load64(hR13, xm(hR15, offStore))
+	a.load64(hR13, xm(hR15, offBudget))
 	for g, h := range hostReg {
 		a.load32(h, cpuReg(g))
 	}
@@ -60,6 +61,7 @@ func jitShared(j *jitCode) int {
 	for g, h := range hostReg {
 		a.store32(cpuReg(g), h)
 	}
+	a.store64(xm(hR15, offBudget), hR13)
 	for i, r := range saved { // r15 is last: it addresses the save area
 		a.load64(r, xm(hR15, offSave+8*int32(i)))
 	}
@@ -121,6 +123,7 @@ func (g *jitGen) produce(value, clear uint32) {
 		g.pend.on = false
 		return
 	}
+	defer g.charge(&g.jb.cost.FlagBytes, len(g.a.b))
 	g.jb.cost.FlagSaves++
 	g.a.pushfq()
 	g.a.inst(0, 0, []byte{0x8F}, 0, xm(hR15, offRaw)) // pop qword [raw]
@@ -128,11 +131,15 @@ func (g *jitGen) produce(value, clear uint32) {
 	g.pend = jitPending{on: true, value: value, clear: clear}
 }
 
+// charge adds the code emitted since start to *n (C32_JITPROF).
+func (g *jitGen) charge(n *uint64, start int) { *n += uint64(len(g.a.b) - start) }
+
 // emitMerge merges pending flags p into c.Flags (uses r9-r11, changes the host's flags).
 func (g *jitGen) emitMerge(p jitPending) {
 	if !p.on {
 		return
 	}
+	defer g.charge(&g.jb.cost.FlagBytes, len(g.a.b))
 	a := &g.a
 	if !p.dyn {
 		g.jb.cost.Merges++
@@ -209,6 +216,7 @@ func (g *jitGen) eaOp(d *dInst) xop {
 // path: addr < ArenaSize-8, or for 16 bytes addr+16 <= ArenaSize-8).
 func (g *jitGen) chkLoad(size int) {
 	g.jb.cost.Loads++
+	defer g.charge(&g.jb.cost.CheckBytes, len(g.a.b))
 	if size == 16 {
 		g.a.alu32I(7, xr(hR8), ArenaSize-24)
 		g.a.jcc(0x7, g.slowLabel()) // ja
@@ -222,9 +230,11 @@ func (g *jitGen) chkLoad(size int) {
 // before) a page holding code: the store table marks those pages.
 func (g *jitGen) chkStore(r int) {
 	g.jb.cost.Stores++
+	defer g.charge(&g.jb.cost.CheckBytes, len(g.a.b))
 	g.a.movRR32(hR11, r)
-	g.a.shiftI32(5, xr(hR11), 12)                          // shr r11d, 12
-	g.a.inst(0, 0, []byte{0x80}, 7, xmi(hR13, hR11, 0, 0)) // cmp byte [r13+r11], 0
+	g.a.shiftI32(5, xr(hR11), 12)                           // shr r11d, 12
+	g.a.inst(0, xW, []byte{0x03}, hR11, xm(hR15, offStore)) // add r11, [stores]
+	g.a.inst(0, 0, []byte{0x80}, 7, xm(hR11, 0))            // cmp byte [r11], 0
 	g.a.emit(0)
 	g.a.jcc(0x5, g.slowLabel()) // jne
 }
@@ -239,6 +249,7 @@ func (g *jitGen) merge(value, clear uint32) {
 // loadFlags puts the guest's arithmetic flags into the host's.
 func (g *jitGen) loadFlags() {
 	g.jb.cost.FlagLoads++
+	defer g.charge(&g.jb.cost.FlagBytes, len(g.a.b))
 	g.a.load32(hR11, xm(hR15, offFlags))
 	g.a.alu32I(4, xr(hR11), flagsArith)
 	g.a.push(hR11)
@@ -343,7 +354,7 @@ func jitTranslate(c *CPU, j *jitCode, jb *jitBlock) bool {
 
 	// exits
 	a.bind(g.limitExit)
-	a.alu64I(0, xm(hR15, offBudget), int32(jb.steps)) // not run: give the charge back
+	a.alu64I(0, xr(hR13), int32(jb.steps)) // not run: give the charge back
 	a.storeI32(xm(hR15, offEIP), jb.eip)
 	g.exit(jitExitLimit)
 	a.bind(g.endStub)
@@ -501,8 +512,10 @@ func (g *jitGen) body() int {
 	if len(jb.code) > 0 {
 		g.codeCheck()
 	}
-	a.alu64I(5, xm(hR15, offBudget), int32(jb.steps)) // sub [budget], steps
-	a.jcc(0x2, g.limitExit)                           // jb: it would pass the limit
+	head := len(a.b)
+	a.alu64I(5, xr(hR13), int32(jb.steps)) // sub r13 (the budget), steps
+	a.jcc(0x2, g.limitExit)                // jb: it would pass the limit
+	g.charge(&jb.cost.HeadBytes, head)
 	if jitProf {
 		if jb.runs == nil {
 			jb.runs = new(uint64)
@@ -1154,8 +1167,23 @@ func (g *jitGen) inst2(d *dInst) bool {
 			g.chkLoad(4)
 			src = memAt
 		}
-		a.sse(0xF3, 0x10, 0, xmmOp(d.reg))
-		a.sse(0xF3, d.aux, 0, src)
+		switch d.aux {
+		case 0x52: // rsqrtss as the interpreter: float32(1 / sqrt(float64(b)))
+			a.sse(0xF3, 0x5A, 1, src)   // cvtss2sd xmm1, b
+			a.sse(0xF2, 0x51, 1, xr(1)) // sqrtsd
+			a.emit(0x49, 0xBB)          // mov r11, 1.0
+			a.emit64(math.Float64bits(1))
+			a.inst(0x66, xW, []byte{0x0F, 0x6E}, 0, xr(hR11)) // movq xmm0, r11
+			a.sse(0xF2, 0x5E, 0, xr(1))                       // divsd
+			a.sse(0xF2, 0x5A, 0, xr(0))                       // cvtsd2ss
+		case 0x53: // rcpss as the interpreter: 1 / b in float32
+			a.movRI32NoFlags(hR11, math.Float32bits(1))
+			a.inst(0x66, 0, []byte{0x0F, 0x6E}, 0, xr(hR11)) // movd xmm0, r11d
+			a.sse(0xF3, 0x5E, 0, src)                        // divss
+		default:
+			a.sse(0xF3, 0x10, 0, xmmOp(d.reg))
+			a.sse(0xF3, d.aux, 0, src)
+		}
 		a.sse(0xF3, 0x11, 0, xmmOp(d.reg))
 	case dArithSD:
 		src := xmmOp(d.rm)
@@ -1278,6 +1306,24 @@ func (g *jitGen) inst2(d *dInst) bool {
 			rm = memAt
 		}
 		a.inst(0, 0, []byte{0x0F, 0xB1}, h(d.reg), rm) // (memory: also written back when different; the page is checked)
+		g.produce(flagsArith, flagsArith)
+	case dMul1: // EDX:EAX = EAX * r/m32 (edx, eax are rdx, rax)
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			g.chkLoad(4)
+			rm = memAt
+		}
+		a.inst(0, 0, []byte{0xF7}, int(d.aux), rm)
+		g.produce(FlagCF|FlagOF, FlagCF|FlagOF)
+	case dXadd:
+		rm := xr(h(d.rm))
+		if d.isMem {
+			g.ea(d)
+			g.chkStore(hR8)
+			rm = memAt
+		}
+		a.inst(0, 0, []byte{0x0F, 0xC1}, h(d.reg), rm) // (without lock)
 		g.produce(flagsArith, flagsArith)
 	case dBt:
 		a.inst(0, 0, []byte{0x0F, 0xA3}, h(d.reg), xr(h(d.rm)))

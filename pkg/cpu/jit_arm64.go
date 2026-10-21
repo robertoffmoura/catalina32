@@ -1134,6 +1134,31 @@ func (g *jitGen) inst(d *dInst) bool {
 		a.bind(ne)
 		a.mov(gr(0), rT1)
 		a.bind(done)
+	case dMul1: // EDX:EAX = EAX * r/m32
+		src := g.loadRM(d, 4, false)
+		if d.aux == 4 {
+			a.umull(rT2, gr(0), src)
+			a.lsrI64(rT3, rT2, 32)
+			a.addR(false, a64Subs, a64ZR, rT3, a64ZR, a64LSL, 0) // the high half: NE if not 0
+		} else {
+			a.smull(rT2, gr(0), src)
+			a.addX(true, a64Subs, a64ZR, rT2, rT2, 6, 0) // NE if it doesn't fit 32 bits
+			a.lsrI64(rT3, rT2, 32)
+		}
+		g.produce(fmNone, FlagCF|FlagOF, func() {
+			a.cset(rF1, a64NE)
+			a.logR(false, a64Orr, rF1, rF1, rF1, a64LSL, 11)
+		})
+		a.mov(gr(0), rT2)
+		a.mov(gr(2), rT3)
+	case dXadd: // r/m32 = r/m32 + r32, r32 = the old r/m32
+		dst := g.loadRM(d, 4, true)
+		if dst != rT1 {
+			a.mov(rT1, dst)
+		}
+		g.alu32(0, rT1, gr(d.reg), 0)
+		a.mov(gr(d.reg), rT1)
+		g.storeRM(d, 4)
 	case dBt:
 		a.op2(a64Lsrv, rT2, gr(d.rm), gr(d.reg)) // (the shift takes the count mod 32)
 		g.produce(fmNone, FlagCF, func() { a.logI(a64AndI, rF1, rT2, 1) })
@@ -1527,6 +1552,17 @@ func (g *jitGen) sse(d *dInst) bool {
 		case 0x5F: // max: a > b ? a : b
 			a.fcmp(double, 0, 1)
 			a.fcsel(double, 0, 0, 1, a64GT)
+		case 0x52: // rsqrt as the interpreter: float32(1 / sqrt(float64(b)))
+			a.fcvtS2D(1, 1)
+			a.fsqrt(true, 1, 1)
+			a.movI64(rF1, math.Float64bits(1))
+			a.fmovFromX(0, rF1)
+			a.fop(a64Fdiv, true, 0, 0, 1)
+			a.fcvtD2S(0, 0)
+		case 0x53: // rcp as the interpreter: 1 / b in float32
+			a.movI(rF1, math.Float32bits(1))
+			a.fmovFromW(0, rF1)
+			a.fop(a64Fdiv, false, 0, 0, 1)
 		case 0x51: // sqrt (singles as the interpreter does: through a double)
 			if double {
 				a.fsqrt(true, 0, 1)

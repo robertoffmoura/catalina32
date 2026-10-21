@@ -59,6 +59,8 @@ func TestA64Encodings(t *testing.T) {
 		{func(a *a64) { a.op2(a64Sbcs, 2, 19, 20) }, "sbcs w2, w19, w20"},
 		{func(a *a64) { a.smull(2, 19, 20) }, "smull x2, w19, w20"},
 		{func(a *a64) { a.rev(19, 19) }, "rev w19, w19"},
+		{func(a *a64) { a.umull(2, 19, 1) }, "umull x2, w19, w1"},
+		{func(a *a64) { a.fmovFromX(0, 13) }, "fmov d0, x13"},
 		{func(a *a64) { a.csel(19, 2, 19, a64NE) }, "csel w19, w2, w19, ne"},
 		{func(a *a64) { a.cset(13, a64NE) }, "cset w13, ne"},
 		{func(a *a64) { a.csinc(13, 13, a64ZR, a64VC) }, "csinc w13, w13, wzr, vc"},

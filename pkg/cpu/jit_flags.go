@@ -28,9 +28,9 @@ func jitFlagFx(d *dInst) jitFx {
 		return jitFx{writes: true, value: flagsLogic, clear: flagsArith}
 	case dIncR, dDecR, dIncRM32, dDecRM32:
 		return jitFx{writes: true, value: flagsArith &^ FlagCF, clear: flagsArith &^ FlagCF}
-	case dNeg32, dNeg8, dUcomiss, dUcomisd, dCmpxchg:
+	case dNeg32, dNeg8, dUcomiss, dUcomisd, dCmpxchg, dXadd:
 		return jitFx{writes: true, value: flagsArith, clear: flagsArith}
-	case dImul32, dImulRRM32:
+	case dImul32, dImulRRM32, dMul1:
 		return jitFx{writes: true, value: FlagCF | FlagOF, clear: FlagCF | FlagOF}
 	case dBt:
 		return jitFx{writes: true, value: FlagCF, clear: FlagCF}
