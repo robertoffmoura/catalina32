@@ -167,7 +167,8 @@ The game's own code writes the save files, so they are compatible with the origi
   `build/release/`. `--publish` then publishes exactly that zip and those notes, without
   rebuilding, once it has checked they come from the current commit and the zip is unchanged:
   it tags `v<version>` and creates a GitHub pre-release (`--final` for a normal one). The
-  version is `cmd/catalina32/cli.go`'s.
+  version is `cmd/catalina32/cli.go`'s; what's new goes in `docs/releases/<version>.md`
+  (`--notes`).
 
 ## Distribution and legal
 

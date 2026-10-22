@@ -13,7 +13,7 @@ import (
 )
 
 // version is catalina32's version, recorded in the game apps it makes.
-const version = "0.1.0"
+const version = "0.2.0"
 
 func usage() {
 	fmt.Fprint(os.Stderr, `catalina32 runs 32-bit Mac games on modern macOS.

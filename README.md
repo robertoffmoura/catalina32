@@ -55,12 +55,6 @@ Catalina32 isn't notarised by Apple yet, so macOS blocks it the first time:
 
 You only do this once. Game apps made by Catalina32 open normally.
 
-## Performance
-
-How smoothly a game runs depends on your Mac. The busiest scenes are the most demanding: the
-emulator is the limit there, and that's where work continues. Portal's largest rooms run at
-a lower frame rate than the rest of the game.
-
 ## Troubleshooting
 
 - The game app says the game moved or changed: Steam updated it or the library moved.
