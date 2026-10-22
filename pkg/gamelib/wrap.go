@@ -22,7 +22,8 @@ type WrapOptions struct {
 // Wrap makes a game app for a supported game: the window app and the engine (copies, so the
 // game app keeps working if Catalina32.app moves), the game's icon and a manifest pointing at
 // the installed game, which is never copied or changed. An existing game app of the same name
-// is replaced; any other app of that name is left alone. It returns the game app's path.
+// is replaced; any other app of that name is left alone, and the game app is called
+// "<name> (Catalina32).app" instead. It returns the game app's path.
 func Wrap(info Info, opt WrapOptions) (string, error) {
 	if info.Status != Supported {
 		return "", fmt.Errorf("%s: %s", info.DisplayName(), info.Detail)
@@ -44,8 +45,15 @@ func Wrap(info Info, opt WrapOptions) (string, error) {
 	if same, _ := sameFile(app, info.App); same || filepath.Clean(app) == filepath.Clean(info.App) {
 		return "", fmt.Errorf("the game app can't go in the game's own folder (%s): choose another folder", opt.OutDir)
 	}
-	if dirExists(app) && !fileExists(filepath.Join(app, "Contents", "Resources", ManifestName)) {
-		return "", fmt.Errorf("%s already exists and isn't a catalina32 game app: choose another folder", app)
+	foreign := func(p string) bool {
+		return dirExists(p) && !fileExists(filepath.Join(p, "Contents", "Resources", ManifestName))
+	}
+	if foreign(app) { // another app has the name, such as the shortcut Steam makes to start the game
+		app = filepath.Join(opt.OutDir, name+" (Catalina32).app")
+		if foreign(app) {
+			return "", fmt.Errorf("%s and %s already exist and aren't catalina32 game apps: move one of them, then try again",
+				filepath.Base(app), name+".app")
+		}
 	}
 	if err := os.MkdirAll(opt.OutDir, 0o755); err != nil {
 		return "", err

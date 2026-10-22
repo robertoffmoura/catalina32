@@ -99,7 +99,8 @@ Catalina32.app/Contents/
   Resources/AppIcon.icns
   Info.plist
 
-<Game>.app/Contents/          made by `catalina32 wrap`
+<Game>.app/Contents/          made by `catalina32 wrap` ("<Game> (Catalina32).app" when another app,
+                              such as Steam's shortcut to the game, has the name)
   MacOS/<Game>               the same window app (game mode: finds Resources/game.json)
   Helpers/catalina32         a copy of the engine: the game app keeps working if
                              Catalina32.app is moved or deleted (about 25 MB)

@@ -166,9 +166,22 @@ func TestWrap(t *testing.T) {
 	if _, err := Wrap(info, WrapOptions{OutDir: filepath.Dir(game), Window: window, Engine: engine}); err == nil {
 		t.Error("wrapped over the original game")
 	}
+	// Another app with the name (Steam's shortcut to the game): left alone, the game app gets
+	// another name, which a second wrap replaces; with both names taken, nothing is made.
 	other := fakeApp(t, filepath.Join(dir, "other"), "Game", []byte("x"))
-	if _, err := Wrap(info, WrapOptions{OutDir: filepath.Dir(other), Window: window, Engine: engine}); err == nil {
-		t.Error("replaced an app that isn't a game app")
+	for i := 0; i < 2; i++ {
+		got, err := Wrap(info, WrapOptions{OutDir: filepath.Dir(other), Window: window, Engine: engine})
+		if err != nil || got != filepath.Join(dir, "other", "Game (Catalina32).app") {
+			t.Fatalf("beside another app: %q %v", got, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(other, "Contents", "MacOS", "Game")); err != nil || string(b) != "x" {
+		t.Errorf("the other app changed: %q %v", b, err)
+	}
+	third := fakeApp(t, filepath.Join(dir, "third"), "Game", []byte("x"))
+	fakeApp(t, filepath.Join(dir, "third"), "Game (Catalina32)", []byte("y"))
+	if _, err := Wrap(info, WrapOptions{OutDir: filepath.Dir(third), Window: window, Engine: engine}); err == nil {
+		t.Error("made a game app with both names taken by other apps")
 	}
 
 	// A changed game fails the check.
