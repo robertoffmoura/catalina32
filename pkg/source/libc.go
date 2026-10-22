@@ -91,7 +91,9 @@ func (m *Machine) hostPath(p string, write bool) string {
 	if write {
 		clear(m.ovMissing) // the game may be about to create files there
 		os.MkdirAll(filepath.Dir(ov), 0o755)
-		if _, err := os.Stat(ov); err != nil {
+		if m.isDeleted(p) {
+			m.setDeleted(p, false) // created anew, from nothing
+		} else if _, err := os.Stat(ov); err != nil {
 			if src := m.fold(p); src != "" { // copy-on-write: start from the game's file
 				if b, err := os.ReadFile(src); err == nil {
 					os.WriteFile(ov, b, 0o644)
@@ -102,6 +104,9 @@ func (m *Machine) hostPath(p string, write bool) string {
 	}
 	if m.ovExists(ov) {
 		return ov
+	}
+	if m.isDeleted(p) {
+		return ov // (not there)
 	}
 	if q := m.fold(p); q != "" {
 		return q
@@ -160,6 +165,49 @@ func (m *Machine) ovExists(ov string) bool {
 	}
 	m.ovMissing[ov] = true
 	return false
+}
+
+// The game deletes files too: Source empties its save folder (each level's state, map.hl1-3) when
+// a game starts or loads, and a level whose state is still there is restored from it instead
+// of starting afresh. Deleting a file in the game's folder can't remove it (that folder is never
+// changed), so it is recorded as deleted (in deletedList, in the overlay, so it stays deleted
+// the next time) and hidden from then on, until the game writes the file again.
+
+const deletedList = ".catalina32-deleted" // in the overlay: one guest path per line
+
+// isDeleted says whether the game deleted the game's file p (a clean absolute guest path).
+func (m *Machine) isDeleted(p string) bool {
+	if m.deleted == nil {
+		m.deleted = map[string]bool{}
+		if b, err := os.ReadFile(filepath.Join(m.Overlay, deletedList)); err == nil {
+			for _, l := range strings.Split(string(b), "\n") {
+				if l != "" {
+					m.deleted[strings.ToLower(l)] = true
+				}
+			}
+		}
+	}
+	return len(m.deleted) > 0 && m.deleted[strings.ToLower(p)]
+}
+
+// setDeleted records p as deleted (or not any more) and saves the list.
+func (m *Machine) setDeleted(p string, del bool) {
+	m.isDeleted(p) // loaded
+	k := strings.ToLower(p)
+	if m.deleted[k] == del {
+		return
+	}
+	if del {
+		m.deleted[k] = true
+	} else {
+		delete(m.deleted, k)
+	}
+	list := make([]string, 0, len(m.deleted))
+	for k := range m.deleted {
+		list = append(list, k)
+	}
+	sort.Strings(list)
+	os.WriteFile(filepath.Join(m.Overlay, deletedList), []byte(strings.Join(list, "\n")+"\n"), 0o644)
 }
 
 // foldCase returns the existing path matching p ignoring case, or "".
@@ -1953,23 +2001,42 @@ func (m *Machine) mkdir(c *cpu.CPU) {
 }
 
 func (m *Machine) unlink(c *cpu.CPU) {
-	p := c.ReadCString(c.Arg(0))
-	if !filepath.IsAbs(p) {
-		p = filepath.Join(m.cwd, p)
-	}
-	// Only files the game wrote (in the overlay) are removed; the game's own files stay.
-	if err := os.Remove(filepath.Join(m.Overlay, filepath.Clean(p))); err != nil {
-		m.setErrno(eNOENT)
+	if e := m.removePath(c.ReadCString(c.Arg(0))); e != 0 {
+		m.setErrno(e)
 		ret(c, neg1())
 		return
 	}
 	ret(c, 0)
 }
 
+// removePath is unlink and rmdir: what the game wrote (in the overlay) is removed; the game's own
+// file is recorded as deleted. It returns 0 or an errno.
+func (m *Machine) removePath(p string) uint32 {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(m.cwd, p)
+	}
+	p = filepath.Clean(p)
+	err := os.Remove(filepath.Join(m.Overlay, p))
+	if game := m.fold(p); game != "" && !m.isDeleted(p) {
+		if st, e := os.Stat(game); e == nil && st.IsDir() {
+			if names, _, _ := m.listDir(p); len(names) > 0 {
+				return 66 // ENOTEMPTY (rmdir)
+			}
+		}
+		m.setDeleted(p, true)
+		err = nil
+	}
+	if err != nil {
+		return errnoOf(err)
+	}
+	return 0
+}
+
 func (m *Machine) rename(c *cpu.CPU) {
-	from := m.hostPath(c.ReadCString(c.Arg(0)), false)
-	to := m.hostPath(c.ReadCString(c.Arg(1)), true)
-	if !strings.HasPrefix(from, m.Overlay) {
+	gp, gto := c.ReadCString(c.Arg(0)), c.ReadCString(c.Arg(1))
+	from := m.hostPath(gp, false)
+	to := m.hostPath(gto, true)
+	if !strings.HasPrefix(from, m.Overlay) { // a game file: copied, and deleted
 		b, err := os.ReadFile(from)
 		if err == nil {
 			err = os.WriteFile(to, b, 0o644)
@@ -1977,6 +2044,15 @@ func (m *Machine) rename(c *cpu.CPU) {
 		if err != nil {
 			ret(c, neg1())
 			return
+		}
+		abs := func(p string) string {
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(m.cwd, p)
+			}
+			return filepath.Clean(p)
+		}
+		if !strings.EqualFold(abs(gp), abs(gto)) {
+			m.setDeleted(abs(gp), true)
 		}
 		ret(c, 0)
 		return
@@ -2029,6 +2105,9 @@ func (m *Machine) listDir(p string) (names []string, types []byte, ok bool) {
 		ok = true
 		ents, _ := os.ReadDir(hp)
 		for _, e := range ents {
+			if hp == game && m.isDeleted(filepath.Join(p, e.Name())) {
+				continue
+			}
 			if k := strings.ToLower(e.Name()); !seen[k] {
 				seen[k] = true
 				names = append(names, e.Name())

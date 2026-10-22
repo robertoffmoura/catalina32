@@ -17,7 +17,14 @@ then runs `catalina32 source --window <window> <folder>`, which finds the mod (`
 portal`) and starts both. What the game writes (settings, saves) goes to
 `~/Library/Application Support/catalina32/<folder name>`, never into the game folder; reads
 see that folder merged over the game's (so a saved `cfg/config.cfg` shadows the game's own,
-but listing `cfg/` still shows its chapter files). There is no game app yet (see Next).
+but listing `cfg/` still shows its chapter files). A game file the game deletes is recorded as
+deleted (`.catalina32-deleted` in that folder) and hidden until the game writes it again. This
+matters for saves: Source empties `save/` when a game starts or loads, and a level whose state
+(`map.hl1`-`hl3`) is still there is restored from it instead of starting afresh. A Portal folder
+copied from an old Mac held escape_02's state from 2021, past GLaDOS's door; while it couldn't
+be deleted, every save carried it and walking into escape_02 restored it, door shut. Saves made
+before the fix still carry it: `map escape_02` starts the level afresh. There is no game app yet
+(see Next).
 
 ## How it works
 

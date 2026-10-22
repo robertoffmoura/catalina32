@@ -89,6 +89,7 @@ type Machine struct {
 	folded             map[string]string            // fold's cache (libc.go)
 	dirNames           map[string]map[string]string // fold's directory listings: lower-case name -> name
 	ovMissing          map[string]bool              // overlay paths known not to exist (libc.go)
+	deleted            map[string]bool              // game files the game deleted, lower case (libc.go); nil: not loaded
 	sdl                sdlState
 	gl                 nullGL
 	fonts              fontState
