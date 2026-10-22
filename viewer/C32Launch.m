@@ -23,7 +23,10 @@
     setenv("C32_SHM_FILE", [g->_shmPath fileSystemRepresentation], 1);
     setenv("C32_FRAMES_DIR", [[work stringByAppendingPathComponent:@"frames"] fileSystemRepresentation], 1);
     const char *rend = getenv("C32_RENDERER");
-    if (!(rend && strcmp(rend, "software") == 0)) {
+    if ([m[@"kind"] isEqual:@"source"]) {
+        /* A Valve Source game draws with OpenGL, streamed to the window (C32GL.m). */
+        setenv("C32_GL_SHM", [[work stringByAppendingPathComponent:@"gl.shm"] fileSystemRepresentation], 1);
+    } else if (!(rend && strcmp(rend, "software") == 0)) {
         setenv("C32_GPU_SHM", [[work stringByAppendingPathComponent:@"gpu.shm"] fileSystemRepresentation], 1);
     }
 

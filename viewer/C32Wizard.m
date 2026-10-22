@@ -3,7 +3,8 @@
 // wrap with --json); this file only presents it (see C32App.h).
 #import "C32App.h"
 
-// C32DropView accepts .app bundles dragged onto the window.
+// C32DropView accepts games dragged onto the window: .app bundles, and folders (Valve's Source
+// games are a folder, such as Steam's steamapps/common/Portal).
 @interface C32DropView : NSView
 @property(copy) void (^onDrop)(NSArray<NSURL *> *apps);
 @end
@@ -21,7 +22,9 @@
                                                              options:@{NSPasteboardURLReadingFileURLsOnlyKey : @YES}];
     NSMutableArray *apps = [NSMutableArray array];
     for (NSURL *u in urls) {
-        if ([[u pathExtension] isEqualToString:@"app"]) [apps addObject:u];
+        NSNumber *dir = nil;
+        [u getResourceValue:&dir forKey:NSURLIsDirectoryKey error:NULL];
+        if ([dir boolValue]) [apps addObject:u];
     }
     return apps;
 }
@@ -187,9 +190,10 @@
 - (void)chooseGame:(id)sender {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     [panel setAllowedFileTypes:@[ @"app" ]];
+    [panel setCanChooseDirectories:YES]; /* Source games are a folder (Steam's common/Portal) */
     [panel setAllowsMultipleSelection:NO];
     [panel setTreatsFilePackagesAsDirectories:NO];
-    [panel setMessage:@"Choose a game app"];
+    [panel setMessage:@"Choose a game app, or the folder of a Valve game such as Portal"];
     [panel beginSheetModalForWindow:_window completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK) [self addApps:[panel URLs]];
     }];

@@ -13,8 +13,9 @@
 @property(readonly) NSString *shmPath; // the framebuffer shared memory the engine creates
 @property(readonly) NSString *logPath; // the engine's output
 @property(readonly) NSTask *engine;
-// Starts Contents/Helpers/catalina32 for the manifest (setting C32_SHM_FILE and C32_GPU_SHM for
-// both processes), or returns nil with a message for players in *error.
+// Starts Contents/Helpers/catalina32 for the manifest (setting C32_SHM_FILE and C32_GPU_SHM, or
+// C32_GL_SHM for a Source game, for both processes), or returns nil with a message for players
+// in *error.
 + (instancetype)launchManifest:(NSString *)manifest error:(NSString **)error;
 // The reason the engine stopped early, from its log (for an alert).
 - (NSString *)failureMessage;

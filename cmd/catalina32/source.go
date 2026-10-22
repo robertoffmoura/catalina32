@@ -5,8 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 
+	"catalina32/pkg/gamelib"
 	"catalina32/pkg/source"
 )
 
@@ -36,6 +36,12 @@ func cmdSource(args []string) int {
 			}
 		}
 	}
+	return runSource(dir, gameArgs, gamelib.SourceOverlay(dir), *noWindow, *window)
+}
+
+// runSource plays a Source game: what it writes (settings, saves) goes to overlay, never into
+// its folder dir.
+func runSource(dir string, gameArgs []string, overlay string, noWindow bool, window string) int {
 	work, err := os.MkdirTemp("", "catalina32-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "catalina32:", err)
@@ -49,19 +55,13 @@ func cmdSource(args []string) int {
 	}
 	os.Setenv("C32_LIVE", "1")
 	os.Setenv("C32_TITLE", name)
-	// What the game writes (settings, saves) goes here, never into its folder.
-	home, _ := os.UserHomeDir()
-	overlay := filepath.Join(home, ".catalina32", name)
-	if runtime.GOOS == "darwin" {
-		overlay = filepath.Join(home, "Library", "Application Support", "catalina32", name)
-	}
 	m, err := source.New(dir, gameArgs, overlay, os.Stdout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "catalina32:", err)
 		return 1
 	}
-	if !*noWindow {
-		win, _, err := runtimeFiles(*window)
+	if !noWindow {
+		win, _, err := runtimeFiles(window)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "catalina32:", err)
 			return 1

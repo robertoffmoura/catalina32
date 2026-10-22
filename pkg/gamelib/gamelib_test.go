@@ -1,7 +1,9 @@
 package gamelib
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,4 +214,133 @@ func TestBackupSaves(t *testing.T) {
 	if len(names) != backupsKept {
 		t.Errorf("%d backups kept, want %d", len(names), backupsKept)
 	}
+}
+
+// fakeSource makes a Source game's folder in dir: the launcher (launcher's bytes), the engine,
+// steam_appid.txt and the portal mod with its icon.
+func fakeSource(t *testing.T, dir, appID string, launcher, engine []byte) string {
+	t.Helper()
+	for _, d := range []string{"bin", "portal/resource"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for p, b := range map[string][]byte{"hl2_osx": launcher, "bin/engine.dylib": engine, "steam_appid.txt": []byte(appID + "\n\x00"),
+		"portal/gameinfo.txt": []byte(`"GameInfo" {}`), "portal/resource/game.icns": []byte("icns")} {
+		if err := os.WriteFile(filepath.Join(dir, p), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// testEngine makes sourceGames accept engine for Portal while the test runs.
+func testEngine(t *testing.T, engine []byte) {
+	sum := sha256.Sum256(engine)
+	saved := sourceGames[0].engines
+	sourceGames[0].engines = append([]string{hex.EncodeToString(sum[:])}, saved...)
+	t.Cleanup(func() { sourceGames[0].engines = saved })
+}
+
+func TestIdentifySource(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	i386 := machHeader(mhMagic32, cpuTypeI386)
+	engine := []byte("engine")
+	portal := fakeSource(t, filepath.Join(dir, "common", "Portal"), "400", i386, engine)
+	if info := Identify(portal); info.Status != Unsupported || info.Kind != KindSource || info.SHA256 == "" {
+		t.Errorf("an untested engine: %+v", info)
+	}
+	testEngine(t, engine)
+	info := Identify(portal)
+	if info.Status != Supported || info.Profile != "portal" || info.Title != "Portal" || info.Executable != "hl2_osx" ||
+		strings.Join(info.Args, " ") != "-game portal" || info.Icon != filepath.Join(portal, "portal", "resource", "game.icns") ||
+		info.Saves != SourceOverlay(portal) || filepath.Base(info.Saves) != "Portal" {
+		t.Errorf("Portal: %+v", info)
+	}
+	for name, c := range map[string]struct {
+		appID    string
+		launcher []byte
+		want     Status
+	}{
+		"HL2": {"220", i386, Unsupported}, "Portal64": {"400", machHeader(mhMagic64, cpuTypeX64), Native},
+	} {
+		if info := Identify(fakeSource(t, filepath.Join(dir, "common", name), c.appID, c.launcher, engine)); info.Status != c.want {
+			t.Errorf("%s: %s (%s), want %s", name, info.Status, info.Detail, c.want)
+		}
+	}
+	if info := Identify(t.TempDir()); info.Status != Unreadable {
+		t.Errorf("an empty folder: %+v", info)
+	}
+	// Scan lists Source folders beside apps (Portal64 runs natively: not listed).
+	fakeApp(t, filepath.Join(dir, "common", "Lego"), "Game", i386)
+	var got []string
+	for _, i := range Scan([]string{filepath.Join(dir, "common")}, false) {
+		got = append(got, i.DisplayName()+":"+string(i.Status))
+	}
+	if want := "Portal:supported Game & Co:unsupported HL2:unsupported"; strings.Join(got, " ") != want {
+		t.Errorf("Scan: %q, want %q", strings.Join(got, " "), want)
+	}
+}
+
+func TestWrapSource(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	engine := []byte("engine")
+	testEngine(t, engine)
+	portal := fakeSource(t, filepath.Join(dir, "common", "Portal"), "400", machHeader(mhMagic32, cpuTypeI386), engine)
+	runtime := filepath.Join(dir, "runtime")
+	if err := os.MkdirAll(runtime, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	window, eng := filepath.Join(runtime, "Catalina32"), filepath.Join(runtime, "catalina32")
+	for _, p := range []string{window, eng} {
+		if err := os.WriteFile(p, []byte(filepath.Base(p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app, err := Wrap(Identify(portal), WrapOptions{OutDir: filepath.Join(dir, "Applications"), Window: window, Engine: eng, Version: "0.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(app) != "Portal.app" {
+		t.Fatalf("app at %s", app)
+	}
+	for _, f := range []string{"MacOS/Portal", "Helpers/catalina32", "Resources/AppIcon.icns"} {
+		if !fileExists(filepath.Join(app, "Contents", f)) {
+			t.Errorf("missing %s", f)
+		}
+	}
+	p, err := readPlist(filepath.Join(app, "Contents", "Info.plist"))
+	if err != nil || p["CFBundleExecutable"] != "Portal" || p["CFBundleIdentifier"] != "com.ffmoura.catalina32.portal" || p["CFBundleDisplayName"] != "Portal" {
+		t.Fatalf("Info.plist: %v %v", p, err)
+	}
+	m, err := ReadManifest(filepath.Join(app, "Contents", "Resources", ManifestName))
+	if err != nil || m.Kind != KindSource || m.App != portal || strings.Join(m.Args, " ") != "-game portal" || m.Saves != SourceOverlay(portal) {
+		t.Fatalf("manifest: %+v %v", m, err)
+	}
+	if _, err := m.Check(); err != nil {
+		t.Errorf("Check on an unchanged game: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(portal, "bin", "engine.dylib"), []byte("updated"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Check(); err == nil {
+		t.Error("Check accepted a changed engine")
+	}
+}
+
+// With the real game (C32_SOURCE_DIR, the Portal folder), Identify supports it.
+func TestIdentifyRealSource(t *testing.T) {
+	dir := os.Getenv("C32_SOURCE_DIR")
+	if dir == "" {
+		t.Skip("C32_SOURCE_DIR not set")
+	}
+	info := Identify(dir)
+	if info.Status != Supported || info.Profile != "portal" || info.Icon == "" {
+		t.Fatalf("%+v", info)
+	}
+	t.Logf("%s: %s, args %v, saves %s", info.DisplayName(), info.Detail, info.Args, info.Saves)
 }

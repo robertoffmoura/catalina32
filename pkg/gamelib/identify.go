@@ -31,19 +31,21 @@ const (
 
 // Info is what catalina32 knows about one game app.
 type Info struct {
-	App        string `json:"app"`                  // the .app bundle
-	Executable string `json:"executable,omitempty"` // relative to App
-	Name       string `json:"name,omitempty"`       // the bundle's name
-	BundleID   string `json:"bundleId,omitempty"`
-	Icon       string `json:"icon,omitempty"` // the bundle's .icns, if any
-	Arch       string `json:"arch,omitempty"` // i386, x86_64, arm64, or a list for universal binaries
-	SHA256     string `json:"sha256,omitempty"`
-	Status     Status `json:"status"`
-	Detail     string `json:"detail"` // one sentence for players
-	Profile    string `json:"profile,omitempty"`
-	Title      string `json:"title,omitempty"` // the game's name as players know it
-	Data       string `json:"data,omitempty"`  // the game's data folder (supported games)
-	Saves      string `json:"saves,omitempty"` // where its saves go by default (supported games)
+	App        string   `json:"app"`                  // the .app bundle
+	Executable string   `json:"executable,omitempty"` // relative to App
+	Name       string   `json:"name,omitempty"`       // the bundle's name
+	BundleID   string   `json:"bundleId,omitempty"`
+	Icon       string   `json:"icon,omitempty"` // the bundle's .icns, if any
+	Arch       string   `json:"arch,omitempty"` // i386, x86_64, arm64, or a list for universal binaries
+	SHA256     string   `json:"sha256,omitempty"`
+	Status     Status   `json:"status"`
+	Detail     string   `json:"detail"` // one sentence for players
+	Profile    string   `json:"profile,omitempty"`
+	Title      string   `json:"title,omitempty"` // the game's name as players know it
+	Data       string   `json:"data,omitempty"`  // the game's data folder (supported games)
+	Saves      string   `json:"saves,omitempty"` // where its saves go by default (supported games)
+	Kind       string   `json:"kind,omitempty"`  // KindSource for a Valve Source game's folder; "" for an app
+	Args       []string `json:"args,omitempty"`  // the game's options (Source games: -game <mod>)
 }
 
 // DisplayName is the best name to show for the game.
@@ -58,10 +60,18 @@ func (i Info) DisplayName() string {
 }
 
 // Identify reads a game app: its Info.plist, its executable's architectures and, for 32-bit
-// executables, its checksum, which picks the profile.
+// executables, its checksum, which picks the profile. A Valve Source game is a folder instead
+// (identifySource).
 func Identify(app string) Info {
 	app = filepath.Clean(app)
+	if IsSourceFolder(app) {
+		return identifySource(app)
+	}
 	info := Info{App: app}
+	if !strings.HasSuffix(app, ".app") && dirExists(app) {
+		info.Status, info.Detail = Unreadable, "This folder isn't a game catalina32 recognises."
+		return info
+	}
 	plist, _ := readPlist(filepath.Join(app, "Contents", "Info.plist"))
 	info.Name = plist["CFBundleName"]
 	info.BundleID = plist["CFBundleIdentifier"]

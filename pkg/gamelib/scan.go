@@ -44,14 +44,14 @@ func steamLibraries(steam string) []string {
 	return libs
 }
 
-// Scan identifies the apps in folders (and one level of subfolders, where Steam keeps games),
-// keeping those that need catalina32: supported and unsupported 32-bit games. all keeps every
-// app it looked at.
+// Scan identifies the apps and Source game folders in folders (and one level of subfolders,
+// where Steam keeps games), keeping those that need catalina32: supported and unsupported
+// 32-bit games. all keeps every game it looked at.
 func Scan(folders []string, all bool) []Info {
 	seen := map[string]bool{}
 	var out []Info
 	for _, dir := range folders {
-		for _, app := range appsIn(dir) {
+		for _, app := range gamesIn(dir) {
 			real, err := filepath.EvalSymlinks(app)
 			if err != nil || seen[real] {
 				continue
@@ -72,8 +72,9 @@ func Scan(folders []string, all bool) []Info {
 	return out
 }
 
-// appsIn lists the .app bundles in dir and in its immediate subfolders.
-func appsIn(dir string) []string {
+// gamesIn lists the .app bundles in dir and in its immediate subfolders, and the Source game
+// folders in dir (Steam's steamapps/common/Portal).
+func gamesIn(dir string) []string {
 	var apps []string
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -84,7 +85,7 @@ func appsIn(dir string) []string {
 		if !isDirOrLink(p) {
 			continue
 		}
-		if strings.HasSuffix(e.Name(), ".app") {
+		if strings.HasSuffix(e.Name(), ".app") || IsSourceFolder(p) {
 			apps = append(apps, p)
 			continue
 		}

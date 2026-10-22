@@ -107,6 +107,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>com.apple.application-bundle</string>
+				<string>public.folder</string>
 			</array>
 		</dict>
 	</array>

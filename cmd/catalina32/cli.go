@@ -19,14 +19,14 @@ func usage() {
 	fmt.Fprint(os.Stderr, `catalina32 runs 32-bit Mac games on modern macOS.
 
   catalina32 list [--json] [--all] [folder...]   find games (Steam libraries, Applications)
-  catalina32 info [--json] <Game.app>            what catalina32 knows about a game
-  catalina32 wrap [-o folder] [--json] <Game.app>
+  catalina32 info [--json] <Game.app or folder>  what catalina32 knows about a game
+  catalina32 wrap [-o folder] [--json] <Game.app or folder>
                                                  make a game app (default ~/Applications)
-  catalina32 run <Game.app>                      play a game without making a game app
+  catalina32 run <Game.app or folder>            play a game without making a game app
   catalina32 run --manifest <game.json> --no-window
                                                  the engine for a game app's window
   catalina32 source [--window app] <folder> [game options]
-                                                 a Valve Source game (Portal...; experimental)
+                                                 a Valve Source game with your own options
   catalina32 -game <executable>                  the engine alone (development; C32_* variables)
 `)
 }
@@ -187,9 +187,10 @@ func cmdRun(args []string) int {
 		usage()
 		return 2
 	}
-	var profile, binPath, data, saves string
+	var m gamelib.Manifest
 	if *manifest != "" {
-		m, err := gamelib.ReadManifest(*manifest)
+		var err error
+		m, err = gamelib.ReadManifest(*manifest)
 		if err == nil {
 			_, err = m.Check()
 		}
@@ -197,15 +198,15 @@ func cmdRun(args []string) int {
 			fmt.Fprintln(os.Stderr, "catalina32:", err)
 			return 1
 		}
-		profile, binPath, data, saves = m.Profile, filepath.Join(m.App, m.Executable), m.Data, m.Saves
 	} else {
 		info := gamelib.Identify(fs.Arg(0))
 		if info.Status != gamelib.Supported {
 			fmt.Fprintf(os.Stderr, "catalina32: %s: %s\n", info.DisplayName(), info.Detail)
 			return 1
 		}
-		profile, binPath, data, saves = info.Profile, filepath.Join(info.App, info.Executable), info.Data, info.Saves
+		m = gamelib.ManifestFor(info)
 	}
+	profile, binPath, data, saves := m.Profile, filepath.Join(m.App, m.Executable), m.Data, m.Saves
 	if v := os.Getenv("C32_SAVE_ROOT"); v != "" {
 		saves = v
 	}
@@ -217,6 +218,9 @@ func cmdRun(args []string) int {
 	if err := os.MkdirAll(saves, 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, "catalina32:", err)
 		return 1
+	}
+	if m.Kind == gamelib.KindSource { // a Valve Source game: its folder, its options, its overlay
+		return runSource(m.App, m.Args, saves, *noWindow, *window)
 	}
 	setDefault := func(k, v string) {
 		if os.Getenv(k) == "" {

@@ -11,14 +11,16 @@ const ManifestName = "game.json"
 
 // Manifest tells a game app which game it runs and where things are.
 type Manifest struct {
-	Format     int    `json:"format"`
-	Profile    string `json:"profile"`
-	Name       string `json:"name"`
-	App        string `json:"app"`
-	Executable string `json:"executable"` // relative to App
-	SHA256     string `json:"sha256"`
-	Data       string `json:"data,omitempty"`
-	Saves      string `json:"saves"`
+	Format     int      `json:"format"`
+	Profile    string   `json:"profile"`
+	Name       string   `json:"name"`
+	App        string   `json:"app"`
+	Executable string   `json:"executable"` // relative to App
+	SHA256     string   `json:"sha256"`
+	Data       string   `json:"data,omitempty"`
+	Saves      string   `json:"saves"`
+	Kind       string   `json:"kind,omitempty"` // KindSource: App is a Source game's folder; Saves its overlay
+	Args       []string `json:"args,omitempty"` // the game's options
 }
 
 const manifestFormat = 1
@@ -26,7 +28,7 @@ const manifestFormat = 1
 // ManifestFor describes a supported game.
 func ManifestFor(info Info) Manifest {
 	return Manifest{Format: manifestFormat, Profile: info.Profile, Name: info.DisplayName(), App: info.App,
-		Executable: info.Executable, SHA256: info.SHA256, Data: info.Data, Saves: info.Saves}
+		Executable: info.Executable, SHA256: info.SHA256, Data: info.Data, Saves: info.Saves, Kind: info.Kind, Args: info.Args}
 }
 
 func ReadManifest(path string) (Manifest, error) {

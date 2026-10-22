@@ -58,6 +58,9 @@ func Wrap(info Info, opt WrapOptions) (string, error) {
 	}
 	defer os.RemoveAll(tmp) // the temporary folder only (gone after a successful rename)
 	exe := filepath.Base(info.Executable)
+	if info.Kind == KindSource {
+		exe = name // not "hl2_osx": the name players see in Activity Monitor
+	}
 	contents := filepath.Join(tmp, "Contents")
 	for _, d := range []string{"MacOS", "Helpers", "Resources"} {
 		if err := os.MkdirAll(filepath.Join(contents, d), 0o755); err != nil {
