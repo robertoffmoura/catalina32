@@ -206,7 +206,7 @@ Each of these cost a bug; most are generic to Source on Mac.
    Deathmatch. Portal 2 and Left 4 Dead 2 are a later engine branch: survey before assuming.
 5. **A Steam bridge** (achievements, cloud saves) through the 64-bit slice of the same
    `libsteam_api.dylib`, talking to the real Steam client; no DRM bypass.
-5. Smaller: controller rumble; Apple Silicon (its GL vendor, "Apple", keeps native
+6. Smaller: controller rumble; Apple Silicon (its GL vendor, "Apple", keeps native
    clip-vertex mode, which is untested there).
 
 ## Legal and practical
