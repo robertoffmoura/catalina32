@@ -34,14 +34,14 @@ Engine       x86 CPU (interpreter, block cache, JIT) · Mach-O loader and       
              OpenAL, fonts) · native replacements found by signature
                          │
 Families     a porting house's runtime layer, found by signature: Feral's MacDoze  (planned);
-             Valve's Source on Mac (SDL2 + ToGL)                                   (experimental)
+             Valve's Source on Mac (SDL2 + ToGL)                                   (Portal)
                          │
 Games        profiles: checksums, names, folders, original save location, rare quirks
 ```
 
 - **Engine** (`pkg/cpu`, `pkg/macho32`, `pkg/crt`, `pkg/win32`, `pkg/d3d9`, `pkg/hlsl`,
   `pkg/d3dsm`, `pkg/msl`, `pkg/lh5`): no game addresses. See `CONTEXT.md`.
-- **Source games** *(experimental, branch `source`)*: `pkg/dyld` links a game's dozens of
+- **Source games**: `pkg/dyld` links a game's dozens of
   dylibs; `pkg/source` replaces the macOS libraries under them. The game's Direct3D-on-OpenGL
   layer (ToGL) runs emulated and its OpenGL calls are streamed to the window, which draws
   them with the Mac's OpenGL. See `docs/PORTAL.md`.
@@ -73,7 +73,9 @@ Games        profiles: checksums, names, folders, original save location, rare q
    (`libraryfolders.vdf`), `/Applications` and `~/Applications`, and lists what it finds with
    a status: supported, or not supported yet. **Create App** (in `~/Applications`) → **Play**
    or **Show in Finder** (from where it can go in the Dock). **Choose game…** or dropping a game
-   on the window or the Dock icon covers games elsewhere. An unsupported game gets a plain
+   on the window or the Dock icon covers games elsewhere. A Valve Source game is a folder, not
+   an app (Steam's `steamapps/common/Portal`, holding `hl2_osx`): the scan finds it beside the
+   apps, and choosing or dropping the folder works the same way. An unsupported game gets a plain
    message and its identity for a report; it is never run on a guess.
 2. **Game app.** On launch it checks the game is still where it was and unchanged (same
    checksum). If Steam updated it or the library moved, it says so and offers to find it again.
@@ -81,10 +83,10 @@ Games        profiles: checksums, names, folders, original save location, rare q
 
    ```sh
    catalina32 list [--json]              # scan for games and show which are supported
-   catalina32 info <Game.app> [--json]   # what catalina32 knows about this game
+   catalina32 info <Game.app> [--json]   # what catalina32 knows about this game (or a folder)
    catalina32 wrap <Game.app> [-o dir]   # make a game app (default ~/Applications)
    catalina32 run <Game.app>             # play without making a game app
-   catalina32 source <folder>            # play a Valve Source game from its folder (experimental)
+   catalina32 source <folder> [options]  # a Valve Source game with your own game options
    catalina32 -game <executable>         # the engine alone (developer flow, run_on_mac.sh)
    ```
 
@@ -126,6 +128,12 @@ players to open it without a trip to System Settings.
 }
 ```
 
+A Source game's manifest has `"kind": "source"`, its folder as `app`, `hl2_osx` as the
+executable, `bin/engine.dylib`'s checksum, the game's options (`"args": ["-game", "portal"]`)
+and its overlay as `saves`. The window then draws with OpenGL instead of Metal. Which Source
+games are supported is a table in `pkg/gamelib/source.go`: Steam's app ID
+(`steam_appid.txt`), the mod folder and the engine checksums tested.
+
 ## Saves
 
 The game's own code writes the save files, so they are compatible with the original game.
@@ -140,6 +148,10 @@ The game's own code writes the save files, so they are compatible with the origi
   newest are kept).
 - **Separate folder** (`~/Library/Application Support/catalina32/<game>/SaveData`): for a
   game whose original location isn't known, or by choice (`C32_SAVE_ROOT` overrides both).
+- **Source games** kept their saves inside the game's folder, which catalina32 never writes:
+  everything they write goes to an overlay, `~/Library/Application Support/catalina32/<folder
+  name>`, and reads see it merged over the game's folder, so older saves there still load
+  (`docs/PORTAL.md`). The overlay is what gets backed up.
 
 ## Building
 

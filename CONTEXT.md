@@ -18,18 +18,17 @@ The first target is **LEGO Star Wars: The Complete Saga** (Feral's Mac port of T
 Tales' NuEngine game). The tool is meant to be general: everything specific to one game lives
 in `pkg/games/<id>`, and the other packages contain no game addresses.
 
-The second, on branch `source`, is **Portal**: Valve's own Mac port, a different kind of game
+The second is **Portal**: Valve's own Mac port, a different kind of game
 (no MacDoze; dozens of dylibs over SDL2, OpenAL and ToGL, its Direct3D on OpenGL). It has its
 own runner, `pkg/source`, described in `docs/PORTAL.md`.
 
 **Goal:** make the game fully playable on a modern Mac.
 
-**State (October 2026):** it boots, plays with sound, controllers and saves, and draws
-through Metal at about 35–57 FPS on the user's Intel MacBook Pro. The whole of Episode I
-Chapter 1 (Negotiations) has been played through without crashes. Portal plays on the Mac
-with no known bugs but, interpreted, at a few frames per second. A JIT now translates hot guest
-code to x86-64 or arm64 (branch `jit`, `docs/JIT.md`): about 3.7× faster in Portal's gameplay
-headless, not yet tried on the Mac. See `PROGRESS.md` for open work.
+**State (October 2026):** LEGO Star Wars boots, plays with sound, controllers and saves, and
+draws through Metal at about 35–57 FPS on the user's Intel MacBook Pro; its first chapter has
+been played through. Portal has been played from the first chamber to the ending on the Mac.
+A JIT translates hot guest code to x86-64 or arm64 (`docs/JIT.md`); both games run with it.
+Release 0.2.0 makes game apps for both. See `PROGRESS.md` for open work.
 
 ## People, machines, paths
 

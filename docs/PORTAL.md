@@ -1,21 +1,24 @@
 # Portal (and Valve's Source games)
 
-Status (2026-10-21, branch `source`): **playable, slowly.** On the user's Mac (Intel, Radeon
-Pro 560X) Portal plays from the menu through the first chambers: New Game and Load Game,
-mouse look, keyboard, a controller (connected at launch or later), sound and music, menus and
-HUD text, and portals drawn correctly. No known bugs except speed: about 10 million guest
-instructions per frame in a chamber against an interpreter doing ~75 million a second, so a
-few frames per second interpreted. The JIT (`docs/JIT.md`, branch `jit`) runs gameplay at
-about 280 million instructions a second headless (3.7×), with a byte-identical GL stream;
-it hasn't been tried on the Mac yet.
+Status (2026-10-22): **played to the ending** on the user's Mac (Intel, Radeon Pro 560X) with
+the JIT: New Game and Load Game, mouse look, keyboard, a controller (connected at launch or
+later), sound and music, menus and HUD text, portals drawn correctly, no errors or crashes.
+Release 0.2.0 makes a game app for it. Large rooms are the slow part (Next).
 
 ## Running it
 
-On the Mac, from the repository: `scripts/run_source.sh [path/to/Portal] [game options]`
-(default: the `Portal` folder next to the repository). It builds the engine and the window,
+Players: Catalina32.app finds the Portal folder in the Steam library (or is given it: the
+folder holding `hl2_osx`) and makes `Portal.app` (`pkg/gamelib/source.go`: Steam app ID 400,
+`portal/gameinfo.txt`, a tested `bin/engine.dylib`; `docs/ARCHITECTURE.md`). The game app runs
+`catalina32 run --manifest`, which starts the same runner as below with `-game portal`.
+
+Developers, on the Mac, from the repository: `scripts/run_source.sh [path/to/Portal] [game
+options]` (default: the `Portal` folder next to the repository; with options, pass `-game
+portal` too). It builds the engine and the window,
 then runs `catalina32 source --window <window> <folder>`, which finds the mod (`-game
 portal`) and starts both. What the game writes (settings, saves) goes to
-`~/Library/Application Support/catalina32/<folder name>`, never into the game folder; reads
+`~/Library/Application Support/catalina32/<folder name>` (the overlay, keyed by each file's
+full path, so it belongs to the folder where the game was), never into the game folder; reads
 see that folder merged over the game's (so a saved `cfg/config.cfg` shadows the game's own,
 but listing `cfg/` still shows its chapter files). A game file the game deletes is recorded as
 deleted (`.catalina32-deleted` in that folder) and hidden until the game writes it again. This
@@ -23,8 +26,7 @@ matters for saves: Source empties `save/` when a game starts or loads, and a lev
 (`map.hl1`-`hl3`) is still there is restored from it instead of starting afresh. A Portal folder
 copied from an old Mac held escape_02's state from 2021, past GLaDOS's door; while it couldn't
 be deleted, every save carried it and walking into escape_02 restored it, door shut. Saves made
-before the fix still carry it: `map escape_02` starts the level afresh. There is no game app yet
-(see Next).
+before the fix still carry it: `map escape_02` starts the level afresh.
 
 ## How it works
 
@@ -185,7 +187,7 @@ Each of these cost a bug; most are generic to Source on Mac.
 
 ## Next
 
-1. **Speed:** play on the Mac. Measured on 22 October 2026 (`e2fc8ad`, before the speed work,
+1. **Speed:** measured on 22 October 2026 (`e2fc8ad`, before the speed work,
    against `dabd540`, run side by side, median frame): GLaDOS's chamber 154 → 80 ms (1.9×), the
    storage room 102 → 64 ms (1.6×), the hall 73 → 51 ms (1.4×), `testchmb_a_14` 81 → 73 ms
    (1.1×). What is left is spread out: translated code (about 60% of a frame), host calls
@@ -198,15 +200,12 @@ Each of these cost a bug; most are generic to Source on Mac.
    frames, `func_portal_volume`, HL2's turret sounds). Live, the sound runs out only on frames
    longer than about 93 ms: the engine's OpenAL device keeps 16 buffers of 256 frames queued, a
    constant (`snd_mixahead` doesn't change it), so it breaks up the same on a slow Mac.
-3. **A game app for Portal:** teach `pkg/gamelib` (scan, identify, wrap) that a game can be a
-   folder, identified by `steam_appid.txt`, `gameinfo.txt` and its engine's checksum
-   (`hl2_osx` is the same launcher in every Source game).
-4. **The family layer:** "Valve Source on Mac (SDL2 + ToGL)" covers Half-Life 2 and its
+3. **The family layer:** "Valve Source on Mac (SDL2 + ToGL)" covers Half-Life 2 and its
    episodes, probably Counter-Strike: Source, Day of Defeat: Source and Half-Life 2:
    Deathmatch. Portal 2 and Left 4 Dead 2 are a later engine branch: survey before assuming.
-5. **A Steam bridge** (achievements, cloud saves) through the 64-bit slice of the same
+4. **A Steam bridge** (achievements, cloud saves) through the 64-bit slice of the same
    `libsteam_api.dylib`, talking to the real Steam client; no DRM bypass.
-6. Smaller: controller rumble; Apple Silicon (its GL vendor, "Apple", keeps native
+5. Smaller: controller rumble; Apple Silicon (its GL vendor, "Apple", keeps native
    clip-vertex mode, which is untested there).
 
 ## Legal and practical

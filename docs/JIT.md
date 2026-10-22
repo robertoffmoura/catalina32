@@ -1,6 +1,6 @@
 # The JIT
 
-Status (October 2026, branch `jit`): **phases 1–4 done.**
+Status (October 2026): **phases 1–4 done**, on the Mac in both games (Intel).
 
 - **x86-64 backend:** Intel Macs and Linux. On by default.
 - **arm64 backend:** tested under QEMU user-mode on Linux only. On Apple Silicon it is
