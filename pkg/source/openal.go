@@ -62,8 +62,10 @@ type openAL struct {
 	written  uint64 // frames mixed
 	start    uint64 // the clock (µs) when mixing started
 	started  bool
-	// Diagnostics: buffers received, and their samples that aren't silence.
+	// Diagnostics: buffers received, and their samples that aren't silence; when (µs after the
+	// start) a playing source ran out of queued sound, which the player hears as a gap.
 	buffers, loudIn int
+	dry             []uint64
 }
 
 func (m *Machine) registerOpenAL() {
@@ -320,6 +322,7 @@ func (a *openAL) mix(now uint64) {
 			if e == nil {
 				if !s.looping {
 					s.state = alStopped
+					a.dry = append(a.dry, now-a.start)
 				}
 				break
 			}

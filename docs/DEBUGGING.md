@@ -211,9 +211,9 @@ git archive HEAD | tar -x -C /tmp/probe && cp pkg/games/lswsaga/aot_gen.go /tmp/
 | `C32_VIEWER_SHM` | tests using `withWindow` (`TestPlayIO`, `TestController`...): the stream file for another viewer instead of the built-in checker |
 | `C32_CMDS` | console commands typed in at instruction counts: `steps:cmd;cmd\|steps:...` (`TestBoot`, `TestController`) |
 | `C32_CTL_LOAD` | `TestController`: load this save (in `C32_OVERLAY`) from the menu first |
-| `C32_PROBE`, `C32_WATCH_NULL`, `C32_TRACECALLS` | log calls and returns of matching guest functions; catch NULL-pointer stores; keep a call stack for backtraces |
+| `C32_PROBE`, `C32_WATCH_NULL`, `C32_TRACECALLS` | log calls and returns of matching guest functions; catch NULL-pointer stores (slow: `TestBoot` reports page zero's dirty bytes anyway, free); keep a call stack for backtraces |
 | `C32_FONT_PNG`, `C32_MP3_OUT` | write a font sample (`HostFontSample`); the menu music's decoded PCM (`TestMenuSound`) |
-| `C32_LIVE` | `1`: wall clock (set by `catalina32 source`) |
+| `C32_LIVE` | `1`: wall clock (set by `catalina32 source`); `TestBoot` then reports the seconds in which the sound ran out (OpenAL sources left with nothing queued) |
 | `C32_JITSTATS`, `C32_JITPROF`, `C32_JITDUMP`, `C32_SLOWOPS` | `TestBoot`: JIT counters (`C32_JITSTATS=<instruction>`: from then on, returns to Go by what runs where they go, the instructions handed to the interpreter, the blocks translated; `C32_SLOWOPS` counts from there too), per-block costs, a block's host code, the forms left to the interpreter's full decoder (`docs/JIT.md`) |
 | `C32_FRAMESTATS` | `TestBoot`: a CSV line per frame: instructions, those the full decoder ran, host and CPU milliseconds, host calls, GL commands and KB, JIT slow and end exits, resets, milliseconds waiting for the GL stream's reader, blocks translated, and (`C32_INJIT=1`) the share of the frame translated code ran (sampled; the CPU profiler loses most samples taken in translated code) |
 | `C32_NATIVE_TRACE`, `C32_TRACECHECK` | `0`: Source's collision traces run as the game's code; `1`: run every trace both ways and compare (`TestBoot` reports the counts; `pkg/source/cmtrace.go`) |

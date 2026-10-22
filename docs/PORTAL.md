@@ -185,18 +185,26 @@ Each of these cost a bug; most are generic to Source on Mac.
 
 ## Next
 
-1. **Speed:** play on the Mac. Large areas went 1.3–1.6× faster headless in October 2026
-   (`docs/JIT.md`, Results); what is left: translated code (about 60% of a frame), host calls
+1. **Speed:** play on the Mac. Measured on 22 October 2026 (`e2fc8ad`, before the speed work,
+   against `dabd540`, run side by side, median frame): GLaDOS's chamber 154 → 80 ms (1.9×), the
+   storage room 102 → 64 ms (1.6×), the hall 73 → 51 ms (1.4×), `testchmb_a_14` 81 → 73 ms
+   (1.1×). What is left is spread out: translated code (about 60% of a frame), host calls
    (about 59,000 a frame, each a return to Go), the forms the cache doesn't decode
    (`docs/JIT.md`, Ideas), Source's sound mixing (6–14% of the translated code), the spatial
    partition's voxel walks (3–4%).
-2. **A game app for Portal:** teach `pkg/gamelib` (scan, identify, wrap) that a game can be a
+2. **Checked on 22 October 2026:** every story map loads and plays its first seconds headless
+   (`-condebug +developer 1`) with no halts and no NULL-pointer stores; what the game's console
+   complains about is missing from the shipped files too (`soundscapes_portal.txt`, the sign
+   frames, `func_portal_volume`, HL2's turret sounds). Live, the sound runs out only on frames
+   longer than about 93 ms: the engine's OpenAL device keeps 16 buffers of 256 frames queued, a
+   constant (`snd_mixahead` doesn't change it), so it breaks up the same on a slow Mac.
+3. **A game app for Portal:** teach `pkg/gamelib` (scan, identify, wrap) that a game can be a
    folder, identified by `steam_appid.txt`, `gameinfo.txt` and its engine's checksum
    (`hl2_osx` is the same launcher in every Source game).
-3. **The family layer:** "Valve Source on Mac (SDL2 + ToGL)" covers Half-Life 2 and its
+4. **The family layer:** "Valve Source on Mac (SDL2 + ToGL)" covers Half-Life 2 and its
    episodes, probably Counter-Strike: Source, Day of Defeat: Source and Half-Life 2:
    Deathmatch. Portal 2 and Left 4 Dead 2 are a later engine branch: survey before assuming.
-4. **A Steam bridge** (achievements, cloud saves) through the 64-bit slice of the same
+5. **A Steam bridge** (achievements, cloud saves) through the 64-bit slice of the same
    `libsteam_api.dylib`, talking to the real Steam client; no DRM bypass.
 5. Smaller: controller rumble; Apple Silicon (its GL vendor, "Apple", keeps native
    clip-vertex mode, which is untested there).

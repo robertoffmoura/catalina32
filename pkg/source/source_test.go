@@ -326,6 +326,28 @@ func TestBoot(t *testing.T) {
 	if m.cmTrace != nil {
 		t.Logf("collision traces in Go: %s", m.cmTrace.report())
 	}
+	if n := len(m.al.dry); n > 0 && m.Live { // (headless frames are 0.1 s apart: the sound always runs out)
+		var secs []string // second: times
+		for i := 0; i < n; {
+			j := i
+			for j < n && m.al.dry[j]/1e6 == m.al.dry[i]/1e6 {
+				j++
+			}
+			secs = append(secs, fmt.Sprintf("%d:%d", m.al.dry[i]/1e6, j-i))
+			i = j
+		}
+		t.Logf("sound ran out %d times, in seconds (second:times) %s", n, strings.Join(secs, " "))
+	}
+	// page zero is unmapped on the Mac: anything here was a NULL-pointer store (C32_WATCH_NULL finds who)
+	var dirty []string
+	for i, b := range m.C.Bytes(0, 0x1000) {
+		if b != 0 && len(dirty) < 16 {
+			dirty = append(dirty, fmt.Sprintf("%#x=%#02x", i, b))
+		}
+	}
+	if len(dirty) > 0 {
+		t.Logf("page zero written (NULL-pointer stores): %s", strings.Join(dirty, " "))
+	}
 	if os.Getenv("C32_GLSTATS") != "" {
 		type kv struct {
 			k string
