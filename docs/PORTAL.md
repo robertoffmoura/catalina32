@@ -71,6 +71,7 @@ also runs the game tests (minutes each):
 | `TestNewGameDialog` | the dialog lists the chapters, draws their pictures, and Start begins chapter 1 |
 | `TestRendererClipMode` | the launcher sees an AMD GPU and turns off native clip-vertex mode |
 | `TestSndDSPAgainstEngine` | the sound effects in Go against `engine.dylib`'s own code, on random delay lines, reverbs, diffusors and filters |
+| `TestCMTraceAgainstEngine` | the collision traces in Go against `engine.dylib`'s own code, on random collision trees, brushes and box and point traces |
 
 To **see** frames on Linux, `tools/glreplay` replays the stream through the window's own
 decoding code into Mesa and saves PNGs; it can imitate AMD's Mac drivers
@@ -171,14 +172,24 @@ Each of these cost a bug; most are generic to Source on Mac.
   instructions in GLaDOS's chamber. `pkg/source/snddsp.go` runs those functions in Go, bound
   by symbol and only when their code bytes are the ones it follows; `C32_DSPCHECK=1` compares
   every call with the game's code.
+- **GLaDOS's chamber is slow mostly because of collision traces.** Its turrets, lasers and
+  physics trace boxes through the map all the time: the walk down the collision tree and the
+  clipping against each brush (`CM_RecursiveHullCheckImpl`, `CM_TraceToLeaf`,
+  `CM_ClipBoxToBrush`, `IntersectRayWithBoxBrush`) were a third of the translated code there,
+  3–5% elsewhere. `pkg/source/cmtrace.go` runs them in Go, box and point traces, the same
+  way as the sound effects: bound by symbol and code bytes, bit for bit the game's results
+  (each single- and double-precision step as the game's, products rounded before the sums so
+  that arm64 doesn't fuse them), leaves with displacements handed to the game's code;
+  `C32_TRACECHECK=1` compares every trace. GLaDOS's chamber: 29 M instructions a frame to 18 M,
+  about 1.25× faster.
 
 ## Next
 
 1. **Speed:** play on the Mac. Large areas went 1.3–1.6× faster headless in October 2026
    (`docs/JIT.md`, Results); what is left: translated code (about 60% of a frame), host calls
    (about 59,000 a frame, each a return to Go), the forms the cache doesn't decode
-   (`docs/JIT.md`, Ideas), and the engine's collision traces, a third of the translated code
-   in GLaDOS's chamber.
+   (`docs/JIT.md`, Ideas), Source's sound mixing (6–14% of the translated code), the spatial
+   partition's voxel walks (3–4%).
 2. **A game app for Portal:** teach `pkg/gamelib` (scan, identify, wrap) that a game can be a
    folder, identified by `steam_appid.txt`, `gameinfo.txt` and its engine's checksum
    (`hl2_osx` is the same launcher in every Source game).

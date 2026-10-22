@@ -285,6 +285,11 @@ func (c *CPU) access(addr, size uint32, write bool) bool {
 	return true
 }
 
+// ReadLimit is the address below which a load of up to 8 bytes is plain memory (0 while a watch
+// is set): host code that reads guest memory a lot can check it and slice Mem itself, as the
+// inlined fast paths above do, rather than call Read32 for every load.
+func (c *CPU) ReadLimit() uint32 { return c.readLimit }
+
 func (c *CPU) Read8(addr uint32) uint8 {
 	if addr < c.readLimit {
 		return c.Mem[addr]

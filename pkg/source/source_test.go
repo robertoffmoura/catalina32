@@ -323,6 +323,9 @@ func TestBoot(t *testing.T) {
 	if m.sndDSP != nil {
 		t.Logf("sound effects in Go: %s", m.sndDSP.report())
 	}
+	if m.cmTrace != nil {
+		t.Logf("collision traces in Go: %s", m.cmTrace.report())
+	}
 	if os.Getenv("C32_GLSTATS") != "" {
 		type kv struct {
 			k string

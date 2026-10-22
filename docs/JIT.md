@@ -71,6 +71,10 @@ objects (GLaDOS's chamber; the storage room with the hanging spheres; the foggy 
 | Hall | 62 (p10 53) | 49 (p10 43) | 1.27× | 16.2 M → 13.9 M |
 
 - Fewer instructions: Source's reverb in Go (`pkg/source/snddsp.go`, not the JIT).
+- Later, Source's collision traces in Go (`pkg/source/cmtrace.go`): GLaDOS's chamber 29.0 M →
+  18.0 M instructions a frame, 77 → 62 ms median (1.24×; CPU time 82 → 62 ms), the turret
+  chamber in `testchmb_a_14` and the hall 4–5% fewer instructions, the storage room unchanged
+  (both builds run at the same time, four rounds).
 - Faster translated code: memory windows, flag liveness across blocks, the SSE2 forms, `push`
   and `call $+5` in blocks, translations kept when a block loses its cache slot.
 - Headless runs take time from the instruction count (50 per microsecond), so every frame
